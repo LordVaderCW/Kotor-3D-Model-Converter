@@ -123,20 +123,7 @@ del /Q "$(TargetDir)$(TargetName).exp" 2&gt;nul</Command>
     <ClInclude Include="Public\PythonFunctions\InstanceMethods.h" />
     <ClInclude Include="Public\PythonFunctions\ModuleFunctions.h" />
   </ItemGroup>
-<ItemGroup Label="PythonPayload">
-    <ResourceCompile Include="GhostRiggerPythonPayload.rc" />
-    <None Include="GhostRiggerPythonPayload.json" />
-    <None Include="GeneratePythonPayload.py" />
-    <None Include="Python\src\__init__.py" />
-    <None Include="Python\src\core\__init__.py" />
-    <None Include="Python\src\core\qt_core.py" />
-    <None Include="Python\src\core\mdl\__init__.py" />
-    <None Include="Python\src\core\mdl\ghostrigger_mdl_reader.py" />
-    <None Include="Python\src\core\mdl\mdl_parser.py" />
-    <None Include="Python\src\core\mdl\mdl_porter.py" />
-    <None Include="Python\src\core\mdl\mdl_reader_wrapper.py" />
-    <None Include="Python\src\core\mdl\mdl_writer.py" />
-  </ItemGroup>
+<ItemGroup Label="PythonPayload"><ResourceCompile Include="GhostRiggerPythonPayload.rc" /><None Include="GhostRiggerPythonPayload.json" /><None Include="GeneratePythonPayload.py" /><None Include="Python\src\__init__.py" /><None Include="Python\src\core\__init__.py" /><None Include="Python\src\core\mdl\__init__.py" /><None Include="Python\src\core\mdl\ghostrigger_mdl_reader.py" /><None Include="Python\src\core\mdl\mdl_parser.py" /><None Include="Python\src\core\mdl\mdl_porter.py" /><None Include="Python\src\core\mdl\mdl_reader_wrapper.py" /><None Include="Python\src\core\mdl\mdl_writer.py" /><None Include="Python\src\core\qt_core.py" /></ItemGroup>
   <PropertyGroup Label="PythonPayloadBuild">
     <GhostRiggerPythonPayloadPython Condition="'$(GhostRiggerPythonPayloadPython)'=='' and '$(GHOSTRIGGER_PYTHON)'!=''">$(GHOSTRIGGER_PYTHON)</GhostRiggerPythonPayloadPython>
     <GhostRiggerPythonPayloadPython Condition="'$(GhostRiggerPythonPayloadPython)'==''">python</GhostRiggerPythonPayloadPython>

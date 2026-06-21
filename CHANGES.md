@@ -11,6 +11,18 @@ For each completed change, add a dated entry with:
 
 ## 2026-06-21
 
+### [2026-06-21] Repair Native Python Payloads After Upstream Pull
+
+Owner: LordVaderCW
+Task: N/A
+Subsystem: Native embedded Python payloads / build tooling
+Intersects: Upstream `qt-ghostrigger` native payload manifests and Visual Studio project metadata.
+
+- Synced the stale `GhostRigger.Core.IO` packaged `mdl_writer.py` copy back to the canonical root `src/core/mdl/mdl_writer.py` source so payload generation no longer aborts during the Debug build.
+- Refreshed native payload manifests and RC metadata for the updated upstream Python file set, now covering 1,142 packaged Python file references across the 18 non-debug payload DLL projects.
+- Added the missing `max2021_mcp` package to `GhostRigger.Core.Automation` and taught the native payload generator to keep `.vcxproj` and `.vcxproj.filters` Python payload entries synchronized with regenerated payload membership.
+- Verification: `python -m py_compile scripts/native_python_payload_generator.py`; `python scripts/native_python_payload_generator.py --all`; `python -m pytest tests/test_native_python_payloads.py`; `"F:\Unreal VS\MSBuild\Current\Bin\amd64\MSBuild.exe" GhostRigger.sln /p:Configuration=Debug /p:Platform=x64 /m /v:minimal`.
+
 ### [2026-06-21] Merge LordVader Fork Updates Into Map Studio Branch
 
 Owner: LordVaderCW

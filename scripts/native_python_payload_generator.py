@@ -20,6 +20,76 @@ def write_text_if_changed(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _windows_path(path: Path) -> str:
+    return path.as_posix().replace("/", "\\")
+
+
+def _python_payload_item_entries(files: list[Path]) -> str:
+    entries = [
+        '<ResourceCompile Include="GhostRiggerPythonPayload.rc" />',
+        '<None Include="GhostRiggerPythonPayload.json" />',
+        '<None Include="GeneratePythonPayload.py" />',
+    ]
+    entries.extend(
+        f'<None Include="Python\\{_windows_path(path)}" />'
+        for path in files
+    )
+    return "".join(entries)
+
+
+def _python_payload_filter_entries(files: list[Path]) -> str:
+    entries = [
+        '<None Include="GhostRiggerPythonPayload.json" />',
+        '<None Include="GeneratePythonPayload.py" />',
+    ]
+    for path in files:
+        include = f"Python\\{_windows_path(path)}"
+        filter_name = str(Path("Python") / path.parent).replace("/", "\\")
+        entries.append(f'<None Include="{include}"><Filter>{filter_name}</Filter></None>')
+    return "".join(entries)
+
+
+def _replace_item_group_containing(path: Path, text: str, marker: str, replacement: str) -> str:
+    marker_index = text.find(marker)
+    if marker_index == -1:
+        raise RuntimeError(f"cannot find {marker!r} in {path}")
+    start = text.rfind("<ItemGroup", 0, marker_index)
+    end = text.find("</ItemGroup>", marker_index)
+    if start == -1 or end == -1:
+        raise RuntimeError(f"cannot find payload item group in {path}")
+    end += len("</ItemGroup>")
+    return text[:start] + replacement + text[end:]
+
+
+def sync_project_payload_items(project: str, files: list[Path]) -> None:
+    project_dir = NATIVE_ROOT / project
+    vcxproj = project_dir / f"{project}.vcxproj"
+    filters = project_dir / f"{project}.vcxproj.filters"
+
+    vcxproj_text = vcxproj.read_text(encoding="utf-8")
+    vcxproj_group = f'<ItemGroup Label="PythonPayload">{_python_payload_item_entries(files)}</ItemGroup>'
+    vcxproj_updated = re.sub(
+        r'<ItemGroup Label="PythonPayload">.*?</ItemGroup>',
+        lambda _match: vcxproj_group,
+        vcxproj_text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if vcxproj_updated == vcxproj_text and vcxproj_group not in vcxproj_text:
+        raise RuntimeError(f"cannot find PythonPayload item group in {vcxproj}")
+    write_text_if_changed(vcxproj, vcxproj_updated)
+
+    filters_text = filters.read_text(encoding="utf-8")
+    filters_group = f"<ItemGroup>{_python_payload_filter_entries(files)}</ItemGroup>"
+    filters_updated = _replace_item_group_containing(
+        filters,
+        filters_text,
+        '<None Include="GhostRiggerPythonPayload.json"',
+        filters_group,
+    )
+    write_text_if_changed(filters, filters_updated)
+
+
 def resource_name_for_packaged_path(packaged_path: str) -> str:
     """Return a readable RC identifier for a packaged Python payload path."""
 
@@ -75,9 +145,11 @@ def refresh_root_manifest(projects: list[str] | None = None) -> None:
 def generate_project(project: str) -> None:
     project_entry(project)
     project_dir = NATIVE_ROOT / project
+    files = project_python_files(project)
+    sync_project_payload_items(project, files)
     rows = []
     seen_names: dict[str, int] = {}
-    for source_path in project_python_files(project):
+    for source_path in files:
         packaged_path = Path("Python") / source_path
         source_abs = ROOT / source_path
         packaged_abs = project_dir / packaged_path

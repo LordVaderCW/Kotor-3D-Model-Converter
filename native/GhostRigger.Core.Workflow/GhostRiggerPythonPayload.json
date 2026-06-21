@@ -9,7 +9,7 @@
             "resource_name": "PYTHON_PAYLOAD_AUTORIG_INIT",
             "source_path": "src/autorig/__init__.py",
             "packaged_path": "Python/src/autorig/__init__.py",
-            "sha256": "ee8e7361d9548d417893dc3a3a8fd248c2c4da2e0f096541e67227d7778d27d6"
+            "sha256": "4244c403d1426ef468e7aff2c6ee5ee5e60a0165a09be548c162b3f191eddfc2"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_AUTORIG_ACCURIG",

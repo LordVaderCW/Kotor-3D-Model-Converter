@@ -66,22 +66,7 @@
       <Filter>Public\PythonFunctions</Filter>
     </ClInclude>
   </ItemGroup>
-  <ItemGroup>
-    <None Include="GhostRiggerPythonPayload.json" />
-    <None Include="GeneratePythonPayload.py" />
-    <None Include="Python\src\core\project\__init__.py">
-      <Filter>Python\src\core\project</Filter>
-    </None>
-    <None Include="Python\src\core\project\ghostrigger_project.py">
-      <Filter>Python\src\core\project</Filter>
-    </None>
-    <None Include="Python\src\core\project\project_validation.py">
-      <Filter>Python\src\core\project</Filter>
-    </None>
-    <None Include="Python\src\core\project\resource_address.py">
-      <Filter>Python\src\core\project</Filter>
-    </None>
-  </ItemGroup>
+  <ItemGroup><None Include="GhostRiggerPythonPayload.json" /><None Include="GeneratePythonPayload.py" /><None Include="Python\src\core\project\__init__.py"><Filter>Python\src\core\project</Filter></None><None Include="Python\src\core\project\ghostrigger_project.py"><Filter>Python\src\core\project</Filter></None><None Include="Python\src\core\project\project_validation.py"><Filter>Python\src\core\project</Filter></None><None Include="Python\src\core\project\resource_address.py"><Filter>Python\src\core\project</Filter></None></ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="GhostRiggerPythonPayload.rc" />
   </ItemGroup>

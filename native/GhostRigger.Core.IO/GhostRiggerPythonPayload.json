@@ -105,7 +105,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_MDL_MDL_WRITER",
             "source_path": "src/core/mdl/mdl_writer.py",
             "packaged_path": "Python/src/core/mdl/mdl_writer.py",
-            "sha256": "d8db82ca658e5dcc3bec6592a1a6c5fb54e2c7962016c592ae1bcbb5df03a867"
+            "sha256": "729a4d16e7883173858981238ba1dbfc416a90f6a67930d34f03be52eb49d77e"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_TEMPLATES_INIT",
@@ -135,7 +135,7 @@
             "resource_name": "PYTHON_PAYLOAD_FORMATS_INIT",
             "source_path": "src/formats/__init__.py",
             "packaged_path": "Python/src/formats/__init__.py",
-            "sha256": "ebd7909bc7b09818bf24aa3a1b0b92f20cb28d6ec9f7ed938627e8ba07f45992"
+            "sha256": "219fe7c8304e7157b8e83a23c20ec28f59d856c356f00ee1946dd4100489bf44"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_FORMATS_GFF_READER",

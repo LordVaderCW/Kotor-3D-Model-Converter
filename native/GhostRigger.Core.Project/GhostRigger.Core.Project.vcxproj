@@ -25,15 +25,7 @@ del /Q "$(TargetDir)$(TargetName).exp" 2&gt;nul</Command></PostBuildEvent></Item
     <ClInclude Include="Public\PythonFunctions\ModuleFunctions.h" />
     <ClInclude Include="Public\PythonFunctions\Properties.h" />
   </ItemGroup>
-<ItemGroup Label="PythonPayload">
-    <ResourceCompile Include="GhostRiggerPythonPayload.rc" />
-    <None Include="GhostRiggerPythonPayload.json" />
-    <None Include="GeneratePythonPayload.py" />
-    <None Include="Python\src\core\project\__init__.py" />
-    <None Include="Python\src\core\project\ghostrigger_project.py" />
-    <None Include="Python\src\core\project\project_validation.py" />
-    <None Include="Python\src\core\project\resource_address.py" />
-  </ItemGroup>
+<ItemGroup Label="PythonPayload"><ResourceCompile Include="GhostRiggerPythonPayload.rc" /><None Include="GhostRiggerPythonPayload.json" /><None Include="GeneratePythonPayload.py" /><None Include="Python\src\core\project\__init__.py" /><None Include="Python\src\core\project\ghostrigger_project.py" /><None Include="Python\src\core\project\project_validation.py" /><None Include="Python\src\core\project\resource_address.py" /></ItemGroup>
   <PropertyGroup Label="PythonPayloadBuild">
     <GhostRiggerPythonPayloadPython Condition="'$(GhostRiggerPythonPayloadPython)'=='' and '$(GHOSTRIGGER_PYTHON)'!=''">$(GHOSTRIGGER_PYTHON)</GhostRiggerPythonPayloadPython>
     <GhostRiggerPythonPayloadPython Condition="'$(GhostRiggerPythonPayloadPython)'==''">python</GhostRiggerPythonPayloadPython>
