@@ -1,15 +1,16 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM GhostRigger Windows build wrapper.
-REM Produces: dist\GhostRigger-K1-K2.exe
+REM GhostStudio Windows build wrapper.
+REM Produces: GhostStudio.exe in the repository root.
 
 cd /d "%~dp0"
 set "LOG=%~dp0build_log.txt"
+set "APP_ENTRYPOINT=native\GhostRigger.Native.Core.Host\main.py"
 echo GhostRigger build started %DATE% %TIME% > "%LOG%"
 
 echo ============================================================
-echo  GhostRigger-K1-K2  ^|  Build Windows exe
+echo  GhostStudio  ^|  Build Windows exe
 echo ============================================================
 echo.
 echo Build log: %LOG%
@@ -104,9 +105,9 @@ if errorlevel 1 (
 
 echo.
 echo [5/7] Verify required files
-if not exist "main.py" (
-    echo ERROR: main.py not found.
-    echo ERROR: main.py not found. >> "%LOG%"
+if not exist "%APP_ENTRYPOINT%" (
+    echo ERROR: %APP_ENTRYPOINT% not found.
+    echo ERROR: %APP_ENTRYPOINT% not found. >> "%LOG%"
     pause
     exit /b 1
 )
@@ -129,7 +130,7 @@ if not exist "assets\icons\ghostrigger.ico" (
 
 echo.
 echo [6/7] Compile build-critical entry points
-%PYTHON_EXE% -m py_compile main.py src\core\retargeting\fbx_backend.py src\gui\windows\qt_main_window.py >> "%LOG%" 2>&1
+%PYTHON_EXE% -m py_compile "%APP_ENTRYPOINT%" native\GhostRigger.Core.Workflow\Python\src\core\retargeting\fbx_backend.py native\GhostRigger.Core.GUI.Display\Python\src\gui\windows\qt_main_window.py >> "%LOG%" 2>&1
 if errorlevel 1 (
     echo ERROR: py_compile failed. See build_log.txt.
     echo ERROR: py_compile failed. >> "%LOG%"
@@ -147,9 +148,25 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "dist\GhostRigger-K1-K2.exe" (
-    echo ERROR: Build finished but dist\GhostRigger-K1-K2.exe was not created.
+if not exist "dist\GhostStudio.exe" (
+    echo ERROR: Build finished but dist\GhostStudio.exe was not created.
     echo ERROR: exe not found after build. >> "%LOG%"
+    pause
+    exit /b 1
+)
+
+if exist "dist\GhostRigger-K1-K2.exe" del /Q "dist\GhostRigger-K1-K2.exe"
+if exist "GhostRigger-K1-K2.exe" del /Q "GhostRigger-K1-K2.exe"
+copy /Y "dist\GhostStudio.exe" "GhostStudio.exe" >nul
+if errorlevel 1 (
+    echo ERROR: Could not copy GhostStudio.exe to the repository root.
+    echo ERROR: root exe copy failed. >> "%LOG%"
+    pause
+    exit /b 1
+)
+if not exist "GhostStudio.exe" (
+    echo ERROR: Root GhostStudio.exe was not created.
+    echo ERROR: root exe not found after copy. >> "%LOG%"
     pause
     exit /b 1
 )
@@ -157,7 +174,8 @@ if not exist "dist\GhostRigger-K1-K2.exe" (
 echo.
 echo ============================================================
 echo  BUILD COMPLETE
-echo  Executable: dist\GhostRigger-K1-K2.exe
+echo  Executable: GhostStudio.exe
+echo  Build copy: dist\GhostStudio.exe
 echo ============================================================
-echo BUILD COMPLETE: dist\GhostRigger-K1-K2.exe >> "%LOG%"
+echo BUILD COMPLETE: GhostStudio.exe >> "%LOG%"
 pause

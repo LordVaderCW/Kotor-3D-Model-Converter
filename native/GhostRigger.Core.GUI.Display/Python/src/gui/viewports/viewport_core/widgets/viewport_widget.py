@@ -44,6 +44,7 @@ class QtViewportWidget(
     DEFAULT_VIEWPORT_TOOLBAR_VISIBLE = True
     DEFAULT_VIEWCUBE_VISIBLE = True
     DEFAULT_TRANSFORM_TYPEIN_VISIBLE = True
+    DEFAULT_MAP_STUDIO_AUTHORING_CHROME = False
     VIEWPORT_ROLE = "base"
 
     modelChanged = QtCore.Signal(object)
@@ -70,14 +71,18 @@ class QtViewportWidget(
         *,
         thumbnail_enabled: Optional[bool] = None,
         compact_controls: Optional[bool] = None,
+        map_studio_authoring_chrome: Optional[bool] = None,
     ):
         super().__init__(parent)
         if thumbnail_enabled is None:
             thumbnail_enabled = self.DEFAULT_THUMBNAIL_ENABLED
         if compact_controls is None:
             compact_controls = self.DEFAULT_COMPACT_CONTROLS
+        if map_studio_authoring_chrome is None:
+            map_studio_authoring_chrome = self.DEFAULT_MAP_STUDIO_AUTHORING_CHROME
         self.viewport_role = self.VIEWPORT_ROLE
         self._compact_controls = bool(compact_controls)
+        self._map_studio_authoring_chrome_enabled = bool(map_studio_authoring_chrome)
         self._viewport_toolbar_visible = bool(self.DEFAULT_VIEWPORT_TOOLBAR_VISIBLE)
         self._viewcube_visible = bool(self.DEFAULT_VIEWCUBE_VISIBLE)
         self._transform_typein_visible = bool(self.DEFAULT_TRANSFORM_TYPEIN_VISIBLE)
@@ -161,6 +166,7 @@ class QtViewportWidget(
         self._active_camera_guard = False
         self._render_suppress_camera_overlays = False
         self._transform_gizmo_dragging = False
+        self._gr_map_studio_terrain_sculpt_input_lock = False
         self._mesh_transform_promotes_to_model_root = False
         self._transform_gizmo_mirror_nodes: list = []
         self._transform_gizmo_mirror_start_positions: dict[int, tuple[float, float, float]] = {}
@@ -172,6 +178,7 @@ class QtViewportWidget(
         self._mesh_topology_cache: dict[int, MeshTopology] = {}
         self._mesh_target_weld_source: int | None = None
         self._render_pending = False
+        self._runtime_qimage_compositor = None
         self._last_canvas_size = (0, 0)
         self._pixmap: Optional[QtGui.QPixmap] = None
         self._fast_drag_enabled = False
@@ -253,12 +260,25 @@ class QtViewportWidget(
         self._overlay_rebuild_rate_hz = 0.0
         self._overlay_rebuild_window_started = time_module.perf_counter()
         self._skip_overlay_pixmap_update = False
+        # Native WGPU surfaces are child HWNDs on Windows.  A translucent Qt
+        # QLabel stacked over that child can intermittently occlude the whole
+        # surface instead of alpha-compositing with it.  Runtime-style viewport
+        # modes (Map Studio PIE) therefore suppress the legacy PIL/QPixmap
+        # overlay and keep all continuously moving content in the retained 3D
+        # scene.  Authoring mode leaves the overlay available for its guides.
+        self._live_surface_overlay_suppressed = False
         self._map_studio_room_outline_geometry = None
         self._map_studio_room_outline_snap_highlight = None
         self._map_studio_room_outline_edge_highlight = None
+        self._map_studio_building_preview = None
+        self._map_studio_level_presentation: dict[str, object] = {}
         self._map_studio_marker_geometry = None
         self._map_studio_terrain_walkability_overlay = None
         self._map_studio_terrain_brush_cursor = None
+        self._map_studio_texture_paint_cursor = None
+        self._map_studio_universal_transform_overlay = None
+        self._map_studio_modeling_points_overlay = None
+        self._map_studio_viewport_presentation: dict[str, object] = {}
         self._map_studio_marker_hit_zones: list[dict[str, object]] = []
         self._map_studio_room_outline_hit_zones: list[dict[str, object]] = []
         self._map_studio_room_outline_edge_hit_zones: list[dict[str, object]] = []

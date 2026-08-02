@@ -303,6 +303,7 @@ def cpu_skin_vbo_arrays(
     skinning: SkinningArrays,
     anim_pose,
     model=None,
+    anim_base_pose=None,
 ) -> tuple[object, object | None]:
     """Apply the same per-skin palette contract used by the ModernGL shader."""
 
@@ -324,9 +325,14 @@ def cpu_skin_vbo_arrays(
     node_anim_pose = animation_pose_for_node(node, anim_pose) if anim_pose is not None else None
     if node_anim_pose is None and not is_bas_attachment:
         return positions, normals
+    node_anim_base_pose = animation_pose_for_node(node, anim_base_pose) if anim_base_pose is not None else None
     try:
         uploader = _cached_matrix_palette_uploader(source_model, MAX_BONES, MatrixPaletteUploader)
-        uploader.compute_skin_node_palette(node, node_anim_pose)
+        uploader.compute_skin_node_palette(
+            node,
+            node_anim_pose,
+            anim_base_pose=node_anim_base_pose,
+        )
         palette = uploader.as_numpy_array()
         palette = bas_attachment_root_local_skin_palette(node, palette, node_anim_pose)
         if palette is None or len(palette) == 0:
@@ -487,6 +493,14 @@ def _skinning_palette_model_for_node(node, model=None):
                 return palette_model
         except Exception:
             pass
+    try:
+        from src.core.rendering.mesh_render_data import runtime_source_model_for_node
+
+        source_model = runtime_source_model_for_node(node)
+        if source_model is not None:
+            return source_model
+    except Exception:
+        pass
     return model or _root_model_from_node(node)
 
 
@@ -546,9 +560,12 @@ def cpu_skin_positions(node, positions, skinning: SkinningArrays, anim_pose, mod
     try:
         uploader = MatrixPaletteUploader(max_bones=MAX_BONES)
         uploader.build_inverse_bind_pose(source_model)
-        if anim_base_pose is not None:
-            uploader.set_bind_pose_from_anim(anim_base_pose)
-        uploader.compute_skin_node_palette(node, node_anim_pose)
+        node_anim_base_pose = animation_pose_for_node(node, anim_base_pose) if anim_base_pose is not None else None
+        uploader.compute_skin_node_palette(
+            node,
+            node_anim_pose,
+            anim_base_pose=node_anim_base_pose,
+        )
         palette = uploader.as_numpy_array()
         if palette is None or len(palette) == 0:
             return positions

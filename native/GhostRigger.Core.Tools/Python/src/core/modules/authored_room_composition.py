@@ -11,19 +11,32 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Union
 
+from src.core.geometry.mesh_topology import compact_indexed_mesh
+from src.core.geometry.polygon_mesh_operations import (
+    AttributeChannel,
+    CombinedMeshResult,
+    IndexedMeshOperand,
+    IndexedPolygonMesh,
+    combine_indexed_meshes,
+)
+
 from .authored_room_geometry import AuthoredRoomGeometry, PrimitiveMesh, RectangularRoomPrimitive
 from .authored_walkmesh_surfaces import require_walkable_walkmesh_surface, resolve_walkmesh_surface_id, walkmesh_surface_name
 from .authored_room_primitives import (
     ArchPrimitive,
+    ConePrimitive,
     CubePrimitive,
     CylinderPrimitive,
     DoorFramePrimitive,
     FloorPrimitive,
     PrimitiveMaterial,
     RampPrimitive,
+    SpherePrimitive,
     StairsPrimitive,
+    TorusPrimitive,
     WallPrimitive,
     build_arch_mesh,
+    build_cone_mesh,
     build_cube_mesh,
     build_cylinder_mesh,
     build_door_frame_mesh,
@@ -31,17 +44,25 @@ from .authored_room_primitives import (
     build_floor_wok,
     build_ramp_mesh,
     build_ramp_wok,
+    build_sphere_mesh,
     build_stairs_mesh,
     build_stairs_wok,
+    build_torus_mesh,
     build_wall_mesh,
 )
-from .module_format import WOKData, WOKFace
+from .module_format import WALKABLE_IDS, WOKData, WOKFace
+
+
+DOOR_TRANSITION_SURFACE_ID = 18
 
 
 BaseRoomPrimitive = Union[
     FloorPrimitive,
     WallPrimitive,
     CubePrimitive,
+    SpherePrimitive,
+    ConePrimitive,
+    TorusPrimitive,
     RampPrimitive,
     StairsPrimitive,
     CylinderPrimitive,
@@ -66,14 +87,56 @@ class PrimitiveTransform:
 
 @dataclass(frozen=True)
 class PlacedRoomPrimitive:
-    """A primitive plus editor-authored transform data."""
+    """A primitive plus editor-authored transform data.
 
-    primitive: BaseRoomPrimitive
+    ``evaluation_transforms`` are immutable downstream transform stages.  A
+    Maya-style Freeze Transformations operation moves the current user-facing
+    channels into this tuple instead of baking dimensions or replacing the
+    retained construction recipe.  The ordinary ``transform`` remains the
+    only W/E/R-editable stage.
+    """
+
+    primitive: BaseRoomPrimitive | "CombinedRoomPrimitive"
     transform: PrimitiveTransform = field(default_factory=PrimitiveTransform)
     name: str = ""
+    evaluation_transforms: tuple[PrimitiveTransform, ...] = ()
 
 
-RoomPrimitive = Union[BaseRoomPrimitive, PlacedRoomPrimitive]
+@dataclass(frozen=True)
+class CombinedRoomPrimitiveSource:
+    """One procedural source recipe used by a true polygon mesh combine.
+
+    ``face_indices`` is an optional selection in the source recipe's compiled
+    face space.  An empty tuple means all faces.  WOK faces are not render-face
+    indexed, so ``inherit`` deliberately retains the source's complete authored
+    WOK proxy; ``exclude`` explicitly transfers no WOK ownership.
+    """
+
+    primitive: "RoomPrimitive"
+    face_indices: tuple[int, ...] = ()
+    source_name: str = ""
+    walkmesh_policy: str = "inherit"
+
+
+@dataclass(frozen=True)
+class CombinedRoomPrimitive:
+    """Human-readable procedural recipe for one genuine polygon mesh object."""
+
+    name: str
+    sources: tuple[CombinedRoomPrimitiveSource, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+RoomPrimitive = Union[BaseRoomPrimitive, PlacedRoomPrimitive, CombinedRoomPrimitive]
+
+
+@dataclass(frozen=True)
+class CombinedRoomPrimitiveCompilation:
+    """Compiled mesh plus stable source provenance used by Separate Shells."""
+
+    mesh: PrimitiveMesh
+    indexed_result: CombinedMeshResult
+    source_face_indices: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -81,7 +144,7 @@ class AuthoredRoomComposition:
     """Editable primitive collection for one room model."""
 
     room_resref: str
-    floor: FloorPrimitive
+    floor: FloorPrimitive | PlacedRoomPrimitive
     primitives: tuple[RoomPrimitive, ...] = ()
     helper_meshes: tuple[PrimitiveMesh, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -127,12 +190,20 @@ def _transform_point(point: tuple[float, float, float], transform: PrimitiveTran
 
 
 def _transform_normal(normal: tuple[float, float, float], transform: PrimitiveTransform) -> tuple[float, float, float]:
+    # Points are scaled before the authored Z rotation, so normals must use
+    # the inverse-transpose of that scale before the rotation.  Applying only
+    # the rotation makes lighting visibly wrong under non-uniform scale.
+    sx, sy, sz = (float(value) for value in transform.scale)
+    epsilon = 1.0e-12
+    nx = float(normal[0]) / sx if abs(sx) > epsilon else 0.0
+    ny = float(normal[1]) / sy if abs(sy) > epsilon else 0.0
+    nz = float(normal[2]) / sz if abs(sz) > epsilon else 0.0
     angle = math.radians(float(transform.rotation_degrees_z))
     cos_a = math.cos(angle)
     sin_a = math.sin(angle)
-    x = float(normal[0]) * cos_a - float(normal[1]) * sin_a
-    y = float(normal[0]) * sin_a + float(normal[1]) * cos_a
-    z = float(normal[2])
+    x = nx * cos_a - ny * sin_a
+    y = nx * sin_a + ny * cos_a
+    z = nz
     length = math.sqrt(x * x + y * y + z * z)
     if length <= 0.0:
         return (0.0, 0.0, 1.0)
@@ -166,14 +237,51 @@ def transform_wok_data(wok: WOKData, transform: PrimitiveTransform) -> WOKData:
         name=wok.name,
         verts=[_transform_point(vertex, transform) for vertex in wok.verts],
         faces=[
-            WOKFace(face.v1, face.v2, face.v3, face.surface, face.adj1, face.adj2, face.adj3)
+            WOKFace(
+                face.v1,
+                face.v2,
+                face.v3,
+                face.surface,
+                face.adj1,
+                face.adj2,
+                face.adj3,
+                face.trans1,
+                face.trans2,
+                face.trans3,
+            )
             for face in wok.faces
         ],
     )
 
 
-def _base_primitive(primitive: RoomPrimitive) -> BaseRoomPrimitive:
+def _base_primitive(primitive: RoomPrimitive) -> BaseRoomPrimitive | CombinedRoomPrimitive:
     return primitive.primitive if isinstance(primitive, PlacedRoomPrimitive) else primitive
+
+
+def _floor_base_and_transform(floor: FloorPrimitive | PlacedRoomPrimitive) -> tuple[FloorPrimitive, PrimitiveTransform | None]:
+    if isinstance(floor, PlacedRoomPrimitive):
+        base = floor.primitive
+        if not isinstance(base, FloorPrimitive):
+            raise TypeError(f"Authored room composition floor must be a FloorPrimitive, not {type(base)!r}.")
+        return base, floor.transform
+    return floor, None
+
+
+def _primitive_transform_stages(primitive: RoomPrimitive) -> tuple[PrimitiveTransform, ...]:
+    """Return downstream frozen stages followed by the editable transform."""
+
+    if not isinstance(primitive, PlacedRoomPrimitive):
+        return ()
+    return tuple(primitive.evaluation_transforms or ()) + (primitive.transform,)
+
+
+def _transform_wok_stages(wok: WOKData, stages: tuple[PrimitiveTransform, ...]) -> WOKData:
+    """Evaluate retained transform stages in construction-graph order."""
+
+    result = wok
+    for stage in stages:
+        result = transform_wok_data(result, stage)
+    return result
 
 
 def _primitive_name(primitive: FloorPrimitive | RoomPrimitive) -> str:
@@ -182,10 +290,203 @@ def _primitive_name(primitive: FloorPrimitive | RoomPrimitive) -> str:
     return str(getattr(primitive, "name", "") or "").strip()
 
 
+def _combined_source_face_indices(source: CombinedRoomPrimitiveSource, mesh: PrimitiveMesh) -> tuple[int, ...]:
+    if not source.face_indices:
+        return tuple(range(len(mesh.faces)))
+    selected = tuple(sorted(dict.fromkeys(int(index) for index in source.face_indices)))
+    invalid = tuple(index for index in selected if index < 0 or index >= len(mesh.faces))
+    if invalid:
+        name = source.source_name or mesh.name or "(unnamed source)"
+        raise IndexError(
+            f"Combined source {name} selects face {invalid[0]}, outside 0..{len(mesh.faces) - 1}."
+        )
+    return selected
+
+
+def _mesh_materials(mesh: PrimitiveMesh) -> tuple[tuple[dict[str, Any], ...], tuple[int, ...]]:
+    """Return a local material table and aligned per-face material IDs."""
+
+    metadata = dict(mesh.metadata or {})
+    raw_table = tuple(metadata.get("material_table") or ())
+    table = tuple(dict(item) for item in raw_table if isinstance(item, dict))
+    if not table:
+        table = (
+            {
+                "texture": str(mesh.texture or ""),
+                "diffuse": tuple(float(value) for value in mesh.diffuse),
+                "ambient": tuple(float(value) for value in mesh.ambient),
+                "metadata": {},
+            },
+        )
+    raw_ids = tuple(int(value) for value in tuple(metadata.get("face_material_ids") or ()))
+    if len(raw_ids) != len(mesh.faces) or any(value < 0 or value >= len(table) for value in raw_ids):
+        raw_ids = tuple(0 for _ in mesh.faces)
+    return table, raw_ids
+
+
+def _material_vec3(value: Any, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return fallback
+    return (float(value[0]), float(value[1]), float(value[2]))
+
+
+def compile_combined_room_primitive_indexed(
+    primitive: CombinedRoomPrimitive,
+) -> CombinedRoomPrimitiveCompilation:
+    """Compile a procedural combine recipe through the shared topology engine."""
+
+    name = str(primitive.name or "").strip()
+    if not name:
+        raise ValueError("CombinedRoomPrimitive requires a stable name.")
+    if not primitive.sources:
+        raise ValueError(f"CombinedRoomPrimitive {name} requires at least one source recipe.")
+
+    operands: list[IndexedMeshOperand] = []
+    source_face_indices: list[tuple[int, ...]] = []
+    material_table: list[dict[str, Any]] = []
+    source_manifest: list[dict[str, Any]] = []
+    for source_index, source in enumerate(primitive.sources):
+        policy = str(source.walkmesh_policy or "inherit").strip().lower()
+        if policy not in {"inherit", "exclude"}:
+            raise ValueError(
+                f"Combined source {source.source_name or source_index} has unsupported WOK policy {source.walkmesh_policy!r}."
+            )
+        source_mesh = _primitive_to_mesh(source.primitive)
+        selected_faces = _combined_source_face_indices(source, source_mesh)
+        if not selected_faces:
+            raise ValueError(f"Combined source {source.source_name or source_mesh.name} has no polygon faces.")
+        local_materials, local_face_material_ids = _mesh_materials(source_mesh)
+        local_to_global: dict[int, int] = {}
+        for local_id in sorted({local_face_material_ids[index] for index in selected_faces}):
+            global_id = len(material_table)
+            local_to_global[local_id] = global_id
+            material_table.append(
+                {
+                    **dict(local_materials[local_id]),
+                    "material_id": global_id,
+                    "source_material_id": local_id,
+                    "source_index": source_index,
+                    "source_name": str(source.source_name or source_mesh.name or f"source_{source_index:02d}"),
+                }
+            )
+
+        vertex_channels: dict[str, tuple[Any, ...]] = {}
+        if len(source_mesh.normals) == len(source_mesh.vertices):
+            vertex_channels["normals"] = tuple(source_mesh.normals)
+        if len(source_mesh.uvs) == len(source_mesh.vertices):
+            vertex_channels["uvs"] = tuple(source_mesh.uvs)
+        compacted = compact_indexed_mesh(
+            source_mesh.vertices,
+            source_mesh.faces,
+            vertex_channels=vertex_channels,
+            kept_face_indices=selected_faces,
+        )
+        indexed = IndexedPolygonMesh.build(
+            compacted.vertices,
+            compacted.faces,
+            vertex_channels={
+                channel_name: AttributeChannel.build(
+                    values,
+                    semantic="normal" if channel_name == "normals" else "attribute",
+                )
+                for channel_name, values in compacted.vertex_channels.items()
+            },
+            face_channels={
+                "material_ids": AttributeChannel.build(
+                    tuple(local_to_global[local_face_material_ids[index]] for index in selected_faces),
+                    default=0,
+                )
+            },
+            metadata={
+                "source_name": str(source.source_name or source_mesh.name or f"source_{source_index:02d}"),
+                "source_face_indices": selected_faces,
+                "walkmesh_policy": policy,
+            },
+        )
+        operands.append(
+            IndexedMeshOperand.build(
+                indexed,
+                source_id=str(source.source_name or source_mesh.name or f"source_{source_index:02d}"),
+            )
+        )
+        source_face_indices.append(tuple(compacted.remap.new_face_to_old))
+        source_manifest.append(
+            {
+                "source_index": source_index,
+                "source_name": str(source.source_name or source_mesh.name or f"source_{source_index:02d}"),
+                "selected_face_count": len(selected_faces),
+                "source_face_count": len(source_mesh.faces),
+                "walkmesh_policy": policy,
+            }
+        )
+
+    result = combine_indexed_meshes(tuple(operands))
+    for face in result.mesh.faces:
+        if len(face) != 3:
+            raise ValueError(f"KOTOR authored room output requires triangles; combined face has {len(face)} corners.")
+    normals_channel = result.mesh.vertex_channels.get("normals")
+    uvs_channel = result.mesh.vertex_channels.get("uvs")
+    material_channel = result.mesh.face_channels.get("material_ids")
+    face_material_ids = tuple(int(value) for value in (material_channel.values if material_channel else ()))
+    if len(face_material_ids) != len(result.mesh.faces):
+        face_material_ids = tuple(0 for _ in result.mesh.faces)
+    primary_material = material_table[0] if material_table else {}
+    compiled_mesh = PrimitiveMesh(
+        name=name,
+        vertices=tuple(result.mesh.vertices),
+        faces=tuple(tuple(int(index) for index in face) for face in result.mesh.faces),  # type: ignore[arg-type]
+        normals=tuple(normals_channel.values) if normals_channel is not None else (),
+        uvs=tuple(uvs_channel.values) if uvs_channel is not None else (),
+        texture=str(primary_material.get("texture") or ""),
+        diffuse=_material_vec3(primary_material.get("diffuse"), (0.8, 0.8, 0.8)),
+        ambient=_material_vec3(primary_material.get("ambient"), (0.35, 0.35, 0.35)),
+        metadata={
+            **dict(primitive.metadata),
+            "primitive": "combined_polygon_mesh",
+            "source": "src.core.modules.authored_room_composition",
+            "procedural_recipe": True,
+            "source_count": len(primitive.sources),
+            "sources": source_manifest,
+            "material_table": material_table,
+            "face_material_ids": list(face_material_ids),
+            "material_count": len(material_table),
+            "topology_policy": "true_polygon_combine_preserve_source_seams",
+        },
+    )
+    return CombinedRoomPrimitiveCompilation(
+        mesh=compiled_mesh,
+        indexed_result=result,
+        source_face_indices=tuple(source_face_indices),
+    )
+
+
+def compile_combined_room_primitive(primitive: CombinedRoomPrimitive) -> PrimitiveMesh:
+    """Return the compiled polygon mesh for a human-readable combine recipe."""
+
+    return compile_combined_room_primitive_indexed(primitive).mesh
+
+
 def _primitive_to_mesh(primitive: RoomPrimitive) -> PrimitiveMesh:
     if isinstance(primitive, PlacedRoomPrimitive):
         mesh = _primitive_to_mesh(primitive.primitive)
-        return transform_primitive_mesh(mesh, primitive.transform, name=_primitive_name(primitive))
+        stages = _primitive_transform_stages(primitive)
+        for stage in stages:
+            mesh = transform_primitive_mesh(mesh, stage, name=_primitive_name(primitive))
+        if primitive.evaluation_transforms:
+            mesh = replace(
+                mesh,
+                metadata={
+                    **dict(mesh.metadata),
+                    "evaluation_transform_stages": [
+                        _transform_manifest(stage) for stage in primitive.evaluation_transforms
+                    ],
+                    "evaluation_transform_stage_count": len(primitive.evaluation_transforms),
+                    "construction_recipe_preserved_through_freeze": True,
+                },
+            )
+        return mesh
+    if isinstance(primitive, CombinedRoomPrimitive):
+        return compile_combined_room_primitive(primitive)
     if isinstance(primitive, FloorPrimitive):
         return build_floor_mesh(primitive)
     if isinstance(primitive, WallPrimitive):
@@ -198,6 +499,12 @@ def _primitive_to_mesh(primitive: RoomPrimitive) -> PrimitiveMesh:
         return build_stairs_mesh(primitive)
     if isinstance(primitive, CylinderPrimitive):
         return build_cylinder_mesh(primitive)
+    if isinstance(primitive, SpherePrimitive):
+        return build_sphere_mesh(primitive)
+    if isinstance(primitive, ConePrimitive):
+        return build_cone_mesh(primitive)
+    if isinstance(primitive, TorusPrimitive):
+        return build_torus_mesh(primitive)
     if isinstance(primitive, DoorFramePrimitive):
         return build_door_frame_mesh(primitive)
     if isinstance(primitive, ArchPrimitive):
@@ -205,44 +512,424 @@ def _primitive_to_mesh(primitive: RoomPrimitive) -> PrimitiveMesh:
     raise TypeError(f"Unsupported authored room primitive: {type(primitive)!r}")
 
 
-def _append_wok(base: WOKData, extra: WOKData) -> WOKData:
-    """Append one primitive WOK to another while preserving local adjacency."""
+def primitive_to_mesh(primitive: RoomPrimitive) -> PrimitiveMesh:
+    """Return the compiled mesh for one authored primitive instance.
 
-    vertex_offset = len(base.verts)
-    face_offset = len(base.faces)
-    base.verts.extend(tuple(vertex) for vertex in extra.verts)
-    for face in extra.faces:
-        base.faces.append(
-            WOKFace(
-                face.v1 + vertex_offset,
-                face.v2 + vertex_offset,
-                face.v3 + vertex_offset,
-                face.surface,
-                face.adj1 + face_offset if face.adj1 >= 0 else -1,
-                face.adj2 + face_offset if face.adj2 >= 0 else -1,
-                face.adj3 + face_offset if face.adj3 >= 0 else -1,
+    Map Studio tools such as the Universal Manipulator need exact selected
+    bounds without owning primitive-specific mesh math in the UI layer.
+    """
+
+    return _primitive_to_mesh(primitive)
+
+
+def _primitive_render_meshes(primitive: RoomPrimitive) -> tuple[PrimitiveMesh, ...]:
+    """Materialize KOTOR-safe mesh nodes for one logical authored object.
+
+    A Maya-style Combined Mesh may retain several material assignments, while
+    Odyssey room nodes have one reliable texture recipe per mesh node.  Split
+    the compiled object into material submeshes for MDL export/preview but keep
+    the same ``logical_primitive_name`` so selection and Separate Shells still
+    treat them as one polygon object.
+    """
+
+    mesh = _primitive_to_mesh(primitive)
+    base = _base_primitive(primitive)
+    logical_name = _primitive_name(primitive) or mesh.name
+    if not isinstance(base, CombinedRoomPrimitive):
+        return (mesh,)
+    metadata = dict(mesh.metadata or {})
+    material_table = tuple(
+        dict(row) for row in tuple(metadata.get("material_table") or ()) if isinstance(row, dict)
+    )
+    face_material_ids = tuple(int(value) for value in tuple(metadata.get("face_material_ids") or ()))
+    if len(face_material_ids) != len(mesh.faces):
+        face_material_ids = tuple(0 for _ in mesh.faces)
+    material_ids = tuple(sorted(set(face_material_ids)))
+    if len(material_ids) <= 1:
+        return (
+            replace(
+                mesh,
+                metadata={**metadata, "logical_primitive_name": logical_name},
+            ),
+        )
+    vertex_channels: dict[str, tuple[Any, ...]] = {}
+    if len(mesh.normals) == len(mesh.vertices):
+        vertex_channels["normals"] = tuple(mesh.normals)
+    if len(mesh.uvs) == len(mesh.vertices):
+        vertex_channels["uvs"] = tuple(mesh.uvs)
+    result: list[PrimitiveMesh] = []
+    for material_id in material_ids:
+        material_suffix = f"_mat{material_id:02d}"
+        material_node_name = f"{logical_name[: max(1, 32 - len(material_suffix))]}{material_suffix}"
+        kept_faces = tuple(index for index, value in enumerate(face_material_ids) if value == material_id)
+        compacted = compact_indexed_mesh(
+            mesh.vertices,
+            mesh.faces,
+            vertex_channels=vertex_channels,
+            kept_face_indices=kept_faces,
+        )
+        material = material_table[material_id] if 0 <= material_id < len(material_table) else {}
+        result.append(
+            PrimitiveMesh(
+                name=material_node_name,
+                vertices=tuple(compacted.vertices),
+                faces=tuple(tuple(int(value) for value in face) for face in compacted.faces),
+                normals=tuple(compacted.vertex_channels.get("normals", ())),
+                uvs=tuple(compacted.vertex_channels.get("uvs", ())),
+                texture=str(material.get("texture") or mesh.texture or ""),
+                diffuse=_material_vec3(material.get("diffuse"), mesh.diffuse),
+                ambient=_material_vec3(material.get("ambient"), mesh.ambient),
+                metadata={
+                    **metadata,
+                    "logical_primitive_name": logical_name,
+                    "material_table": [material] if material else [],
+                    "face_material_ids": [0] * len(compacted.faces),
+                    "material_count": 1,
+                    "source_material_id": material_id,
+                    "source_face_indices": list(compacted.remap.new_face_to_old),
+                    "kotor_material_submesh": True,
+                },
             )
         )
+    return tuple(result)
+
+
+_WOK_SEAM_EPSILON = 1.0e-5
+
+
+def _segment_parameter(
+    point: tuple[float, float, float],
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+    *,
+    epsilon: float = _WOK_SEAM_EPSILON,
+) -> float | None:
+    """Return a point's parameter on a 3-D segment when it is truly collinear."""
+
+    delta = tuple(float(end[axis]) - float(start[axis]) for axis in range(3))
+    length_sq = sum(value * value for value in delta)
+    if length_sq <= epsilon * epsilon:
+        return None
+    relative = tuple(float(point[axis]) - float(start[axis]) for axis in range(3))
+    parameter = sum(relative[axis] * delta[axis] for axis in range(3)) / length_sq
+    projected = tuple(float(start[axis]) + parameter * delta[axis] for axis in range(3))
+    if math.dist(tuple(float(value) for value in point), projected) > epsilon:
+        return None
+    parameter_epsilon = epsilon / math.sqrt(length_sq)
+    if parameter < -parameter_epsilon or parameter > 1.0 + parameter_epsilon:
+        return None
+    return min(1.0, max(0.0, parameter))
+
+
+def _walkable_component_count(wok: WOKData) -> int:
+    """Count raw-index connected walkable face components."""
+
+    wok.rebuild_adjacencies()
+    walkable = {index for index, face in enumerate(wok.faces) if face.surface in WALKABLE_IDS}
+    components = 0
+    while walkable:
+        components += 1
+        pending = [walkable.pop()]
+        while pending:
+            face_index = pending.pop()
+            face = wok.faces[face_index]
+            for adjacent in (face.adj1, face.adj2, face.adj3):
+                if adjacent in walkable:
+                    walkable.remove(adjacent)
+                    pending.append(adjacent)
+    return components
+
+
+def _find_boundary_seam(
+    base: WOKData,
+    extra: WOKData,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
+    """Find an oppositely wound low edge contained by a base boundary edge.
+
+    Requiring containment and opposite winding prevents an interior ramp which
+    merely overlaps the floor from being mistaken for a valid connection.  A
+    ramp or stair may only extend from a real room-WOK boundary; open space is
+    never bridged automatically.
+    """
+
+    base.rebuild_adjacencies()
+    extra.rebuild_adjacencies()
+    extra_boundaries = extra.boundary_edges()
+    if not extra_boundaries:
+        return None
+    horizontal = [
+        row
+        for row in extra_boundaries
+        if abs(float(extra.verts[row[0]][2]) - float(extra.verts[row[1]][2])) <= _WOK_SEAM_EPSILON
+    ]
+    if not horizontal:
+        return None
+    minimum_height = min(
+        (float(extra.verts[row[0]][2]) + float(extra.verts[row[1]][2])) * 0.5
+        for row in horizontal
+    )
+    low_edges = [
+        row
+        for row in horizontal
+        if abs(
+            (float(extra.verts[row[0]][2]) + float(extra.verts[row[1]][2])) * 0.5
+            - minimum_height
+        )
+        <= _WOK_SEAM_EPSILON
+    ]
+    best: tuple[float, tuple[int, int, int, int], tuple[int, int, int, int]] | None = None
+    for base_edge in base.boundary_edges():
+        base_start = base.verts[base_edge[0]]
+        base_end = base.verts[base_edge[1]]
+        base_delta = tuple(float(base_end[axis]) - float(base_start[axis]) for axis in range(3))
+        base_length = math.sqrt(sum(value * value for value in base_delta))
+        if base_length <= _WOK_SEAM_EPSILON:
+            continue
+        for extra_edge in low_edges:
+            extra_start = extra.verts[extra_edge[0]]
+            extra_end = extra.verts[extra_edge[1]]
+            start_parameter = _segment_parameter(extra_start, base_start, base_end)
+            end_parameter = _segment_parameter(extra_end, base_start, base_end)
+            if start_parameter is None or end_parameter is None:
+                continue
+            extra_delta = tuple(float(extra_end[axis]) - float(extra_start[axis]) for axis in range(3))
+            extra_length = math.sqrt(sum(value * value for value in extra_delta))
+            if extra_length <= _WOK_SEAM_EPSILON:
+                continue
+            direction_dot = sum(base_delta[axis] * extra_delta[axis] for axis in range(3))
+            direction_cosine = direction_dot / (base_length * extra_length)
+            if direction_cosine > -1.0 + _WOK_SEAM_EPSILON:
+                continue
+            overlap = abs(end_parameter - start_parameter) * base_length
+            candidate = (overlap, base_edge, extra_edge)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    return None if best is None else (best[1], best[2])
+
+
+def _split_boundary_face_for_seam(
+    base: WOKData,
+    base_edge: tuple[int, int, int, int],
+    extra: WOKData,
+    extra_edge: tuple[int, int, int, int],
+) -> dict[int, int]:
+    """Split a longer base boundary and return extra-to-base seam vertices."""
+
+    base_start_index, base_end_index, face_index, local_edge = base_edge
+    base_start = base.verts[base_start_index]
+    base_end = base.verts[base_end_index]
+    seam_vertices: dict[int, int] = {}
+    chain: list[tuple[float, int]] = [(0.0, base_start_index), (1.0, base_end_index)]
+    for extra_index in (extra_edge[0], extra_edge[1]):
+        point = tuple(float(value) for value in extra.verts[extra_index])
+        parameter = _segment_parameter(point, base_start, base_end)
+        if parameter is None:
+            raise ValueError("Walkmesh seam endpoints stopped matching their selected boundary edge.")
+        if parameter <= _WOK_SEAM_EPSILON:
+            mapped_index = base_start_index
+        elif parameter >= 1.0 - _WOK_SEAM_EPSILON:
+            mapped_index = base_end_index
+        else:
+            # Raw indices, not coordinate equality, define WOK topology.  Do
+            # not reuse a coordinate-equal vertex from another shell here.
+            mapped_index = len(base.verts)
+            base.verts.append(point)
+            chain.append((parameter, mapped_index))
+        seam_vertices[extra_index] = mapped_index
+
+    deduplicated_chain: list[tuple[float, int]] = []
+    for parameter, vertex_index in sorted(chain, key=lambda row: row[0]):
+        if deduplicated_chain and vertex_index == deduplicated_chain[-1][1]:
+            continue
+        deduplicated_chain.append((parameter, vertex_index))
+    if len(deduplicated_chain) <= 2:
+        setattr(base.faces[face_index], f"trans{local_edge + 1}", -1)
+        return seam_vertices
+
+    source = base.faces[face_index]
+    triangle = (source.v1, source.v2, source.v3)
+    transitions = (source.trans1, source.trans2, source.trans3)
+    third_index = triangle[(local_edge + 2) % 3]
+    boundary_transition = transitions[local_edge]
+    trailing_transition = transitions[(local_edge + 1) % 3]
+    leading_transition = transitions[(local_edge + 2) % 3]
+    seam_key = tuple(sorted(seam_vertices.values()))
+    replacement: list[WOKFace] = []
+    for chain_index in range(len(deduplicated_chain) - 1):
+        left = deduplicated_chain[chain_index][1]
+        right = deduplicated_chain[chain_index + 1][1]
+        segment_transition = -1 if tuple(sorted((left, right))) == seam_key else boundary_transition
+        replacement.append(
+            WOKFace(
+                left,
+                right,
+                third_index,
+                source.surface,
+                trans1=segment_transition,
+                trans2=trailing_transition if right == base_end_index else -1,
+                trans3=leading_transition if left == base_start_index else -1,
+            )
+        )
+    base.faces[face_index] = replacement[0]
+    base.faces.extend(replacement[1:])
+    return seam_vertices
+
+
+def _append_wok(base: WOKData, extra: WOKData) -> WOKData:
+    """Append a WOK, stitching only a genuine coincident low boundary seam."""
+
+    if not base.faces:
+        base.verts.extend(tuple(vertex) for vertex in extra.verts)
+        base.faces.extend(
+            WOKFace(
+                face.v1,
+                face.v2,
+                face.v3,
+                face.surface,
+                face.adj1,
+                face.adj2,
+                face.adj3,
+                face.trans1,
+                face.trans2,
+                face.trans3,
+            )
+            for face in extra.faces
+        )
+        base.rebuild_adjacencies()
+        return base
+
+    seam = _find_boundary_seam(base, extra)
+    seam_vertices = (
+        _split_boundary_face_for_seam(base, seam[0], extra, seam[1])
+        if seam is not None
+        else {}
+    )
+    vertex_remap: dict[int, int] = dict(seam_vertices)
+    for extra_index, vertex in enumerate(extra.verts):
+        if extra_index in vertex_remap:
+            continue
+        vertex_remap[extra_index] = len(base.verts)
+        base.verts.append(tuple(vertex))
+    for extra_face_index, face in enumerate(extra.faces):
+        transitions = [face.trans1, face.trans2, face.trans3]
+        if seam is not None and extra_face_index == seam[1][2]:
+            # A transition belongs to a perimeter edge.  Once the edge is a
+            # stitched internal seam, retaining it would create an engine-
+            # invalid orphan transition record.
+            transitions[seam[1][3]] = -1
+        base.faces.append(
+            WOKFace(
+                vertex_remap[face.v1],
+                vertex_remap[face.v2],
+                vertex_remap[face.v3],
+                face.surface,
+                trans1=transitions[0],
+                trans2=transitions[1],
+                trans3=transitions[2],
+            )
+        )
+    base.rebuild_adjacencies()
     return base
 
 
-def build_composition_wok(composition: AuthoredRoomComposition) -> WOKData:
-    """Build the room WOK from the floor plus walkable authored primitives."""
+def primitive_to_wok(primitive: RoomPrimitive) -> WOKData | None:
+    """Compile one primitive recipe's inherited walkable WOK contribution.
 
-    wok = build_floor_wok(composition.floor)
+    Polygon face selections never guess at a render-face-to-WOK-face mapping.
+    A combined source therefore inherits its complete authored WOK proxy once,
+    unless its explicit ``walkmesh_policy`` is ``exclude``.
+    """
+
+    if isinstance(primitive, PlacedRoomPrimitive):
+        primitive_wok = primitive_to_wok(primitive.primitive)
+        return (
+            _transform_wok_stages(primitive_wok, _primitive_transform_stages(primitive))
+            if primitive_wok is not None
+            else None
+        )
+    if isinstance(primitive, CombinedRoomPrimitive):
+        combined = WOKData(name=primitive.name)
+        contributed = False
+        for source in primitive.sources:
+            policy = str(source.walkmesh_policy or "inherit").strip().lower()
+            if policy not in {"inherit", "exclude"}:
+                raise ValueError(
+                    f"Combined source {source.source_name or '(unnamed)'} has unsupported WOK policy {source.walkmesh_policy!r}."
+                )
+            if policy == "exclude":
+                continue
+            source_wok = primitive_to_wok(source.primitive)
+            if source_wok is not None:
+                _append_wok(combined, source_wok)
+                contributed = True
+        return combined if contributed else None
+    if isinstance(primitive, FloorPrimitive):
+        return build_floor_wok(primitive)
+    if isinstance(primitive, RampPrimitive):
+        return build_ramp_wok(primitive)
+    if isinstance(primitive, StairsPrimitive):
+        return build_stairs_wok(primitive)
+    return None
+
+
+def _build_floor_wok_for_composition(composition: AuthoredRoomComposition) -> WOKData:
+    """Build the base floor WOK, optionally reserving a doorway transition strip."""
+
+    floor, _transform = _floor_base_and_transform(composition.floor)
+    transform_stages = _primitive_transform_stages(composition.floor)
+    if not bool(dict(composition.metadata or {}).get("include_door_transition_surface", False)):
+        wok = build_floor_wok(floor)
+        return _transform_wok_stages(wok, transform_stages)
+
+    surface_id = resolve_walkmesh_surface_id(floor.surface_id)
+    half_w = float(floor.width) * 0.5
+    half_d = float(floor.depth) * 0.5
+    z = float(floor.z)
+    strip_depth = max(0.25, min(2.0, float(floor.depth) * 0.25))
+    strip_y = half_d - strip_depth
+    wok = WOKData(
+        verts=[
+            (-half_w, -half_d, z),
+            (half_w, -half_d, z),
+            (half_w, strip_y, z),
+            (-half_w, strip_y, z),
+            (half_w, half_d, z),
+            (-half_w, half_d, z),
+        ],
+        faces=[
+            WOKFace(0, 1, 2, surface=surface_id, adj1=-1, adj2=-1, adj3=1),
+            WOKFace(0, 2, 3, surface=surface_id, adj1=0, adj2=2, adj3=-1),
+            WOKFace(3, 2, 4, surface=DOOR_TRANSITION_SURFACE_ID, adj1=1, adj2=-1, adj3=3),
+            WOKFace(3, 4, 5, surface=DOOR_TRANSITION_SURFACE_ID, adj1=2, adj2=-1, adj3=-1),
+        ],
+    )
+    return _transform_wok_stages(wok, transform_stages)
+
+
+def build_composition_wok(composition: AuthoredRoomComposition) -> WOKData:
+    """Build one connected room WOK from floor plus authored primitives.
+
+    Disconnected walkable islands are blocked for new authoring unless the
+    composition explicitly records that a designer reviewed and accepted them.
+    That override preserves islands; it never invents a bridge across space.
+    """
+
+    wok = _build_floor_wok_for_composition(composition)
+    allow_islands = bool(dict(composition.metadata or {}).get("allow_disconnected_walkmesh_islands", False))
     for primitive in composition.primitives:
-        base = _base_primitive(primitive)
-        primitive_wok: WOKData | None = None
-        if isinstance(base, FloorPrimitive):
-            primitive_wok = build_floor_wok(base)
-        if isinstance(base, RampPrimitive):
-            primitive_wok = build_ramp_wok(base)
-        if isinstance(base, StairsPrimitive):
-            primitive_wok = build_stairs_wok(base)
+        primitive_wok = primitive_to_wok(primitive)
         if primitive_wok is not None:
-            if isinstance(primitive, PlacedRoomPrimitive):
-                primitive_wok = transform_wok_data(primitive_wok, primitive.transform)
             _append_wok(wok, primitive_wok)
+            component_count = _walkable_component_count(wok)
+            if component_count > 1 and not allow_islands:
+                primitive_name = _primitive_name(primitive) or "(unnamed)"
+                raise ValueError(
+                    f"Walkmesh primitive {primitive_name} is disconnected from the room floor. "
+                    "Snap its low boundary edge to an existing walkmesh boundary; Ghost Studio will not "
+                    "bridge open space. Set composition metadata allow_disconnected_walkmesh_islands=true "
+                    "only after reviewing an intentional island."
+                )
+    wok.rebuild_adjacencies()
     return wok
 
 
@@ -251,14 +938,24 @@ def validate_authored_room_composition(composition: AuthoredRoomComposition) -> 
 
     warnings: list[str] = []
     blocking: list[str] = []
+    floor, floor_transform = _floor_base_and_transform(composition.floor)
     if not _normalise_name(composition.room_resref):
         blocking.append("Authored room composition requires a room resref.")
-    if float(composition.floor.width) <= 0.0 or float(composition.floor.depth) <= 0.0:
+    if float(floor.width) <= 0.0 or float(floor.depth) <= 0.0:
         blocking.append("Authored room floor must have positive width and depth.")
+    if int(floor.subdivisions_width) < 1 or int(floor.subdivisions_depth) < 1:
+        blocking.append("Authored room floor subdivisions must be at least 1 on width and depth.")
     try:
-        require_walkable_walkmesh_surface(composition.floor.surface_id, context=f"{composition.room_resref} floor")
+        require_walkable_walkmesh_surface(floor.surface_id, context=f"{composition.room_resref} floor")
     except ValueError as exc:
         blocking.append(str(exc))
+    floor_transforms = _primitive_transform_stages(composition.floor)
+    if floor_transform is not None and any(
+        any(float(value) <= 0.0 for value in transform.scale) for transform in floor_transforms
+    ):
+        blocking.append(
+            f"Placed floor {_primitive_name(composition.floor) or '(unnamed)'} must have positive transform scale."
+        )
     names: set[str] = set()
     for primitive in (composition.floor, *composition.primitives):
         name = _primitive_name(primitive)
@@ -269,17 +966,32 @@ def validate_authored_room_composition(composition: AuthoredRoomComposition) -> 
             blocking.append(f"Duplicate authored room primitive name: {name}")
         names.add(name)
     for primitive in composition.primitives:
-        if isinstance(primitive, PlacedRoomPrimitive) and any(float(value) <= 0.0 for value in primitive.transform.scale):
-            blocking.append(f"Placed primitive {_primitive_name(primitive) or '(unnamed)'} must have positive transform scale.")
+        if isinstance(primitive, PlacedRoomPrimitive) and any(
+            any(float(value) <= 0.0 for value in transform.scale)
+            for transform in _primitive_transform_stages(primitive)
+        ):
+            blocking.append(
+                f"Placed primitive {_primitive_name(primitive) or '(unnamed)'} must have positive transform scale."
+            )
         base = _base_primitive(primitive)
         base_name = _primitive_name(primitive) or str(getattr(base, "name", "") or "(unnamed)")
         if isinstance(base, FloorPrimitive):
             if float(base.width) <= 0.0 or float(base.depth) <= 0.0:
                 blocking.append(f"Plane primitive {base_name} must have positive width and depth.")
+            if int(base.subdivisions_width) < 1 or int(base.subdivisions_depth) < 1:
+                blocking.append(f"Plane primitive {base_name} subdivisions must be at least 1 on width and depth.")
             try:
                 require_walkable_walkmesh_surface(base.surface_id, context=f"{base_name} plane")
             except ValueError as exc:
                 blocking.append(str(exc))
+        if isinstance(base, CubePrimitive):
+            if any(float(value) <= 0.0 for value in base.size):
+                blocking.append(f"Cube primitive {base_name} must have positive X, Y, and Z sizes.")
+            if any(
+                int(value) < 1
+                for value in (base.subdivisions_x, base.subdivisions_y, base.subdivisions_z)
+            ):
+                blocking.append(f"Cube primitive {base_name} subdivisions must be at least 1 on X, Y, and Z.")
         if isinstance(base, RampPrimitive):
             if float(base.width) <= 0.0 or float(base.length) <= 0.0 or float(base.height) <= 0.0:
                 blocking.append(f"Ramp primitive {base_name} must have positive width, length, and height.")
@@ -299,6 +1011,40 @@ def validate_authored_room_composition(composition: AuthoredRoomComposition) -> 
                 require_walkable_walkmesh_surface(base.surface_id, context=f"{base_name} stairs")
             except ValueError as exc:
                 blocking.append(str(exc))
+        if isinstance(base, SpherePrimitive):
+            if (
+                float(base.radius) <= 0.0
+                or int(base.subdivisions_axis) < 3
+                or int(base.subdivisions_height) < 2
+            ):
+                blocking.append(
+                    f"Sphere primitive {base_name} requires a positive radius, at least 3 axis subdivisions, "
+                    "and at least 2 height subdivisions."
+                )
+        if isinstance(base, ConePrimitive):
+            if (
+                float(base.radius) <= 0.0
+                or float(base.height) <= 0.0
+                or int(base.subdivisions_axis) < 3
+                or int(base.subdivisions_height) < 1
+                or int(base.subdivisions_caps) < 1
+            ):
+                blocking.append(
+                    f"Cone primitive {base_name} requires positive radius/height, at least 3 axis subdivisions, "
+                    "and at least 1 height/cap subdivision."
+                )
+        if isinstance(base, TorusPrimitive):
+            if (
+                float(base.radius) <= 0.0
+                or float(base.section_radius) <= 0.0
+                or float(base.radius) <= float(base.section_radius)
+                or int(base.subdivisions_axis) < 3
+                or int(base.subdivisions_height) < 3
+            ):
+                blocking.append(
+                    f"Torus primitive {base_name} requires radius greater than a positive section radius and "
+                    "at least 3 axis/height subdivisions."
+                )
         if isinstance(base, ArchPrimitive):
             if (
                 float(base.width) <= 0.0
@@ -322,6 +1068,20 @@ def validate_authored_room_composition(composition: AuthoredRoomComposition) -> 
                 blocking.append(f"Door frame primitive {base_name} must leave a positive doorway opening height.")
     if not composition.primitives and not composition.helper_meshes:
         warnings.append("Authored room composition has only a floor; add walls or helpers before game-facing export.")
+    if not blocking:
+        try:
+            validated_wok = build_composition_wok(composition)
+            component_count = _walkable_component_count(validated_wok)
+            if component_count > 1:
+                warnings.append(
+                    f"Authored room composition explicitly preserves {component_count} disconnected walkmesh islands; "
+                    "verify every island in KOTOR 2 before shipping."
+                )
+            # Compile/export must not discover a malformed perimeter or AABB
+            # after the editor has already declared the composition ready.
+            validated_wok.to_bytes()
+        except ValueError as exc:
+            blocking.append(str(exc))
     return AuthoredRoomCompositionValidation(
         ok=not blocking,
         warnings=tuple(warnings),
@@ -335,9 +1095,14 @@ def compile_authored_room_composition(composition: AuthoredRoomComposition) -> A
     validation = validate_authored_room_composition(composition)
     if not validation.ok:
         raise ValueError("; ".join(validation.blocking_issues))
-    floor_mesh = build_floor_mesh(composition.floor)
-    floor_surface_id = resolve_walkmesh_surface_id(composition.floor.surface_id)
-    primitive_meshes = tuple(_primitive_to_mesh(primitive) for primitive in composition.primitives)
+    floor, _floor_transform = _floor_base_and_transform(composition.floor)
+    floor_mesh = _primitive_to_mesh(composition.floor)
+    floor_surface_id = resolve_walkmesh_surface_id(floor.surface_id)
+    primitive_meshes = tuple(
+        mesh
+        for primitive in composition.primitives
+        for mesh in _primitive_render_meshes(primitive)
+    )
     room_resref = _normalise_name(composition.room_resref)
     return AuthoredRoomGeometry(
         room_resref=room_resref,
@@ -351,15 +1116,20 @@ def compile_authored_room_composition(composition: AuthoredRoomComposition) -> A
             "floor": floor_mesh.name,
             "floor_surface_id": floor_surface_id,
             "floor_surface_name": walkmesh_surface_name(floor_surface_id),
+            "transition_surface_id": DOOR_TRANSITION_SURFACE_ID
+            if bool(dict(composition.metadata or {}).get("include_door_transition_surface", False))
+            else 0,
             "primitive_count": len(composition.primitives),
             "helper_mesh_count": len(composition.helper_meshes),
             "compiled_mesh_count": 1 + len(primitive_meshes) + len(composition.helper_meshes),
             "walkmesh_primitive_count": sum(
                 1
                 for primitive in composition.primitives
-                if isinstance(_base_primitive(primitive), (FloorPrimitive, RampPrimitive, StairsPrimitive))
+                if primitive_to_wok(primitive) is not None
             ),
-            "transformed_primitive_count": sum(1 for primitive in composition.primitives if isinstance(primitive, PlacedRoomPrimitive)),
+            "transformed_primitive_count": sum(
+                1 for primitive in (composition.floor,) + tuple(composition.primitives) if isinstance(primitive, PlacedRoomPrimitive)
+            ),
             "warnings": list(validation.warnings),
         },
     )
@@ -438,6 +1208,7 @@ def create_rectangular_room_composition(primitive: RectangularRoomPrimitive) -> 
             "wall_height": wall_height,
             "floor_surface_id": floor_surface_id,
             "floor_surface_name": walkmesh_surface_name(floor_surface_id),
+            "include_door_transition_surface": bool(primitive.include_doorway_marker),
         },
     )
 
@@ -445,12 +1216,19 @@ def create_rectangular_room_composition(primitive: RectangularRoomPrimitive) -> 
 __all__ = [
     "AuthoredRoomComposition",
     "AuthoredRoomCompositionValidation",
+    "CombinedRoomPrimitive",
+    "CombinedRoomPrimitiveCompilation",
+    "CombinedRoomPrimitiveSource",
     "PlacedRoomPrimitive",
     "PrimitiveTransform",
     "RoomPrimitive",
     "build_composition_wok",
     "compile_authored_room_composition",
+    "compile_combined_room_primitive",
+    "compile_combined_room_primitive_indexed",
     "create_rectangular_room_composition",
+    "primitive_to_mesh",
+    "primitive_to_wok",
     "transform_primitive_mesh",
     "transform_wok_data",
     "validate_authored_room_composition",

@@ -204,14 +204,22 @@ def test_non_serializable_metadata_fails_preflight(tmp_path: Path) -> None:
     assert any("non-JSON-serializable" in issue.message for issue in result.validation_report.issues)
 
 
-def test_outputs_must_share_parent_directory_for_now(tmp_path: Path) -> None:
+def test_multi_directory_outputs_stage_and_promote_together(tmp_path: Path) -> None:
     out_a = tmp_path / "a" / "one.txt"
     out_b = tmp_path / "b" / "two.txt"
-    called = False
+    seen_staging_dirs: list[Path] = []
 
-    def writer(_context: ExportJobContext) -> None:
-        nonlocal called
-        called = True
+    def writer(context: ExportJobContext) -> None:
+        context.write_text(out_a, "one", encoding="utf-8")
+        context.write_text(out_b, "two", encoding="utf-8")
+        staged_a = context.staged_path_for(out_a)
+        staged_b = context.staged_path_for(out_b)
+        assert staged_a.exists()
+        assert staged_b.exists()
+        assert staged_a.parent != staged_b.parent
+        assert not out_a.exists()
+        assert not out_b.exists()
+        seen_staging_dirs.extend([staged_a.parent, staged_b.parent])
 
     result = run_export_job(
         _request(
@@ -224,9 +232,42 @@ def test_outputs_must_share_parent_directory_for_now(tmp_path: Path) -> None:
         writer=writer,
     )
 
-    assert result.status == ExportJobStatus.PREFLIGHT_FAILED
-    assert called is False
-    assert any("share one final parent" in issue.message for issue in result.validation_report.issues)
+    assert result.status == ExportJobStatus.SUCCEEDED
+    assert out_a.read_text(encoding="utf-8") == "one"
+    assert out_b.read_text(encoding="utf-8") == "two"
+    assert Path(result.staged_paths[str(out_a)]).name == "one.txt"
+    assert Path(result.staged_paths[str(out_b)]).name == "two.txt"
+    assert seen_staging_dirs and all(not path.exists() for path in seen_staging_dirs)
+
+
+def test_multi_directory_staging_does_not_repeat_long_absolute_paths(tmp_path: Path) -> None:
+    output_root = tmp_path / ("user_selected_map_studio_package_" + ("x" * 64))
+    module = output_root / "install" / "Modules" / "grstyles.mod"
+    room = output_root / "source" / "resources" / "grstylesr001.mdl"
+    seen_staged: list[Path] = []
+
+    def writer(context: ExportJobContext) -> None:
+        seen_staged.extend((context.staged_path_for(module), context.staged_path_for(room)))
+        context.write_bytes(module, b"mod")
+        context.write_bytes(room, b"mdl")
+
+    result = run_export_job(
+        _request(
+            module,
+            job_id="map_studio.custom_module_package.grstyles.with_a_long_descriptive_job_name",
+            outputs=(
+                ExportOutputSpec(module, "module_package"),
+                ExportOutputSpec(room, "loose_resource"),
+            ),
+        ),
+        writer=writer,
+    )
+
+    assert result.succeeded is True
+    assert module.read_bytes() == b"mod"
+    assert room.read_bytes() == b"mdl"
+    assert seen_staged
+    assert all(str(output_root.resolve()).lower() not in path.parent.name.lower() for path in seen_staged)
 
 
 def test_manifest_writer_output_is_promoted(tmp_path: Path) -> None:
@@ -261,4 +302,3 @@ def test_manifest_writer_output_is_promoted(tmp_path: Path) -> None:
     assert result.manifest_path == manifest
     assert manifest.exists()
     assert json.loads(manifest.read_text(encoding="utf-8"))["job_id"] == "job1"
-

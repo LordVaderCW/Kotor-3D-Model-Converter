@@ -172,6 +172,9 @@ def test_shared_viewport_exposes_pivot_and_freeze_toolbar_actions() -> None:
     assert "ViewportFreezeTransformsButton" in viewport
     assert "def center_pivot_to_selection" in viewport
     assert "def freeze_selected_transform" in viewport
+    assert "def _freeze_world_vertices_for_node" in viewport
+    assert "def _mark_node_vertices_as_world_space" in viewport
+    assert "_gr_vertices_in_kotor_world = True" in viewport
 
 
 def test_complete_character_load_and_texture_folder_prompt_are_wired() -> None:
@@ -317,10 +320,21 @@ def test_import_root_gimbal_transforms_whole_mesh_and_supports_scale() -> None:
     assert "apply_external_model_fit_adjustment" in viewport
     assert "translation_delta=translation_delta" in viewport
     assert "scale_delta=scale_delta" in viewport
+    assert "pivot_override=getattr" in viewport
     assert "def _hit_test_model_bounds" in viewport
     assert "def _draw_selected_model_outline" in viewport
     assert "Scale mode (gimbal_mode==3)" in core
     assert "elif self.gimbal_mode == 3" in core
+
+
+def test_character_builder_bind_marks_clean_payload_vertices_as_world_space() -> None:
+    builder = _read("src/core/characters/character_builder.py")
+    workflow = _read("src/core/characters/headless_body_workflow.py")
+
+    assert "cleaned.vertex_space = 1" in builder
+    assert 'setattr(cleaned, "_imported", True)' in builder
+    assert 'setattr(cleaned, "_gr_vertices_in_kotor_world", True)' in builder
+    assert "pivot_override" in workflow
 
 
 def test_rotation_gimbal_rings_are_hit_testable() -> None:
@@ -365,6 +379,36 @@ def test_external_template_skeleton_is_selectable_and_symmetry_aware() -> None:
     assert "def set_symmetry_enabled" in inspector
     assert "def symmetry_enabled" in inspector
     assert "def set_joint_symmetry" in viewport
+
+
+def test_character_builder_has_rig_tool_belt_and_marking_menus() -> None:
+    builder = _read("src/gui/panels/qt_character_builder_panel.py")
+    viewport_variants = _read("src/gui/viewports/viewport_core/widgets/variants.py")
+
+    assert 'QtWidgets.QLabel(" Rig: ")' in builder
+    assert '("select", "Select"' in builder
+    assert '("translate", "Move"' in builder
+    assert '("rotate", "Rotate"' in builder
+    assert '("transform", "Transform"' in builder
+    assert "CharacterBuilderRigToolAction_{key}" in builder
+    assert "characterBuilderTransformMarkingMenu" in builder
+    assert "characterBuilderRigMarkingMenu" in builder
+    assert "characterBuilderRigMarkingQuickButton_{key}" in builder
+    assert '("weights", "Weights"' in builder
+    assert '("center_pivot", "Center Pivot"' in builder
+    assert '("freeze_transforms", "Freeze"' in builder
+    assert "def _center_pivot_from_marking_menu" in builder
+    assert "def _freeze_transform_from_marking_menu" in builder
+    assert "characterBuilderRigMarkingAction_{key}" in builder
+    assert '("rom", "Range of Motion Test"' in builder
+    assert "def _viewport_external_skeleton_model" in builder
+    assert "def _option_from_loaded_skeleton_template" in builder
+    assert "or self._viewport_external_skeleton_model()" in builder
+    assert "rigTransformMarkingMenuRequested" in viewport_variants
+    assert "rigToolsMarkingMenuRequested" in viewport_variants
+    assert "DEFAULT_VIEWPORT_TOOLBAR_VISIBLE = False" in viewport_variants
+    assert "DEFAULT_MAP_STUDIO_AUTHORING_CHROME = True" in viewport_variants
+    assert "tabs.hide()" not in viewport_variants
 
 
 def test_selected_imported_mesh_outline_uses_projected_mesh_hover_path_not_bbox() -> None:
@@ -416,15 +460,19 @@ def test_gpu_renderer_clamps_single_tile_character_atlases_like_cpu_renderer() -
 
     assert "FIX-EDGEBLEED (CPU)" in viewport
     assert "FIX-EDGEBLEED (GPU)" in viewport
-    assert "_has_no_repeat_features" in viewport
+    assert "from src.core.rendering.gpu_diagnostics_records import _node_uses_single_tile_atlas" in viewport
+    assert viewport.count("_node_uses_single_tile_atlas(node)") >= 2
     assert "_accel_clamp_s = True" in viewport
     assert "_accel_clamp_t = True" in viewport
-    assert "0.0 <= u <= 1.0 and 0.0 <= v <= 1.0" in viewport
     assert "def _node_uses_single_tile_atlas" in gpu
+    assert "_SINGLE_TILE_UV_TOLERANCE = 1.0" in gpu
     assert "_node_uses_single_tile_atlas(node)" in gpu
     assert "gl_diff.repeat_x = not _node_clamp_s" in gpu
     assert "_gr_gpu_uv_v_flip" in gpu
-    assert "img._gr_gpu_uv_v_flip = False" in viewport
+    assert "def _uses_bottom_left_uv_tga_profile" in viewport
+    assert "_gpu_uv_v_flip_for_loose_texture(raw)" in viewport
+    assert 'getattr(face_tex, "_gr_gpu_uv_v_flip", True)' in viewport
+    assert 'getattr(_face_pil_tex, "_gr_gpu_uv_v_flip", True)' in viewport
 
 
 def test_manual_v_key_bone_snap_is_wired_without_auto_snap() -> None:
@@ -452,4 +500,3 @@ def test_gimbal_translation_uses_projected_visible_axis_direction() -> None:
     assert "pixels_along = (float(dx_screen) * sx + float(dy_screen) * sy) / length" in viewport
     assert "return self._projected_axis_delta(" in viewport
     assert "origin_world" in viewport
-

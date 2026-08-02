@@ -2,14 +2,14 @@
     "schema": "ghostrigger_python_payload.v1",
     "phase": "P1.5 embedded python payload",
     "project": "GhostRigger.Core.Validation",
-    "file_count": 8,
+    "file_count": 11,
     "originals_remain_in_src": true,
     "files": [
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_VALIDATION_INIT",
             "source_path": "src/core/validation/__init__.py",
             "packaged_path": "Python/src/core/validation/__init__.py",
-            "sha256": "f15413c969631800b5105bb26384ee7d3432b86ea1116eb5ddaa5c499eb1b862"
+            "sha256": "b8b1efe8a729acb4d179a8239e5ebb965d0a711972cc505a1af32966a5deb520"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_VALIDATION_NATIVE",
@@ -34,6 +34,24 @@
             "source_path": "src/core/validation/capture_specs.py",
             "packaged_path": "Python/src/core/validation/capture_specs.py",
             "sha256": "a5d05008156f4c96bec8bcd342d902fb9f4d679f373a1963b4dd5f23aac0fe4c"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_VALIDATION_CUSTOM_RIGGED_CHARACTER_VALIDATOR",
+            "source_path": "src/core/validation/custom_rigged_character_validator.py",
+            "packaged_path": "Python/src/core/validation/custom_rigged_character_validator.py",
+            "sha256": "8cc57689c012010f32b14f0bd312096aa0429f4dd5e8c005f2f3d2c2ab48430a"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_VALIDATION_HEAD_BUILDER_PREFLIGHT",
+            "source_path": "src/core/validation/head_builder_preflight.py",
+            "packaged_path": "Python/src/core/validation/head_builder_preflight.py",
+            "sha256": "c9638e0d13760dc7a81d616382090cc9a7a6d3e7a4121333dae1ea70c5953f2d"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_VALIDATION_KOTOR_MODULE_ENGINE_CONTRACT",
+            "source_path": "src/core/validation/kotor_module_engine_contract.py",
+            "packaged_path": "Python/src/core/validation/kotor_module_engine_contract.py",
+            "sha256": "ab54e04c39dcbeea4a58ef6c472981c86aefc9e036a5b721bd447745e952eb67"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_VALIDATION_VALIDATION_ADAPTERS",

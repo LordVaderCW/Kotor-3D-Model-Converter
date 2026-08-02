@@ -7,6 +7,49 @@ defaults and community customization.
 
 The standalone Module Editor is theme/layout aware. It consumes the active `ThemeManager` stylesheet and `LayoutManager` metrics, uses the `moduleEditor` toolbar id for its top command strip, and keeps KMAP outliner/properties/validation/export panels on shared table, tree, input, splitter, and toolbar metrics. No new colour tokens are required for the first KMAP pass.
 
+## GUI Editor Notes
+
+The standalone GUI Editor is a main-workbench product surface, not a Map Studio
+panel. It registers with the parent theme manager, consumes the existing `main`
+toolbar metrics, and sizes its splitter with `guiEditorCatalog` and
+`guiEditorInspector`. Its texture-backed move/resize canvas, typed property
+forms, resource catalog, validation summary, and add/delete actions all paint
+with the active Qt palette. PIE receives an immutable GUI preview payload and
+must not import the editor window.
+
+## Custom KOTOR Head Builder Notes
+
+The beginner-facing Character Builder selector assigns the Custom KOTOR Head
+card the stable layout id `characterBuilderMode.native_kotor_head`. Selecting
+it reuses the existing Character Builder workbench in Head mode, so the active
+theme, `main` toolbar metrics, viewport metrics, rail/inspector sizing, and
+splitter policy remain authoritative. The entry adds no head-only color tokens
+or fixed layout contract.
+
+The advanced facial entry is
+`characterBuilderMode.facial_performance_head`. It deliberately reuses the
+same Head Builder surface and exposes the Custom Animation Patch requirement
+as ordinary warning-role copy. Matching dialogue audio/LIP inputs and playback
+state remain inside `headBuilderProperties`, inherit the existing layout
+metrics, and introduce no custom palette or fixed sizing.
+
+Vanilla face, eye, eyelid/lash, hair, and modular-alien selectors remain inside
+the existing `headBuilderProperties` layout surface and inherit standard form,
+input, label, group-box, and button styling. No component-specific theme token
+or splitter metric is introduced.
+
+## Scripting Suite Notes
+
+The Scripting Suite is a standalone, non-modal workbench with the
+stable layout id `scriptingDialogueStudio`. It registers with the parent theme
+manager and consumes existing main-toolbar, library-panel, viewport, and output
+log metrics. Its twelve routed work areas cover scripts/dialogue, NWScript
+reference, quests, JRL, 2DA/globals, TLK, voice/LIP/SSF, project/history,
+packaging, guided workflows, Blueprint/GFF, and integrated GhostStudio tools.
+Editors, resource views, timelines, tables, and diagnostics intentionally inherit
+the normal application palette; do not add a private scripting stylesheet or
+hard-coded editor colours.
+
 ## Files
 
 - Theme engine: `src/gui/libtheme/`
@@ -75,7 +118,8 @@ Required root attributes:
 Known panel ids include `contentBrowser`, `scene`, `library`, `modules`,
 `properties`, `animationLibrary`, `meshTools`, `nodes`, `lighting`, `cameras`,
 `moduleMeshes`, `spriteMaterials`, `adjustPivot`, `2das`, `resources`, `outputLog`, and
-`pythonTerminal`. The `contentBrowser`, `scene`, and `properties` ids control
+`pythonTerminal`, plus the standalone GUI Editor ids `guiEditorCatalog` and
+`guiEditorInspector`. The `contentBrowser`, `scene`, and `properties` ids control
 top-level dock widgets around the central viewport; the older `library` and
 `animationLibrary` ids remain valid for user layout compatibility. Unknown ids
 warn but do not crash, so future panels can be added safely.
@@ -110,6 +154,20 @@ Supported button modes:
 
 Tooltips must always keep the full action name, especially for icon-only
 layouts.
+
+Menu geometry is layout-owned. The `<spacing>` entries `menuBarHeight`,
+`menuMinimumWidth`, `menuHorizontalPadding`, `menuShortcutGap`,
+`menuIndicatorWidth`, and `menuSubmenuArrowWidth` are combined with live font
+metrics whenever a main or context menu opens. This keeps label, icon/check,
+shortcut, and submenu columns aligned without fixed per-window menu widths.
+Text-bearing toolbar buttons likewise size to their full label; compact
+workspaces should provide horizontal overflow rather than clipping text.
+
+Map Studio's left and right authoring rails are collapsible splitter children.
+Its reversible **Maximize Viewport** action hides the rails and nonessential
+authoring chrome, then restores the recorded splitter and dock state. Layout
+changes made while focused replace the stored normal splitter proportions so
+the selected layout remains authoritative after restoration.
 
 ## Runtime
 

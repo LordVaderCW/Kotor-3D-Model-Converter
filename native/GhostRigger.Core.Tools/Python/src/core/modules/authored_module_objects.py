@@ -12,6 +12,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from pykotor.common.language import LocalizedString
+
+from .authored_walkmesh_sampling import walkmesh_face_at_xy, walkmesh_floor_z_at_xy
 from .authored_walkmesh_surfaces import walkable_walkmesh_surface_ids, walkmesh_surface_name
 
 
@@ -26,6 +29,7 @@ GIT_STRUCT_ID_PLACEABLE = 9
 GIT_STRUCT_ID_SOUND = 6
 GIT_STRUCT_ID_STORE = 11
 GIT_STRUCT_ID_TRIGGER = 1
+GIT_STRUCT_ID_TRIGGER_GEOMETRY = 3
 GIT_STRUCT_ID_WAYPOINT = 5
 
 
@@ -46,6 +50,13 @@ class AuthoredPlaceableInstance:
     tag: str = ""
     position: Vec3 = (0.0, 0.0, 0.0)
     bearing: float = 0.0
+    # K2-only vanilla GIT presentation fields.  K1 omits them entirely.
+    use_tweak_color: bool = False
+    tweak_color: int = 0
+    # Editor-only durable identity.  The GIT writer deliberately ignores this
+    # field and ``tag``; they exist so KMAP selection/naming survives list
+    # reordering. Runtime placeable identity comes from the referenced UTP.
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -56,6 +67,7 @@ class AuthoredCreatureInstance:
     tag: str = ""
     position: Vec3 = (0.0, 0.0, 0.0)
     bearing: float = 0.0
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -68,7 +80,12 @@ class AuthoredDoorInstance:
     bearing: float = 0.0
     linked_to: str = ""
     linked_to_module: str = ""
+    linked_to_flags: int = 0
     transition_destination: int = 0
+    # K2-only vanilla door presentation fields. K1 omits them entirely.
+    use_tweak_color: bool = False
+    tweak_color: int = 0
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,7 +96,10 @@ class AuthoredWaypointInstance:
     tag: str = ""
     position: Vec3 = (0.0, 0.0, 0.0)
     bearing: float = 0.0
+    # Legacy KMAP compatibility only. Vanilla WaypointList rows are transition
+    # destinations and do not carry LinkedTo; writers intentionally omit it.
     linked_to: str = ""
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -92,7 +112,9 @@ class AuthoredTriggerInstance:
     geometry: tuple[Vec3, ...] = ()
     linked_to: str = ""
     linked_to_module: str = ""
+    linked_to_flags: int = 0
     transition_destination: int = 0
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,6 +124,7 @@ class AuthoredEncounterInstance:
     template_resref: str
     tag: str = ""
     position: Vec3 = (0.0, 0.0, 0.0)
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,6 +134,7 @@ class AuthoredSoundInstance:
     template_resref: str
     tag: str = ""
     position: Vec3 = (0.0, 0.0, 0.0)
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,6 +148,7 @@ class AuthoredCameraInstance:
     height: float = 0.0
     mic_range: float = 0.0
     pitch: float = 0.0
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -132,6 +157,9 @@ class AuthoredStoreInstance:
 
     template_resref: str
     tag: str = ""
+    position: Vec3 = (0.0, 0.0, 0.0)
+    bearing: float = 0.0
+    instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -230,22 +258,49 @@ def _validate_transition_intent(kind: str, item: Any, blocking: list[str]) -> No
     linked_to = str(getattr(item, "linked_to", "") or "").strip()
     linked_module = normalise_resource_resref(getattr(item, "linked_to_module", ""))
     try:
+        linked_to_flags = int(getattr(item, "linked_to_flags", 0) or 0)
+    except (TypeError, ValueError):
+        blocking.append(f"{kind} {label} has an invalid LinkedToFlags value.")
+        return
+    if linked_to_flags not in {0, 1, 2}:
+        blocking.append(
+            f"{kind} {label} has LinkedToFlags={linked_to_flags}; KOTOR accepts 0 (none), "
+            "1 (destination door), or 2 (destination waypoint)."
+        )
+    try:
         destination_type = int(getattr(item, "transition_destination", 0) or 0)
     except (TypeError, ValueError):
         blocking.append(f"{kind} {label} has an invalid TransitionDestin value.")
         return
-    if destination_type < 0:
-        blocking.append(f"{kind} {label} has an invalid negative TransitionDestin value.")
+    # TransitionDestin is a CExoLocString StringRef into dialog.tlk. -1
+    # (0xFFFFFFFF) is the standard "no transition text" sentinel that the
+    # writer itself emits and that most stock doors carry; only values below
+    # it are genuinely malformed. Treating -1 as an error blocked export of
+    # every ordinary open/close door imported from a stock module (921srt).
+    if destination_type < -1:
+        blocking.append(
+            f"{kind} {label} has an invalid TransitionDestin value {destination_type}; "
+            "use -1 for no transition text."
+        )
         return
+    if destination_type > 2147483647:
+        blocking.append(f"{kind} {label} has TransitionDestin={destination_type}; dialog.tlk StringRefs are signed 32-bit values.")
+        return
+    has_transition_text = destination_type > 0
     if not linked_to and linked_module:
         blocking.append(
             f"{kind} {label} has an incomplete transition: LinkedToModule is set to {linked_module}, "
             "but LinkedTo/destination tag is missing."
         )
-    if not linked_to and destination_type:
+    if not linked_to and has_transition_text:
         blocking.append(
             f"{kind} {label} has an incomplete transition: TransitionDestin is set, "
             "but LinkedTo/destination tag is missing."
+        )
+    if linked_to and linked_to_flags == 0:
+        blocking.append(
+            f"{kind} {label} links to {linked_to}, but LinkedToFlags is 0. Choose destination door (1) "
+            "or destination waypoint (2) so the KOTOR engine can resolve the tag."
         )
 
 
@@ -319,10 +374,7 @@ def validate_authored_gameplay_placement(placement: AuthoredGameplayPlacement) -
 
 
 def _walkmesh_face_at_position(wok: Any, position: Vec3) -> int:
-    face_at_point = getattr(wok, "face_at_point", None)
-    if not callable(face_at_point):
-        return -2
-    return int(face_at_point(float(position[0]), float(position[1])))
+    return walkmesh_face_at_xy(wok, float(position[0]), float(position[1]))
 
 
 def _triangle_floor_z_at_position(position: Vec3, a: Vec3, b: Vec3, c: Vec3) -> float:
@@ -398,12 +450,14 @@ def _walkmesh_check(label: str, position: Vec3, wok: Any, *, z_tolerance: float)
             surface_id=surface_id,
             message=f"{label} resolved to WOK face {face_index} with invalid vertex indices.",
         )
-    floor_z = _triangle_floor_z_at_position(
-        position,
-        tuple(verts[vertex_indices[0]]),  # type: ignore[arg-type]
-        tuple(verts[vertex_indices[1]]),  # type: ignore[arg-type]
-        tuple(verts[vertex_indices[2]]),  # type: ignore[arg-type]
-    )
+    floor_z = walkmesh_floor_z_at_xy(wok, face_index, float(position[0]), float(position[1]))
+    if floor_z is None:
+        floor_z = _triangle_floor_z_at_position(
+            position,
+            tuple(verts[vertex_indices[0]]),  # type: ignore[arg-type]
+            tuple(verts[vertex_indices[1]]),  # type: ignore[arg-type]
+            tuple(verts[vertex_indices[2]]),  # type: ignore[arg-type]
+        )
     if abs(float(position[2]) - floor_z) > float(z_tolerance):
         return AuthoredGameplayWalkmeshCheck(
             label=label,
@@ -460,7 +514,17 @@ def validate_authored_gameplay_placement_against_walkmesh(
         label = waypoint.tag or normalise_resource_resref(waypoint.template_resref) or f"waypoint_{index + 1}"
         checks.append(_walkmesh_check(f"waypoint:{label}", waypoint.position, wok, z_tolerance=float(z_tolerance)))
 
-    blocking.extend(check.message for check in checks if not check.ok)
+    # Only the entry point must be walkable (the player spawns there).
+    # Everything else legitimately sits off-mesh in vanilla data: mapnote
+    # waypoints, cut-content markers, wall consoles, door hooks in frames —
+    # plcaa alone ships a dozen such rows, so these are warnings.
+    for check in checks:
+        if check.ok:
+            continue
+        if check.label == "entry_point":
+            blocking.append(check.message)
+        else:
+            warnings.append(check.message)
     if not checks:
         warnings.append("No gameplay placements required walkmesh validation.")
     return AuthoredGameplayWalkmeshValidation(
@@ -501,15 +565,25 @@ def apply_entry_point_to_ifo(root: Any, entry: ModuleEntryPoint) -> None:
     root.set_single("Mod_Entry_Dir_Y", math.sin(float(entry.facing)))
 
 
-def _add_placeable(list_value: Any, index: int, placeable: AuthoredPlaceableInstance) -> None:
+def _add_placeable(
+    list_value: Any,
+    index: int,
+    placeable: AuthoredPlaceableInstance,
+    *,
+    game: str = "K1",
+) -> None:
     item = list_value.add(GIT_STRUCT_ID_PLACEABLE)
     resref = normalise_resource_resref(placeable.template_resref)
     item.set_resref("TemplateResRef", resref)
-    item.set_string("Tag", placeable.tag or resref)
     item.set_single("X", float(placeable.position[0]))
     item.set_single("Y", float(placeable.position[1]))
     item.set_single("Z", float(placeable.position[2]))
     item.set_single("Bearing", float(placeable.bearing))
+    # Vanilla K2 emits these fields on every placeable row. K1 rows contain
+    # exactly TemplateResRef/X/Y/Z/Bearing and must not receive them.
+    if str(game or "K1").strip().upper() == "K2":
+        item.set_uint8("UseTweakColor", int(bool(placeable.use_tweak_color)))
+        item.set_uint32("TweakColor", int(placeable.tweak_color) & 0xFFFFFFFF)
 
 
 def _add_creature(list_value: Any, index: int, creature: AuthoredCreatureInstance) -> None:
@@ -520,27 +594,46 @@ def _add_creature(list_value: Any, index: int, creature: AuthoredCreatureInstanc
     item.set_single("XPosition", float(creature.position[0]))
     item.set_single("YPosition", float(creature.position[1]))
     item.set_single("ZPosition", float(creature.position[2]))
-    item.set_single("XOrientation", float(creature.bearing))
-    item.set_single("Bearing", float(creature.bearing))
+    # Vanilla creature orientation is a unit direction vector (cos/sin of the
+    # facing angle) split across XOrientation/YOrientation; creatures carry no
+    # scalar "Bearing" field. Writing the raw bearing into XOrientation faced
+    # every spawned creature the wrong way.
+    item.set_single("XOrientation", math.cos(float(creature.bearing)))
+    item.set_single("YOrientation", math.sin(float(creature.bearing)))
 
 
-def _add_door(list_value: Any, index: int, door: AuthoredDoorInstance) -> None:
+def _add_door(
+    list_value: Any,
+    index: int,
+    door: AuthoredDoorInstance,
+    *,
+    game: str = "K1",
+) -> None:
     item = list_value.add(GIT_STRUCT_ID_DOOR)
     resref = normalise_resource_resref(door.template_resref)
     item.set_resref("TemplateResRef", resref)
     item.set_string("Tag", door.tag or resref)
+    # Match vanilla field types and order. LinkedToModule is a ResRef, not a
+    # String, and LinkedToFlags is present even for an ordinary unlinked door.
+    item.set_resref("LinkedToModule", normalise_resource_resref(door.linked_to_module))
+    item.set_string("LinkedTo", door.linked_to)
+    item.set_uint8("LinkedToFlags", int(door.linked_to_flags) & 0xFF)
+    # TransitionDestin is a CExoLocString (a dialog.tlk StringRef) in vanilla,
+    # not an int32; -1 means "no override" (use the linked area's name).
+    _door_sref = int(door.transition_destination)
+    item.set_locstring("TransitionDestin", LocalizedString(_door_sref if _door_sref > 0 else -1))
     item.set_single("X", float(door.position[0]))
     item.set_single("Y", float(door.position[1]))
     item.set_single("Z", float(door.position[2]))
     item.set_single("Bearing", float(door.bearing))
-    item.set_string("LinkedTo", door.linked_to)
-    item.set_string("LinkedToModule", door.linked_to_module)
-    item.set_int32("TransitionDestin", int(door.transition_destination))
+    if str(game or "K1").strip().upper() == "K2":
+        item.set_uint8("UseTweakColor", int(bool(door.use_tweak_color)))
+        item.set_uint32("TweakColor", int(door.tweak_color) & 0xFFFFFFFF)
 
 
 def _add_trigger_geometry(list_value: Any, points: tuple[Vec3, ...]) -> None:
-    for index, point in enumerate(points):
-        item = list_value.add(index)
+    for point in points:
+        item = list_value.add(GIT_STRUCT_ID_TRIGGER_GEOMETRY)
         item.set_single("PointX", float(point[0]))
         item.set_single("PointY", float(point[1]))
         item.set_single("PointZ", float(point[2]))
@@ -550,13 +643,26 @@ def _add_trigger(list_value: Any, index: int, trigger: AuthoredTriggerInstance) 
     item = list_value.add(GIT_STRUCT_ID_TRIGGER)
     resref = normalise_resource_resref(trigger.template_resref)
     item.set_resref("TemplateResRef", resref)
-    item.set_string("Tag", trigger.tag or resref)
+    _trig_sref = int(trigger.transition_destination)
+    is_transition = bool(
+        trigger.linked_to
+        or normalise_resource_resref(trigger.linked_to_module)
+        or int(trigger.linked_to_flags)
+        or _trig_sref > 0
+    )
+    if is_transition:
+        # Match vanilla transition-trigger field order exactly in K1 and K2.
+        item.set_string("Tag", trigger.tag or resref)
+        item.set_locstring("TransitionDestin", LocalizedString(_trig_sref if _trig_sref > 0 else -1))
+        item.set_resref("LinkedToModule", normalise_resource_resref(trigger.linked_to_module))
+        item.set_string("LinkedTo", trigger.linked_to)
+        item.set_uint8("LinkedToFlags", int(trigger.linked_to_flags) & 0xFF)
     item.set_single("XPosition", float(trigger.position[0]))
     item.set_single("YPosition", float(trigger.position[1]))
     item.set_single("ZPosition", float(trigger.position[2]))
-    item.set_string("LinkedTo", trigger.linked_to)
-    item.set_string("LinkedToModule", trigger.linked_to_module)
-    item.set_int32("TransitionDestin", int(trigger.transition_destination))
+    item.set_single("XOrientation", 0.0)
+    item.set_single("YOrientation", 0.0)
+    item.set_single("ZOrientation", 0.0)
     geometry = _empty_gff_list()
     _add_trigger_geometry(geometry, trigger.geometry)
     item.set_list("Geometry", geometry)
@@ -567,7 +673,6 @@ def _add_waypoint(list_value: Any, index: int, waypoint: AuthoredWaypointInstanc
     resref = normalise_resource_resref(waypoint.template_resref)
     item.set_resref("TemplateResRef", resref)
     item.set_string("Tag", waypoint.tag or resref)
-    item.set_string("LinkedTo", waypoint.linked_to)
     item.set_single("XPosition", float(waypoint.position[0]))
     item.set_single("YPosition", float(waypoint.position[1]))
     item.set_single("ZPosition", float(waypoint.position[2]))
@@ -609,10 +714,17 @@ def _add_camera(list_value: Any, index: int, camera: AuthoredCameraInstance) -> 
 
 
 def _add_store(list_value: Any, index: int, store: AuthoredStoreInstance) -> None:
+    # Engine contract (vanilla 202TEL GIT, struct 11): stores use "ResRef" —
+    # not "TemplateResRef" like every other list — plus world position and an
+    # orientation vector.
     item = list_value.add(GIT_STRUCT_ID_STORE)
     resref = normalise_resource_resref(store.template_resref)
-    item.set_resref("TemplateResRef", resref)
-    item.set_string("Tag", store.tag or resref)
+    item.set_resref("ResRef", resref)
+    item.set_single("XPosition", float(store.position[0]))
+    item.set_single("YPosition", float(store.position[1]))
+    item.set_single("ZPosition", float(store.position[2]))
+    item.set_single("XOrientation", math.sin(float(store.bearing)))
+    item.set_single("YOrientation", math.cos(float(store.bearing)))
 
 
 def _default_area_properties() -> Any:
@@ -633,7 +745,7 @@ def _default_area_properties() -> Any:
     return item
 
 
-def build_git_gff(placement: AuthoredGameplayPlacement) -> Any:
+def build_git_gff(placement: AuthoredGameplayPlacement, *, game: str = "K1") -> Any:
     """Compile authored gameplay placements into a GIT GFF."""
 
     validation = validate_authored_gameplay_placement(placement)
@@ -656,7 +768,7 @@ def build_git_gff(placement: AuthoredGameplayPlacement) -> Any:
 
     doors = _empty_gff_list()
     for index, door in enumerate(placement.doors):
-        _add_door(doors, index, door)
+        _add_door(doors, index, door, game=game)
     root.set_list("Door List", doors)
 
     triggers = _empty_gff_list()
@@ -682,7 +794,7 @@ def build_git_gff(placement: AuthoredGameplayPlacement) -> Any:
 
     placeables = _empty_gff_list()
     for index, placeable in enumerate(placement.placeables):
-        _add_placeable(placeables, index, placeable)
+        _add_placeable(placeables, index, placeable, game=game)
     root.set_list("Placeable List", placeables)
 
     waypoints = _empty_gff_list()
@@ -692,10 +804,52 @@ def build_git_gff(placement: AuthoredGameplayPlacement) -> Any:
     return gff
 
 
-def build_git_bytes(placement: AuthoredGameplayPlacement) -> bytes:
+def build_git_bytes(placement: AuthoredGameplayPlacement, *, game: str = "K1") -> bytes:
     """Compile authored gameplay placements into serialized GIT bytes."""
 
-    return _bytes_gff(build_git_gff(placement))
+    return _bytes_gff(build_git_gff(placement, game=game))
+
+
+def patch_preserved_stock_git_bytes(
+    source_git_bytes: bytes,
+    placement: AuthoredGameplayPlacement,
+    *,
+    game: str = "K1",
+) -> bytes:
+    """Patch authored object lists while preserving stock GIT area metadata.
+
+    Imported modules may carry music, ambient sound, environmental audio, and
+    unknown extension fields in the GIT root.  Rebuilding the entire resource
+    from the editable placement subset used to reset those fields.  This
+    routine replaces only the lists Map Studio owns and leaves every other
+    root field intact.  Unedited imports should continue to use the original
+    byte stream directly; this patch path is for deliberate placement edits.
+    """
+
+    raw = bytes(source_git_bytes or b"")
+    if not raw:
+        return build_git_bytes(placement, game=game)
+    from pykotor.resource.formats.gff import read_gff
+
+    source = read_gff(raw)
+    candidate = build_git_gff(placement, game=game)
+    for label in (
+        "CameraList",
+        "Creature List",
+        "Door List",
+        "TriggerList",
+        "Encounter List",
+        "SoundList",
+        "StoreList",
+        "List",
+        "Placeable List",
+        "WaypointList",
+    ):
+        source.root.set_list(label, candidate.root.acquire(label, _empty_gff_list()))
+    # UseTemplates is owned by the placement compiler; AreaProperties and
+    # every unknown source-root field are intentionally preserved.
+    source.root.set_uint8("UseTemplates", int(candidate.root.acquire("UseTemplates", 1) or 0))
+    return _bytes_gff(source)
 
 
 __all__ = [
@@ -716,6 +870,7 @@ __all__ = [
     "apply_entry_point_to_ifo",
     "build_git_bytes",
     "build_git_gff",
+    "patch_preserved_stock_git_bytes",
     "normalise_resource_resref",
     "validate_authored_gameplay_placement",
     "validate_authored_gameplay_placement_against_walkmesh",

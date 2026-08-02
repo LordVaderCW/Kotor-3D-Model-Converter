@@ -1,0 +1,1932 @@
+"""Map Studio tool-belt action routing.
+
+This module keeps Map Studio shelf/tool-belt action semantics out of the Qt
+window.  The UI can arrange buttons and collect selection context, but the
+meaning of an action key lives here so menus, hotkeys, context menus, command
+search, and the customizable tool belt can share one policy.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from .map_studio_modeling_tools import (
+    MapStudioToolBeltAction,
+    available_map_studio_tool_belt_actions,
+    map_studio_tool_capability_summary,
+)
+
+
+MAP_STUDIO_TOOL_ACTION_STALE_OUTPUTS: tuple[str, ...] = ("MDL", "MDX", "WOK", "LYT", "VIS", "PTH", ".mod")
+MAP_STUDIO_TOOL_ACTION_READINESS_IMPACT = (
+    "Map Studio validation, export, install handoff, and game proof are stale."
+)
+
+
+@dataclass(frozen=True)
+class MapStudioToolActionContext:
+    """Current selection/context facts needed to resolve one tool-belt action."""
+
+    module_root: str = ""
+    room_resref: str = ""
+    first_room_resref: str = ""
+    second_room_resref: str = ""
+    result_room_resref: str = ""
+    primitive_name: str = ""
+    primitive_kind: str = ""
+    target_primitive_name: str = ""
+    target_vertex_index: int | None = None
+    placement_kind: str = ""
+    placement_template_resref: str = ""
+    placement_tag: str = ""
+    placement_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    placement_bearing: float = 0.0
+    entry_area_resref: str = ""
+    entry_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    entry_facing: float = 0.0
+    light_room_resref: str = ""
+    light_name: str = ""
+    light_position: tuple[float, float, float] = (0.0, 0.0, 2.25)
+    light_color: tuple[float, float, float] = (1.0, 0.92, 0.78)
+    light_radius: float = 8.0
+    light_intensity: float = 1.0
+    light_type: str = "point"
+    script_scope: str = "area"
+    script_field_name: str = ""
+    script_resref: str = ""
+    wall_opening_name: str = ""
+    wall_opening_edge_index: int = 0
+    wall_opening_center_fraction: float = 0.5
+    wall_opening_width: float = 1.5
+    wall_opening_height: float = 2.1
+    wall_opening_bottom: float = 0.0
+    opening_name: str = ""
+    opening_marker_kind: str = "door"
+    opening_marker_template_resref: str = ""
+    opening_marker_tag: str = ""
+    opening_marker_linked_to: str = ""
+    opening_marker_linked_to_module: str = ""
+    opening_marker_linked_to_flags: int = 0
+    opening_marker_transition_destination: int = 0
+    opening_marker_edge_index: int | None = None
+    point_index: int | None = None
+    point_indices: tuple[int, ...] = ()
+    target_point_index: int | None = None
+    target_room_resref: str = ""
+    first_edge_index: int | None = None
+    second_edge_index: int | None = None
+    axis: str = "x"
+    positive_z: bool = True
+    operation_distance: float = 0.25
+    operation_edge_index: int = 0
+    terrain_row_index: int = 0
+    terrain_column_index: int = 0
+    terrain_points: tuple[tuple[int, int, float], ...] = ()
+    terrain_delta: float = 0.1
+    terrain_radius: int = 0
+    terrain_height: float = 0.0
+    terrain_iterations: int = 1
+    terrain_strength: float = 0.5
+    terrain_preserve_boundary: bool = True
+    terrain_symmetry_axis: str = ""
+    cut_center: tuple[float, float] = (0.0, 0.0)
+    cut_size: tuple[float, float] = (1.0, 1.0)
+    duplicate_count: int = 1
+    duplicate_translation_offset: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    duplicate_rotation_offset_degrees_z: float = 0.0
+    duplicate_scale_multiplier: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    move_delta: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    grid_size: float = 0.1
+    snap_axes: tuple[str, ...] = ("x", "y", "z")
+    export_output_dir: str = ""
+    export_dry_run: bool = True
+    export_overwrite: bool = False
+    export_game_modules_dir: str = ""
+    proof_manifest_path: str = ""
+    proof_evidence_path: str = ""
+    proof_tester: str = ""
+    proof_notes: str = ""
+    proof_module_loads_in_game: bool = False
+    proof_module_identity_matches_authored_resref: bool = False
+    proof_player_spawns_on_floor: bool = False
+    proof_test_placeable_visible: bool = False
+    proof_player_can_walk_on_floor: bool = False
+    proof_transition_pathing_sanity_confirmed: bool = False
+    proof_no_inherited_base_game_geometry_or_scripted_movers: bool = False
+    proof_allow_missing_evidence: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MapStudioToolActionRoute:
+    """Resolved behavior for one Map Studio action key."""
+
+    action_key: str
+    label: str
+    workspace_key: str
+    tool_key: str
+    enabled: bool
+    disabled_reason: str = ""
+    focus_component_mode: str = ""
+    focus_snap_mode: str = ""
+    terrain_brush: str = ""
+    primitive_kind: str = ""
+    placement_kind: str = ""
+    command_method: str = ""
+    command_kwargs: dict[str, Any] = field(default_factory=dict)
+    mutates_kmap: bool = False
+    stale_outputs: tuple[str, ...] = ()
+    readiness_impact: str = ""
+    status_message: str = ""
+    authoring_context: str = ""
+    capability_stage: str = ""
+    resource_impacts: tuple[str, ...] = ()
+    readiness_summary: str = ""
+
+
+_PRIMITIVE_ACTIONS: dict[str, str] = {
+    "primitive": "cube",
+    "floor": "floor",
+    "plane": "plane",
+    "cube": "cube",
+    "wall": "wall",
+    "ramp": "ramp",
+    "stairs": "stairs",
+    "cylinder": "cylinder",
+    "sphere": "sphere",
+    "cone": "cone",
+    "torus": "torus",
+    "door_frame": "door_frame",
+    "arch": "arch",
+}
+
+_ROOM_PRESET_ACTIONS: dict[str, tuple[str, str]] = {
+    "blockout_room": ("composition_starter_room", "grblock"),
+    "create_room": ("rectangular_dev_room", "grdev01"),
+    "corridor": ("wide_hall", "grhall"),
+    "terrain_patch": ("terrain_heightfield", "grterrain"),
+}
+
+_PLACEMENT_ACTIONS: dict[str, str] = {
+    "place": "placeable",
+    "placeable": "placeable",
+    "creature": "creature",
+    "door": "door",
+    "waypoint": "waypoint",
+    "trigger": "trigger",
+    "encounter": "encounter",
+    "sound": "sound",
+    "camera": "camera",
+    "store": "store",
+}
+
+_PLACEMENT_DEFAULT_TEMPLATES: dict[str, str] = {
+    "placeable": "plc_bench",
+    "creature": "c_drdmkone",
+    "door": "door_t01",
+    "waypoint": "wp_mapstudio",
+    "trigger": "trg_mapstudio",
+    "encounter": "enc_mapstudio",
+    "sound": "snd_mapstudio",
+    "store": "store_map",
+    "camera": "",
+}
+
+_TERRAIN_BRUSH_ACTIONS: dict[str, str] = {
+    "sculpt_raise": "raise",
+    "sculpt_lower": "lower",
+    "sculpt_smooth": "smooth",
+    "sculpt_flatten": "flatten",
+    "sculpt_erase": "erase",
+    "sculpt_plateau": "plateau",
+    "sculpt_ramp": "ramp",
+    "sculpt_slope": "slope",
+    "sculpt_terrace": "terrace",
+    "sculpt_pinch": "pinch",
+    "sculpt_erode": "erode",
+    "sculpt_noise": "noise",
+}
+
+_VERTEX_FOCUS: dict[str, tuple[str, str, str]] = {
+    "vertex_snap": ("vertex", "snap_vertices", "vertex"),
+    "grid_snap": ("vertex", "snap_vertices", "grid"),
+    "weld": ("vertex", "weld_vertices", "vertex"),
+    "merge_components": ("vertex", "weld_vertices", "vertex"),
+    "flatten": ("vertex", "flatten_vertices", "grid"),
+    "transform_snap_level": ("vertex", "transform_snap_level", "level"),
+    "mirror": ("vertex", "mirror_footprint", "grid"),
+    "mirror_x": ("vertex", "mirror_x", "grid"),
+    "mirror_y": ("vertex", "mirror_y", "grid"),
+    "mirror_z": ("vertex", "mirror_z", "grid"),
+    "cleanup": ("vertex", "cleanup_footprint", "grid"),
+}
+
+
+def _action_by_key() -> dict[str, MapStudioToolBeltAction]:
+    return {item.key: item for item in available_map_studio_tool_belt_actions()}
+
+
+def _clean_axis(axis: str) -> str:
+    value = str(axis or "x").strip().lower()
+    return value if value in {"x", "y", "z"} else "x"
+
+
+def _clean_indices(values: tuple[int, ...] | list[int] | Any) -> tuple[int, ...]:
+    return tuple(int(index) for index in tuple(values or ()))
+
+
+def _placement_template_for_action(ctx: MapStudioToolActionContext, placement_kind: str, requested_kind: str) -> str:
+    selected_kind = str(ctx.placement_kind or "").strip().lower()
+    if (not selected_kind or selected_kind == placement_kind or requested_kind == "place") and str(ctx.placement_template_resref or "").strip():
+        return str(ctx.placement_template_resref or "").strip()
+    return _PLACEMENT_DEFAULT_TEMPLATES.get(placement_kind, "")
+
+
+def _placement_tag_for_action(ctx: MapStudioToolActionContext, placement_kind: str) -> str:
+    tag = str(ctx.placement_tag or "").strip()
+    if tag:
+        return tag
+    return f"map_{placement_kind}"[:32]
+
+
+def _disabled(action: MapStudioToolBeltAction | None, action_key: str, reason: str) -> MapStudioToolActionRoute:
+    capability = map_studio_tool_capability_summary(action) if action is not None else None
+    return MapStudioToolActionRoute(
+        action_key=action_key,
+        label=str(getattr(action, "label", action_key) or action_key),
+        workspace_key=str(getattr(action, "workspace_key", "") or ""),
+        tool_key=str(getattr(action, "tool_key", "") or ""),
+        enabled=False,
+        disabled_reason=reason,
+        status_message=reason,
+        capability_stage=capability.capability_stage if capability is not None else "unknown",
+        resource_impacts=capability.resource_impacts if capability is not None else (),
+        readiness_summary=capability.readiness_summary if capability is not None else reason,
+    )
+
+
+def _route(
+    action: MapStudioToolBeltAction,
+    *,
+    enabled: bool = True,
+    disabled_reason: str = "",
+    focus_component_mode: str = "",
+    focus_snap_mode: str = "",
+    terrain_brush: str = "",
+    primitive_kind: str = "",
+    placement_kind: str = "",
+    command_method: str = "",
+    command_kwargs: dict[str, Any] | None = None,
+    mutates_kmap: bool = False,
+    stale_outputs: tuple[str, ...] | None = None,
+    readiness_impact: str | None = None,
+    status_message: str = "",
+    authoring_context: str = "",
+) -> MapStudioToolActionRoute:
+    capability = map_studio_tool_capability_summary(action)
+    route_mutates = bool(mutates_kmap and enabled)
+    resolved_stale_outputs = (
+        tuple(stale_outputs) if stale_outputs is not None else MAP_STUDIO_TOOL_ACTION_STALE_OUTPUTS
+    )
+    resolved_readiness_impact = (
+        str(readiness_impact) if readiness_impact is not None else MAP_STUDIO_TOOL_ACTION_READINESS_IMPACT
+    )
+    return MapStudioToolActionRoute(
+        action_key=action.key,
+        label=action.label,
+        workspace_key=action.workspace_key,
+        tool_key=action.tool_key,
+        enabled=enabled,
+        disabled_reason=disabled_reason,
+        focus_component_mode=focus_component_mode,
+        focus_snap_mode=focus_snap_mode,
+        terrain_brush=terrain_brush,
+        primitive_kind=primitive_kind,
+        placement_kind=placement_kind,
+        command_method=command_method if enabled else "",
+        command_kwargs=dict(command_kwargs or {}) if enabled else {},
+        mutates_kmap=route_mutates,
+        stale_outputs=resolved_stale_outputs if route_mutates else (),
+        readiness_impact=resolved_readiness_impact if route_mutates else "",
+        status_message=status_message or action.description,
+        authoring_context=authoring_context,
+        capability_stage=capability.capability_stage,
+        resource_impacts=capability.resource_impacts,
+        readiness_summary=capability.readiness_summary,
+    )
+
+
+def _viewport_hold_modifier_active(ctx: MapStudioToolActionContext, action_key: str) -> bool:
+    metadata = dict(ctx.metadata or {})
+    return (
+        str(metadata.get("active_modifier_action") or "").strip() == action_key
+        and str(metadata.get("active_modifier_behavior") or "").strip() == "hold_modifier"
+        and str(metadata.get("active_modifier_source") or "").strip() == "map_studio_viewport"
+    )
+
+
+def _object_vertex_snap_route(
+    action: MapStudioToolBeltAction,
+    ctx: MapStudioToolActionContext,
+    *,
+    authoring_prefix: str = "Object Vertex Snap",
+) -> MapStudioToolActionRoute:
+    if not ctx.primitive_name:
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="vertex",
+            enabled=False,
+            disabled_reason="Object Vertex Snap needs a selected authored room primitive.",
+        )
+    return _route(
+        action,
+        focus_component_mode="object",
+        focus_snap_mode="vertex",
+        command_method="snap_authored_room_primitive_pivot_to_vertex",
+        command_kwargs={
+            "room_resref": ctx.room_resref,
+            "primitive_name": ctx.primitive_name,
+            "target_primitive_name": ctx.target_primitive_name,
+            "target_vertex_index": None if ctx.target_vertex_index is None else int(ctx.target_vertex_index),
+        },
+        mutates_kmap=True,
+        authoring_context=(
+            f"{authoring_prefix}: move the selected primitive as an object so its pivot lands exactly on a target "
+            "primitive vertex in authored-room composition mesh space; when no target is supplied, core chooses the nearest candidate. "
+            "This preserves topology and makes validation/export/game proof stale."
+        ),
+    )
+
+
+def resolve_map_studio_tool_belt_action(
+    action_key: str,
+    context: MapStudioToolActionContext | None = None,
+) -> MapStudioToolActionRoute:
+    """Resolve a Map Studio tool-belt action into command/focus semantics."""
+
+    key = str(action_key or "").strip()
+    actions = _action_by_key()
+    action = actions.get(key)
+    if action is None:
+        return _disabled(None, key, f"Unknown Map Studio tool-belt action '{key}'.")
+    ctx = context or MapStudioToolActionContext()
+    if not bool(action.implemented):
+        return _disabled(action, key, f"{action.label} is planned and not implemented for command execution yet.")
+
+    if key in {"object", "vertex", "edge", "face"}:
+        snap_by_mode = {
+            "object": "grid",
+            "vertex": "vertex",
+            "edge": "edge",
+            "face": "face",
+        }
+        context_by_mode = {
+            "object": "Object mode: select, move, duplicate, delete, snap, center pivot, or freeze authored KMAP objects.",
+            "vertex": "Vertex mode: snap, weld, flatten, mirror, and clean floor-plan or WOK-facing vertices before validation.",
+            "edge": "Edge mode: cut, split, bridge, bevel, extrude, and align doorway or room-seam edges.",
+            "face": "Face mode: paint material/WOK intent, fill, triangulate, inset, and repair winding before export.",
+        }
+        return _route(
+            action,
+            focus_component_mode=key,
+            focus_snap_mode=snap_by_mode[key],
+            mutates_kmap=False,
+            stale_outputs=(),
+            readiness_impact="Mode focus only; KMAP state changes when a modeling command is committed.",
+            status_message=f"Map Studio {action.label} focused.",
+            authoring_context=context_by_mode[key],
+        )
+
+    if key == "validate":
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="validate",
+            mutates_kmap=False,
+            status_message="Map Studio validation refreshed; review blocking issues before staging or game proof.",
+            authoring_context=(
+                "Validation: run the headless KMAP/authored-module readiness checks and surface actionable "
+                "KOTOR resource issues before export, install handoff, or in-game proof."
+            ),
+        )
+
+    if key == "launch_handoff":
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="map_studio_launch_handoff",
+            mutates_kmap=False,
+            status_message=(
+                "Prepared Map Studio launch handoff summary; live warp proof still must be recorded in-game."
+            ),
+            authoring_context=(
+                "Launch Handoff: inspect the staged proof manifest, launcher script, recorder, and exact warp "
+                "command before opening KOTOR. This is a handoff query, not game-tested proof."
+            ),
+        )
+
+    if key == "record_proof":
+        proof_manifest = str(ctx.proof_manifest_path or "").strip()
+        evidence_path = str(ctx.proof_evidence_path or "").strip()
+        if proof_manifest and evidence_path:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                command_method="record_map_studio_game_proof",
+                command_kwargs={
+                    "proof_manifest_path": proof_manifest,
+                    "evidence_path": evidence_path,
+                    "tester": str(ctx.proof_tester or ""),
+                    "notes": str(ctx.proof_notes or ""),
+                    "module_loads_in_game": bool(ctx.proof_module_loads_in_game),
+                    "module_identity_matches_authored_resref": bool(ctx.proof_module_identity_matches_authored_resref),
+                    "player_spawns_on_floor": bool(ctx.proof_player_spawns_on_floor),
+                    "test_placeable_visible": bool(ctx.proof_test_placeable_visible),
+                    "player_can_walk_on_floor": bool(ctx.proof_player_can_walk_on_floor),
+                    "transition_pathing_sanity_confirmed": bool(
+                        ctx.proof_transition_pathing_sanity_confirmed
+                    ),
+                    "no_inherited_base_game_geometry_or_scripted_movers": bool(
+                        ctx.proof_no_inherited_base_game_geometry_or_scripted_movers
+                    ),
+                    "allow_missing_evidence": bool(ctx.proof_allow_missing_evidence),
+                },
+                mutates_kmap=True,
+                stale_outputs=(),
+                readiness_impact=(
+                    "Map Studio proof metadata changed; generated MDL/MDX/WOK/LYT/VIS/PTH/.mod files are unchanged."
+                ),
+                status_message=(
+                    "Record accepted KOTOR warp-test evidence and promote the authored module toward game-tested status."
+                ),
+                authoring_context=(
+                    "Record Proof: attach screenshot or video evidence from an actual KOTOR warp test, record acceptance "
+                    "checks in the proof manifest, and update KMAP proof metadata. This is the only path that can mark "
+                    "an authored module game-tested."
+                ),
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="map_studio_game_proof_recording_handoff",
+            mutates_kmap=False,
+            status_message=(
+                "Prepared Map Studio proof-recording defaults; actual game-tested proof requires accepted evidence."
+            ),
+            authoring_context=(
+                "Record Proof: query the staged proof manifest and default acceptance checks before the user "
+                "attaches screenshot or video evidence from an actual KOTOR warp test."
+            ),
+        )
+
+    if key == "stage_module":
+        output_dir = str(ctx.export_output_dir or "").strip()
+        if not output_dir:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Stage .mod needs an output directory before it can stage an authored KOTOR module package candidate.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="stage_authored_module",
+            command_kwargs={
+                "output_dir": output_dir,
+                "dry_run": bool(ctx.export_dry_run),
+                "overwrite": bool(ctx.export_overwrite),
+            },
+            mutates_kmap=True,
+            status_message=(
+                "Staged authored module package candidate; install handoff and live warp proof are still required "
+                "before calling it game-ready."
+            ),
+            authoring_context=(
+                "Stage .mod: compile the authored KMAP module through the staged export/proof service. "
+                "This creates an export candidate and test checklist, records package/proof metadata back into KMAP, "
+                "and is not game-tested proof."
+            ),
+        )
+
+    if key == "install_module":
+        output_dir = str(ctx.export_output_dir or "").strip()
+        modules_dir = str(ctx.export_game_modules_dir or "").strip()
+        if not output_dir:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Install Test needs a staging output directory before it can prepare a module install candidate.",
+            )
+        if not modules_dir:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Install Test needs the target KOTOR Modules folder before it can copy or dry-run an authored .mod.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="stage_authored_module",
+            command_kwargs={
+                "output_dir": output_dir,
+                "dry_run": bool(ctx.export_dry_run),
+                "overwrite": bool(ctx.export_overwrite),
+                "game_modules_dir": modules_dir,
+            },
+            mutates_kmap=True,
+            status_message=(
+                "Prepared authored module install candidate; live warp proof must still be recorded before calling it game-ready."
+            ),
+            authoring_context=(
+                "Install Test: stage the authored KMAP module, copy or dry-run copy to a chosen KOTOR Modules folder, "
+                "write the manual warp-test checklist, and record install/proof metadata back into KMAP. "
+                "This is not the same as recorded in-game proof."
+            ),
+        )
+
+    if key == "terrain":
+        return _route(
+            action,
+            focus_component_mode="terrain",
+            focus_snap_mode="surface",
+            command_method="authored_terrain_status",
+            mutates_kmap=False,
+            status_message="Terrain status refreshed; choose a brush or create a terrain patch before sculpting.",
+            authoring_context=(
+                "Terrain: query authored terrain room choices, walkability overlay counts, slope risk, and next actions "
+                "without mutating KMAP state. Brush actions commit dirty-region heightfield edits."
+            ),
+        )
+
+    if key == "walkmesh":
+        return _route(
+            action,
+            focus_component_mode="walkmesh",
+            focus_snap_mode="face",
+            command_method="authored_walkmesh_status",
+            mutates_kmap=False,
+            status_message="Walkmesh status refreshed; paint WOK surfaces or fix traversal blockers before export.",
+            authoring_context=(
+                "Walkmesh: query generated WOK walkability, disconnected islands, invalid/degenerate faces, "
+                "and gameplay-anchor readiness without mutating KMAP state."
+            ),
+        )
+
+    if key == "select":
+        if not ctx.room_resref and not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Select needs an authored room or primitive target before it can persist KMAP selection state.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="set_map_studio_active_selection",
+            command_kwargs={
+                "component_mode": str(ctx.metadata.get("component_mode") or "object"),
+                "workspace_key": str(ctx.metadata.get("workspace_key") or "geometry"),
+                "tool_key": "select",
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+                "selection_kind": str(ctx.metadata.get("selection_kind") or ""),
+            },
+            mutates_kmap=True,
+            stale_outputs=(),
+            readiness_impact="Selection changed; generated MDL/MDX/WOK/LYT/VIS/PTH/.mod files are unchanged.",
+            status_message="Selected authored Map Studio target and persisted active KMAP selection context.",
+            authoring_context=(
+                "Select: persist the active authored room or primitive target in the KMAP so command search, "
+                "custom belts, undo/redo, and later viewport actions share one durable selection context."
+            ),
+        )
+
+    if key == "move":
+        delta = tuple(float(value) for value in tuple(ctx.move_delta))
+        if len(delta) != 3:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Move needs a 3D world delta before it can update authored KMAP primitive placement.",
+            )
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Move needs a selected authored room primitive before it can update KMAP placement.",
+            )
+        if all(abs(float(value)) <= 1.0e-9 for value in delta):
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Move needs a non-zero world delta; edit Move X/Y/Z or drag the primitive before committing.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="move_authored_room_primitive",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+                "world_delta": delta,
+            },
+            mutates_kmap=True,
+            status_message="Moved authored Map Studio primitive; validation, export, install handoff, and game proof are stale.",
+            authoring_context=(
+                "Move: commit an object-space primitive translation into durable authored KMAP room state. "
+                "This preserves primitive identity while making MDL/MDX/WOK/LYT/VIS/PTH/.mod output stale."
+            ),
+        )
+
+    preset = _ROOM_PRESET_ACTIONS.get(key)
+    if preset is not None:
+        preset_id, fallback_root = preset
+        module_root = str(ctx.module_root or fallback_root).strip() or fallback_root
+        return _route(
+            action,
+            focus_component_mode="object" if key != "terrain_patch" else "terrain",
+            focus_snap_mode="grid" if key != "terrain_patch" else "surface",
+            command_method="create_authored_room_preset_module",
+            command_kwargs={"preset_id": preset_id, "module_root": module_root},
+            mutates_kmap=True,
+            authoring_context=(
+                f"{action.label}: create a KMAP-authored module from the {preset_id} preset; "
+                "room geometry, placements, walkmesh intent, validation, export, and game proof become stale."
+            ),
+        )
+
+    if key in _PRIMITIVE_ACTIONS:
+        primitive_kind = ctx.primitive_kind or _PRIMITIVE_ACTIONS[key]
+        return _route(
+            action,
+            primitive_kind=primitive_kind,
+            command_method="add_authored_room_primitive",
+            command_kwargs={
+                "primitive_kind": primitive_kind,
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+                "module_root": str(ctx.module_root or "").strip(),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                f"Primitive: add a {primitive_kind} to an editable authored room; "
+                "if no authored KMAP module exists yet, create a starter blockout room first. "
+                "KMAP state, validation, export, and game proof become stale."
+            ),
+        )
+
+    terrain_brush = _TERRAIN_BRUSH_ACTIONS.get(key)
+    if terrain_brush:
+        if not str(ctx.room_resref or "").strip():
+            return _route(
+                action,
+                focus_component_mode="terrain",
+                terrain_brush=terrain_brush,
+                enabled=False,
+                disabled_reason="Terrain brush needs a selected authored terrain room.",
+            )
+        terrain_points = tuple(ctx.terrain_points or ((int(ctx.terrain_row_index), int(ctx.terrain_column_index), 1.0),))
+        kwargs: dict[str, Any] = {
+            "brush": terrain_brush,
+            "room_resref": str(ctx.room_resref or "").strip(),
+            "row_index": int(ctx.terrain_row_index),
+            "column_index": int(ctx.terrain_column_index),
+            "points": terrain_points,
+            "delta": float(ctx.terrain_delta),
+            "radius": int(ctx.terrain_radius),
+            "height": float(ctx.terrain_height),
+            "iterations": int(ctx.terrain_iterations),
+            "strength": float(ctx.terrain_strength),
+            "preserve_boundary": bool(ctx.terrain_preserve_boundary),
+        }
+        if str(ctx.terrain_symmetry_axis or "").strip():
+            kwargs["symmetry_axis"] = str(ctx.terrain_symmetry_axis or "").strip().lower()
+        return _route(
+            action,
+            focus_component_mode="terrain",
+            focus_snap_mode="surface",
+            terrain_brush=terrain_brush,
+            command_method="apply_authored_terrain_brush_stroke",
+            command_kwargs=kwargs,
+            mutates_kmap=True,
+            status_message=(
+                f"Applied terrain brush {terrain_brush}; dirty terrain samples changed and "
+                "MDL/WOK/export/game proof are stale."
+            ),
+            authoring_context=(
+                f"Terrain brush: {terrain_brush}. Commit one dirty-region scoped heightfield stroke "
+                "to authored KMAP terrain; live frames remain viewport-coalesced, while full MDL/WOK "
+                "rebuild waits for validation or staged export."
+            ),
+        )
+
+    if key == "universal_transform":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Universal Manipulator needs a selected authored room primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="map_studio_universal_transform_overlay",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+            },
+            mutates_kmap=False,
+            authoring_context=(
+                "Universal Manipulator: query exact KMAP-world selected primitive bounds, center, "
+                "width/depth/height, transform handles, dimension labels, and export-stale impact before committing any edit."
+            ),
+        )
+
+    if key == "reset_transform":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Reset Transformations needs a selected authored room primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="reset_authored_room_primitive_transform",
+            command_kwargs={"room_resref": ctx.room_resref, "primitive_name": ctx.primitive_name},
+            mutates_kmap=True,
+        )
+
+    if key == "center_pivot":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Center Pivot needs a selected authored room primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="center_authored_room_primitive_pivot",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Center Pivot: recenter the selected primitive pivot in primitive-local space and compensate "
+                "translation so visible geometry and generated WOK stay fixed while validation/export/game proof become stale."
+            ),
+        )
+
+    if key == "zero_pivot":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Zero Pivot needs a selected authored room primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="zero_authored_room_primitive_pivot",
+            command_kwargs={"room_resref": ctx.room_resref, "primitive_name": ctx.primitive_name},
+            mutates_kmap=True,
+        )
+
+    if key == "freeze_transform":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Freeze Transform needs a selected authored room primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="freeze_authored_room_primitive_transform",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Freeze Transform: bake supported unrotated primitive translation and scale into the authored "
+                "parametric primitive, reset transform intent to identity, and mark validation/export/game proof stale."
+            ),
+        )
+
+    if key == "delete_history":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Delete History needs a selected authored room primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="delete_authored_room_primitive_history",
+            command_kwargs={"room_resref": ctx.room_resref, "primitive_name": ctx.primitive_name},
+            mutates_kmap=True,
+        )
+
+    if key == "duplicate_special_options":
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            authoring_context="Open Duplicate Special options; applying the options runs the ordinary duplicate_special command.",
+        )
+
+    if key in {"multi_cut", "target_weld", "make_hole", "connect_components", "make_live", "quad_draw"}:
+        focus_mode = {
+            "target_weld": "vertex",
+            "make_hole": "face",
+            "connect_components": "edge",
+            "make_live": "object",
+            "quad_draw": "face",
+        }.get(key, "face")
+        return _route(
+            action,
+            focus_component_mode=focus_mode,
+            focus_snap_mode="surface" if key in {"make_live", "quad_draw"} else "vertex",
+            authoring_context=f"{action.label}: activate the persistent Map Studio modeling context; pointer gestures own preview/commit/cancel.",
+        )
+
+    if key in {"select_triangles", "select_quads", "convert_contained_faces"}:
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="face",
+            authoring_context=f"{action.label}: selection-only command; generated KOTOR resources stay unchanged.",
+        )
+
+    if key == "wrap":
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="surface",
+            authoring_context="Wrap: configure a driver and target object, preview the deformation, then bake one KMAP mesh edit.",
+        )
+
+    if key == "object_grid_snap":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Object Grid Snap needs a selected authored room primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="grid_snap_authored_room_primitive",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+                "grid_size": float(ctx.grid_size),
+                "axes": tuple(ctx.snap_axes or ("x", "y", "z")),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Object Grid Snap: snap the selected primitive pivot in KMAP-world space to the authored grid. "
+                "This moves the object, preserves primitive identity/topology, and makes validation/export/game proof stale."
+            ),
+        )
+
+    if key == "object_vertex_snap":
+        return _object_vertex_snap_route(action, ctx)
+
+    if key == "shrink_wrap":
+        if ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="surface",
+                command_method="shrink_wrap_authored_room_primitive_to_terrain",
+                command_kwargs={
+                    "room_resref": ctx.room_resref,
+                    "primitive_name": ctx.primitive_name,
+                    "terrain_room_resref": ctx.target_room_resref,
+                },
+                mutates_kmap=True,
+                authoring_context=(
+                    "Object Shrink Wrap: move the selected authored primitive so its lowest transformed vertex "
+                    "lands on the selected or first terrain heightfield at the primitive pivot X/Y. "
+                    "This preserves topology and makes validation/export/game proof stale."
+                ),
+            )
+        return _route(
+            action,
+            focus_component_mode="walkmesh",
+            focus_snap_mode="surface",
+            command_method="shrink_wrap_authored_placements_to_terrain",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Shrink Wrap: project authored entry points, waypoints, and gameplay placements onto the selected "
+                "terrain heightfield; arbitrary mesh/walkmesh shrink-wrap remains planned."
+            ),
+        )
+
+    if key == "paint_wok":
+        surface = ctx.metadata.get("surface_id", ctx.metadata.get("floor_surface", ctx.metadata.get("wok_surface", 4)))
+        if not ctx.room_resref:
+            return _route(
+                action,
+                focus_component_mode="walkmesh",
+                focus_snap_mode="face",
+                enabled=False,
+                disabled_reason="Paint WOK Surface needs an active authored room before it can assign walkmesh surface intent.",
+            )
+        if ctx.primitive_name:
+            supports_walkmesh_surface = ctx.metadata.get("supports_walkmesh_surface")
+            if supports_walkmesh_surface is False:
+                return _route(
+                    action,
+                    focus_component_mode="walkmesh",
+                    focus_snap_mode="face",
+                    enabled=False,
+                    disabled_reason=(
+                        "Paint WOK Surface needs a selected primitive that contributes walkmesh faces, such as a "
+                        "plane, ramp, or stairs."
+                    ),
+                )
+            return _route(
+                action,
+                focus_component_mode="walkmesh",
+                focus_snap_mode="face",
+                command_method="set_authored_room_primitive_style",
+                command_kwargs={
+                    "room_resref": ctx.room_resref,
+                    "primitive_name": ctx.primitive_name,
+                    "surface_id": surface,
+                },
+                mutates_kmap=True,
+                authoring_context=(
+                    "Paint WOK Surface: assign KOTOR walkmesh surface intent to the selected walkmesh-producing "
+                    "primitive while preserving its material texture; validation/export/game proof become stale."
+                ),
+            )
+        return _route(
+            action,
+            focus_component_mode="walkmesh",
+            focus_snap_mode="face",
+            command_method="set_authored_room_walkmesh_surface",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "floor_surface": surface,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Paint WOK Surface: assign KOTOR walkmesh surface intent to the active room floor so traversal "
+                "and generated WOK metadata are reviewed before export/game proof."
+            ),
+        )
+
+    if key == "paint_material":
+        texture = str(
+            ctx.metadata.get("texture")
+            or ctx.metadata.get("material")
+            or ctx.metadata.get("texture_resref")
+            or ""
+        ).strip()
+        if not texture:
+            return _route(
+                action,
+                focus_component_mode="face",
+                focus_snap_mode="face",
+                enabled=False,
+                disabled_reason="Paint Material needs a KOTOR texture/material resref before it can author material intent.",
+            )
+        if not ctx.room_resref:
+            return _route(
+                action,
+                focus_component_mode="face",
+                focus_snap_mode="face",
+                enabled=False,
+                disabled_reason="Paint Material needs an active authored room before it can assign KOTOR material intent.",
+            )
+        if ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="face",
+                focus_snap_mode="face",
+                command_method="set_authored_room_primitive_style",
+                command_kwargs={
+                    "room_resref": ctx.room_resref,
+                    "primitive_name": ctx.primitive_name,
+                    "texture": texture,
+                },
+                mutates_kmap=True,
+                authoring_context=(
+                    "Paint Material: assign KOTOR texture/material intent to the selected authored primitive "
+                    "while preserving its existing WOK surface intent; generated MDL/MDX/WOK/PTH/LYT/VIS export "
+                    "and game proof become stale."
+                ),
+            )
+        surface_keys = ("floor_surface", "surface_id", "wok_surface")
+        if not any(surface_key in ctx.metadata for surface_key in surface_keys):
+            return _route(
+                action,
+                focus_component_mode="face",
+                focus_snap_mode="face",
+                enabled=False,
+                disabled_reason=(
+                    "Paint Material needs the current room WOK surface metadata so it can preserve traversal "
+                    "intent while changing texture/material intent."
+                ),
+            )
+        surface = ctx.metadata.get("floor_surface", ctx.metadata.get("surface_id", ctx.metadata.get("wok_surface")))
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="face",
+            command_method="apply_authored_room_style",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "texture": texture,
+                "floor_surface": surface,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Paint Material: assign KOTOR texture/material intent to the active room while preserving the "
+                "current WOK surface intent; generated MDL/MDX/WOK/PTH/LYT/VIS export and game proof become stale."
+            ),
+        )
+
+    if key == "entry_point":
+        return _route(
+            action,
+            focus_component_mode="placement",
+            focus_snap_mode="face",
+            command_method="set_authored_module_entry_point",
+            command_kwargs={
+                "area_resref": str(ctx.entry_area_resref or "").strip(),
+                "position": tuple(ctx.entry_position),
+                "facing": float(ctx.entry_facing),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Entry Point: write the authored module IFO player start from the selected KMAP-world position; "
+                "validate that it lands on a reachable WOK before export/game proof."
+            ),
+        )
+
+    if key == "light":
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="add_authored_room_light",
+            command_kwargs={
+                "room_resref": str(ctx.light_room_resref or "").strip(),
+                "name": str(ctx.light_name or "").strip(),
+                "position": tuple(ctx.light_position),
+                "color": tuple(ctx.light_color),
+                "radius": float(ctx.light_radius),
+                "intensity": float(ctx.light_intensity),
+                "light_type": str(ctx.light_type or "point").strip().lower() or "point",
+            },
+            mutates_kmap=True,
+            status_message="Added authored room light; lighting, export, install handoff, and game proof are stale.",
+            authoring_context=(
+                "Lighting: add authored room-light intent to KMAP state for later room MDL/lightmap/export checks. "
+                "Viewport lighting is previewable only until an in-game module test proves the result."
+            ),
+        )
+
+    if key == "script":
+        field_name = str(ctx.script_field_name or "").strip()
+        if not field_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Script hook assignment needs an ARE/IFO script field selection first.",
+            )
+        script_resref = str(ctx.script_resref or "").strip()
+        command_method = "set_authored_script_hook" if script_resref else "remove_authored_script_hook"
+        command_kwargs = {
+            "scope": str(ctx.script_scope or "area").strip().lower() or "area",
+            "field_name": field_name,
+        }
+        if script_resref:
+            command_kwargs["script_resref"] = script_resref
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method=command_method,
+            command_kwargs=command_kwargs,
+            mutates_kmap=True,
+            status_message="Updated authored script hook; export, install handoff, and game proof are stale.",
+            authoring_context=(
+                "Scripts: assign or clear ARE/IFO script-hook resrefs in KMAP metadata. "
+                "Referenced .ncs files must resolve from the module package, Override, or base game before game proof."
+            ),
+        )
+
+    if key == "opening":
+        room_resref = str(ctx.room_resref or "").strip()
+        if not room_resref:
+            return _route(
+                action,
+                focus_component_mode="edge",
+                focus_snap_mode="edge",
+                enabled=False,
+                disabled_reason="Wall Opening needs a selected authored floor-plan room before it can cut KOTOR-safe doorway geometry.",
+            )
+        return _route(
+            action,
+            focus_component_mode="edge",
+            focus_snap_mode="edge",
+            command_method="set_authored_floor_plan_wall_opening",
+            command_kwargs={
+                "room_resref": room_resref,
+                "name": str(ctx.wall_opening_name or "doorway_opening").strip() or "doorway_opening",
+                "edge_index": int(ctx.wall_opening_edge_index),
+                "center_fraction": float(ctx.wall_opening_center_fraction),
+                "width": float(ctx.wall_opening_width),
+                "height": float(ctx.wall_opening_height),
+                "bottom": float(ctx.wall_opening_bottom),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Wall Opening: cut a named doorway/window opening into one authored floor-plan wall edge; "
+                "use Opening Marker next to turn it into KOTOR door, trigger, or waypoint transition data."
+            ),
+        )
+
+    if key == "opening_marker":
+        opening_name = str(ctx.opening_name or "").strip()
+        if not str(ctx.room_resref or "").strip() or not opening_name:
+            return _route(
+                action,
+                focus_component_mode="placement",
+                focus_snap_mode="doorhook",
+                enabled=False,
+                disabled_reason="Opening Marker needs an authored wall opening selected before it can create KOTOR transition data.",
+            )
+        kwargs: dict[str, Any] = {
+            "room_resref": str(ctx.room_resref or "").strip(),
+            "opening_name": opening_name,
+            "marker_kind": str(ctx.opening_marker_kind or "door").strip().lower() or "door",
+            "template_resref": str(ctx.opening_marker_template_resref or "").strip(),
+            "tag": str(ctx.opening_marker_tag or "").strip(),
+            "linked_to": str(ctx.opening_marker_linked_to or "").strip(),
+            "linked_to_module": str(ctx.opening_marker_linked_to_module or "").strip(),
+            "linked_to_flags": int(ctx.opening_marker_linked_to_flags),
+            "transition_destination": int(ctx.opening_marker_transition_destination),
+        }
+        if ctx.opening_marker_edge_index is not None:
+            kwargs["edge_index"] = int(ctx.opening_marker_edge_index)
+        return _route(
+            action,
+            focus_component_mode="placement",
+            focus_snap_mode="doorhook",
+            command_method="add_authored_floor_plan_opening_transition_marker",
+            command_kwargs=kwargs,
+            mutates_kmap=True,
+            authoring_context=(
+                "Opening Marker: convert a visual floor-plan wall opening into a KOTOR door/trigger transition "
+                "source or waypoint destination, with LinkedTo/LinkedToModule/LinkedToFlags readiness checks."
+            ),
+        )
+
+    placement_kind = _PLACEMENT_ACTIONS.get(key)
+    if placement_kind:
+        template_resref = _placement_template_for_action(ctx, placement_kind, key)
+        return _route(
+            action,
+            placement_kind=placement_kind,
+            command_method="add_authored_gameplay_placement",
+            command_kwargs={
+                "kind": placement_kind,
+                "template_resref": template_resref,
+                "tag": _placement_tag_for_action(ctx, placement_kind),
+                "position": tuple(ctx.placement_position),
+                "bearing": float(ctx.placement_bearing),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                f"Placement: add a {placement_kind} blueprint/resref to authored GIT/IFO state at the current placement position; "
+                "validate template availability and walkable WOK before export/game proof."
+            ),
+        )
+
+    if key == "vertex_snap":
+        if _viewport_hold_modifier_active(ctx, "vertex_snap") and ctx.primitive_name:
+            return _object_vertex_snap_route(action, ctx, authoring_prefix="Hold V Object Vertex Snap")
+        if ctx.point_index is None or ctx.target_point_index is None:
+            return _route(
+                action,
+                focus_component_mode="vertex",
+                focus_snap_mode="vertex",
+                enabled=False,
+                disabled_reason="Vertex snap needs a source point and a target point; hold V or choose points first.",
+            )
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="vertex",
+            command_method="snap_authored_floor_plan_vertex",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "point_index": int(ctx.point_index),
+                "target_point_index": int(ctx.target_point_index),
+                "target_room_resref": ctx.target_room_resref,
+            },
+            mutates_kmap=True,
+        )
+
+    if key == "grid_snap":
+        indices = _clean_indices(ctx.point_indices)
+        if len(indices) < 1:
+            return _route(
+                action,
+                focus_component_mode="vertex",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Grid Snap needs at least one selected floor-plan vertex.",
+            )
+        axes_raw = ctx.metadata.get("axes") or ("x", "y")
+        axes = tuple(str(axis or "").strip().lower() for axis in tuple(axes_raw))
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="grid",
+            command_method="grid_snap_authored_floor_plan_vertices",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "point_indices": indices,
+                "grid_size": float(ctx.metadata.get("grid_size") or 0.1),
+                "axes": axes,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Grid Snap: move selected floor-plan vertices to the authored grid without welding topology; "
+                "KMAP geometry, WOK readiness, staged export, and game proof become stale."
+            ),
+        )
+
+    if key in {"weld", "merge_components"}:
+        indices = _clean_indices(ctx.point_indices)
+        if len(indices) < 2:
+            return _route(
+                action,
+                focus_component_mode="vertex",
+                focus_snap_mode="vertex",
+                enabled=False,
+                disabled_reason="Weld/Merge needs at least two selected floor-plan vertices.",
+            )
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="vertex",
+            command_method="weld_authored_floor_plan_vertices",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "point_indices": indices,
+                "target_point_index": ctx.target_point_index,
+                "position_policy": str(ctx.metadata.get("position_policy") or "target"),
+            },
+            mutates_kmap=True,
+        )
+
+    if key == "flatten":
+        indices = _clean_indices(ctx.point_indices)
+        if len(indices) < 2:
+            return _route(
+                action,
+                focus_component_mode="vertex",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Flatten needs two or more selected floor-plan vertices.",
+            )
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="grid",
+            command_method="flatten_authored_floor_plan_vertices",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "point_indices": indices,
+                "axis": _clean_axis(ctx.axis),
+                "value": ctx.metadata.get("value"),
+            },
+            mutates_kmap=True,
+        )
+
+    if key == "transform_snap_level":
+        indices = _clean_indices(ctx.point_indices)
+        if len(indices) < 2:
+            if ctx.primitive_name:
+                return _route(
+                    action,
+                    focus_component_mode="object",
+                    focus_snap_mode="level",
+                    command_method="transform_snap_authored_room_primitive_level",
+                    command_kwargs={
+                        "room_resref": ctx.room_resref,
+                        "primitive_name": ctx.primitive_name,
+                        "axis": _clean_axis(ctx.axis),
+                        "target_primitive_name": ctx.target_primitive_name,
+                        "target_vertex_index": None if ctx.target_vertex_index is None else int(ctx.target_vertex_index),
+                        "value": ctx.metadata.get("value"),
+                    },
+                    mutates_kmap=True,
+                    authoring_context=(
+                        "Object Transform Level Snap: align the selected primitive pivot on one X/Y/Z level, using an explicit "
+                        "value/target when supplied or the nearest primitive vertex candidate otherwise. This preserves topology and "
+                        "marks validation/export/game proof stale."
+                    ),
+                )
+            return _route(
+                action,
+                focus_component_mode="vertex",
+                focus_snap_mode="level",
+                enabled=False,
+                disabled_reason="Transform level snap needs two or more selected floor-plan vertices or a selected authored primitive.",
+            )
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="level",
+            command_method="transform_snap_authored_floor_plan_vertices",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "point_indices": indices,
+                "axis": _clean_axis(ctx.axis),
+                "target_point_index": ctx.target_point_index,
+                "value": ctx.metadata.get("value"),
+                "level_policy": str(ctx.metadata.get("level_policy") or "average"),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Transform Level Snap: align selected floor-plan vertices onto one shared local X/Y level through "
+                "the hold-J command path; KMAP geometry, WOK readiness, staged export, and game proof become stale."
+            ),
+        )
+
+    if key == "cleanup":
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="grid",
+            command_method="cleanup_authored_floor_plan_vertices",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "tolerance": float(ctx.metadata.get("tolerance") or 0.001),
+            },
+            mutates_kmap=True,
+        )
+
+    if key == "mirror_z":
+        if ctx.primitive_name:
+            center = float(ctx.metadata.get("center", ctx.metadata.get("mirror_center", 0.0)))
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                command_method="mirror_authored_room_primitive_transform",
+                command_kwargs={
+                    "room_resref": ctx.room_resref,
+                    "primitive_name": ctx.primitive_name,
+                    "axis": "z",
+                    "center": center,
+                },
+                mutates_kmap=True,
+                authoring_context=(
+                    "Object Mirror Z: reflect the selected primitive placement across a horizontal Z plane in "
+                    "authored-room composition mesh space. This is placement mirroring, not baked arbitrary mesh mirroring."
+                ),
+            )
+        kwargs: dict[str, Any] = {
+            "room_resref": ctx.room_resref,
+        }
+        if "center_height" in ctx.metadata:
+            kwargs["center_height"] = float(ctx.metadata["center_height"])
+        return _route(
+            action,
+            focus_component_mode="terrain",
+            focus_snap_mode="surface",
+            command_method="mirror_z_authored_terrain_heightfield",
+            command_kwargs=kwargs,
+            mutates_kmap=True,
+            authoring_context=(
+                "Mirror Z: reflect a terrain heightfield around a horizontal Z plane, then revalidate WOK slope, "
+                "placements, and export readiness. Arbitrary mesh/component Z mirroring remains planned."
+            ),
+        )
+
+    if key == "bend_tool":
+        kwargs = {
+            "room_resref": ctx.room_resref,
+            "axis": _clean_axis(ctx.axis),
+            "amplitude": float(ctx.metadata.get("amplitude", ctx.operation_distance)),
+        }
+        if "center" in ctx.metadata:
+            kwargs["center"] = float(ctx.metadata["center"])
+        if "span" in ctx.metadata:
+            kwargs["span"] = float(ctx.metadata["span"])
+        return _route(
+            action,
+            focus_component_mode="terrain",
+            focus_snap_mode="surface",
+            command_method="bend_authored_terrain_heightfield",
+            command_kwargs=kwargs,
+            mutates_kmap=True,
+            authoring_context=(
+                "Bend: bake a parabolic X/Y height profile into the selected terrain heightfield, "
+                "then revalidate WOK slope, placements, and export readiness. Arbitrary mesh/component bending remains planned."
+            ),
+        )
+
+    if key == "lattice":
+        kwargs: dict[str, Any] = {
+            "room_resref": ctx.room_resref,
+            "strength": float(ctx.metadata.get("strength", 1.0)),
+        }
+        if "control_deltas" in ctx.metadata:
+            kwargs["control_deltas"] = ctx.metadata["control_deltas"]
+        else:
+            kwargs["amplitude"] = float(ctx.metadata.get("amplitude", ctx.operation_distance))
+        return _route(
+            action,
+            focus_component_mode="terrain",
+            focus_snap_mode="surface",
+            command_method="lattice_authored_terrain_heightfield",
+            command_kwargs=kwargs,
+            mutates_kmap=True,
+            authoring_context=(
+                "Lattice: bake a heightfield control cage into the selected terrain, then revalidate WOK slope, "
+                "placements, and export readiness. Arbitrary mesh/object lattice deformation remains planned."
+            ),
+        )
+
+    if key == "curve_tool":
+        points = ctx.metadata.get("points")
+        if points is None:
+            distance = max(1.0, abs(float(ctx.operation_distance)) * 4.0)
+            points = ((0.0, 0.0, 0.0), (distance, 0.0, 0.0), (distance, distance * 0.5, 0.0))
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="grid",
+            command_method="add_authored_curve_guide",
+            command_kwargs={
+                "name": str(ctx.metadata.get("curve_name") or ""),
+                "points": tuple(points),
+                "purpose": str(ctx.metadata.get("curve_purpose") or "path_guide"),
+                "room_resref": ctx.room_resref,
+                "coordinate_space": str(ctx.metadata.get("coordinate_space") or "kmap_world"),
+                "metadata": {"source_action": "curve_tool"},
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Curve: add a durable KMAP construction guide for roads, terrain ridges, placement paths, "
+                "or later sweep/PTH tools. This is previewable guide data, not baked KOTOR runtime geometry yet."
+            ),
+        )
+
+    if key in {"mirror", "mirror_x", "mirror_y"}:
+        axis = {"mirror_y": "y", "mirror_x": "x"}.get(key, _clean_axis(ctx.axis))
+        if ctx.primitive_name:
+            center = float(ctx.metadata.get("center", ctx.metadata.get("mirror_center", 0.0)))
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                command_method="mirror_authored_room_primitive_transform",
+                command_kwargs={
+                    "room_resref": ctx.room_resref,
+                    "primitive_name": ctx.primitive_name,
+                    "axis": axis,
+                    "center": center,
+                },
+                mutates_kmap=True,
+                authoring_context=(
+                    "Object Mirror: reflect the selected primitive placement across the requested X/Y/Z plane in "
+                    "authored-room composition mesh space, preserving topology, dimensions, scale, and pivot intent. "
+                    "Arbitrary baked mesh mirroring remains planned."
+                ),
+            )
+        return _route(
+            action,
+            focus_component_mode="vertex",
+            focus_snap_mode="grid",
+            command_method="mirror_authored_floor_plan_vertices",
+            command_kwargs={"room_resref": ctx.room_resref, "axis": axis},
+            mutates_kmap=True,
+        )
+
+    if key in {"normals", "cleanup_normals", "reverse_normals"}:
+        positive_z = key != "reverse_normals" and bool(ctx.positive_z)
+        context_label = "Reverse Normals" if key == "reverse_normals" else "Cleanup Normals"
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="grid",
+            command_method="cleanup_authored_floor_plan_normals",
+            command_kwargs={"room_resref": ctx.room_resref, "positive_z": positive_z},
+            mutates_kmap=True,
+            authoring_context=(
+                f"{context_label}: orient the selected floor-plan room winding in explicit KMAP floor-plan space "
+                f"so generated room geometry and WOK normals target {'positive' if positive_z else 'negative'} Z. "
+                "Validation/export/game proof become stale because winding affects generated MDL/WOK output."
+            ),
+        )
+
+    if key in {"soften_edges", "harden_edges"}:
+        policy = "soft" if key == "soften_edges" else "hard"
+        return _route(
+            action,
+            focus_component_mode="edge",
+            focus_snap_mode="grid",
+            command_method="set_authored_room_edge_normal_policy",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "policy": policy,
+                "primitive_name": ctx.primitive_name,
+                "edge_indices": tuple(ctx.metadata.get("edge_indices") or ()),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Edge normals: record visual soft/hard edge intent in authored KMAP state; "
+                "WOK traversal remains validated separately."
+            ),
+        )
+
+    if key == "extrude":
+        return _route(
+            action,
+            focus_component_mode="edge",
+            focus_snap_mode="grid",
+            command_method="edge_extrude_authored_floor_plan_room",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "distance": float(ctx.operation_distance),
+                "edge_index": int(ctx.operation_edge_index),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Extrude: pull the selected floor-plan edge into a KOTOR-authored room footprint; "
+                "MDL/WOK generation must be revalidated."
+            ),
+        )
+
+    if key == "bevel":
+        return _route(
+            action,
+            focus_component_mode="edge",
+            focus_snap_mode="grid",
+            command_method="bevel_authored_floor_plan_room",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "distance": float(ctx.operation_distance),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Bevel: chamfer convex room footprint corners while preserving deterministic WOK output."
+            ),
+        )
+
+    if key == "inset":
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="grid",
+            command_method="inset_authored_floor_plan_room",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "distance": float(ctx.operation_distance),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Inset: create an inward offset floor-plan face while preserving KOTOR room/export boundaries."
+            ),
+        )
+
+    if key == "boolean":
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="grid",
+            command_method="rectangular_cut_authored_floor_plan_room",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "center": tuple(ctx.cut_center),
+                "size": tuple(ctx.cut_size),
+            },
+            mutates_kmap=True,
+            authoring_context="Cut/boolean: split or subtract simple floor-plan geometry, then cleanup and validate before export.",
+        )
+
+    if key in {"cut", "split", "cut_slice_insert_edges", "insert_edge_loop"}:
+        axis = _clean_axis(ctx.axis)
+        coordinate = float(ctx.cut_center[1] if axis == "y" else ctx.cut_center[0])
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="grid",
+            command_method="axis_split_authored_floor_plan_room",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "axis": axis,
+                "coordinate": coordinate,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                f"{action.label}: split simple floor-plan geometry into explicit KOTOR room/export boundaries, "
+                "then cleanup and validate before export."
+            ),
+        )
+
+    if key in {"boolean_a_minus_b", "boolean_b_minus_a"}:
+        first = ctx.first_room_resref
+        second = ctx.second_room_resref
+        if not first or not second:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Boolean Difference needs two selected rectangular floor-plan rooms.",
+            )
+        minuend = first if key == "boolean_a_minus_b" else second
+        cutter = second if key == "boolean_a_minus_b" else first
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="boolean_difference_authored_floor_plan_rooms",
+            command_kwargs={
+                "first_room_resref": minuend,
+                "second_room_resref": cutter,
+                "result_room_resref": ctx.result_room_resref,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Boolean Difference: subtract one compatible rectangular floor-plan room from another, "
+                "consume the cutter operand, and emit KOTOR-safe room/export pieces."
+            ),
+        )
+
+    if key in {"triangulate", "triangulate_face"}:
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="grid",
+            command_method="triangulate_authored_floor_plan_face",
+            command_kwargs={"room_resref": ctx.room_resref},
+            mutates_kmap=True,
+            authoring_context=(
+                "Triangulate: precompute deterministic floor-plan fan triangles for export/readiness review; "
+                "WOK and room validation still decide whether the result is exportable."
+            ),
+        )
+
+    if key in {"fill", "fill_hole"}:
+        indices = _clean_indices(ctx.point_indices)
+        if len(indices) < 3:
+            return _route(
+                action,
+                focus_component_mode="face",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Fill needs a selected loop of at least three floor-plan points.",
+            )
+        return _route(
+            action,
+            focus_component_mode="face",
+            focus_snap_mode="grid",
+            command_method="fill_authored_floor_plan_face",
+            command_kwargs={"room_resref": ctx.room_resref, "point_indices": indices},
+            mutates_kmap=True,
+            authoring_context=(
+                "Fill Hole: record a selected floor-plan loop as a filled face candidate, then run cleanup and "
+                "validation before treating it as MDL/WOK export-ready."
+            ),
+        )
+
+    if key == "bridge":
+        if not ctx.first_room_resref or not ctx.second_room_resref or ctx.first_edge_index is None or ctx.second_edge_index is None:
+            return _route(
+                action,
+                focus_component_mode="edge",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Bridge needs two selected room edges before it can create a connector room.",
+            )
+        return _route(
+            action,
+            focus_component_mode="edge",
+            focus_snap_mode="grid",
+            command_method="bridge_authored_floor_plan_edges",
+            command_kwargs={
+                "first_room_resref": ctx.first_room_resref,
+                "first_edge_index": int(ctx.first_edge_index),
+                "second_room_resref": ctx.second_room_resref,
+                "second_edge_index": int(ctx.second_edge_index),
+                "result_room_resref": ctx.result_room_resref,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Bridge: create a new connector room between two compatible floor-plan edges; matching elevation, "
+                "material, wall, and WOK surface settings are required before export."
+            ),
+        )
+
+    if key == "combine":
+        if ctx.primitive_name and ctx.target_primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                command_method="combine_authored_room_primitives",
+                command_kwargs={
+                    "room_resref": ctx.room_resref,
+                    "primitive_names": (ctx.primitive_name, ctx.target_primitive_name),
+                    "group_name": str(ctx.metadata.get("group_name") or ctx.result_room_resref or ""),
+                },
+                mutates_kmap=True,
+                authoring_context=(
+                    "Combine Meshes: bake selected authored-object transforms into one true polygon object while "
+                    "preserving UVs, normals, materials, source provenance, disconnected shells, and explicit WOK ownership."
+                ),
+            )
+        if not ctx.first_room_resref or not ctx.second_room_resref:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Combine needs two selected composition primitives or two compatible floor-plan rooms.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="merge_authored_floor_plan_rooms",
+            command_kwargs={
+                "first_room_resref": ctx.first_room_resref,
+                "second_room_resref": ctx.second_room_resref,
+                "result_room_resref": ctx.result_room_resref,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Combine: merge two compatible rectangular floor-plan rooms into one export boundary while "
+                "preserving authored KMAP room identity, visibility, and stale export/proof state."
+            ),
+        )
+
+    if key == "separate":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Separate Shells needs one Combined Mesh selection first.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="separate_authored_room_primitive_shells",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+                "name_prefix": ctx.result_room_resref,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Separate Shells: split one Combined Mesh into connected polygon-shell objects in the same room. "
+                "Use Extract to Export Room when a new KOTOR room boundary is intended."
+            ),
+        )
+
+    if key in {"duplicate_special", "duplicate_selected"}:
+        if not ctx.primitive_name:
+            label = "Duplicate" if key == "duplicate_selected" else "Duplicate Special"
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason=f"{label} needs an authored composition primitive selection first.",
+            )
+        duplicate_count = 1 if key == "duplicate_selected" else int(ctx.duplicate_count)
+        translation_offset = (1.0, 0.0, 0.0) if key == "duplicate_selected" else tuple(ctx.duplicate_translation_offset)
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="duplicate_authored_room_primitive",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+                "duplicate_count": duplicate_count,
+                "translation_offset": translation_offset,
+                "rotation_offset_degrees_z": float(ctx.duplicate_rotation_offset_degrees_z),
+                "scale_multiplier": tuple(ctx.duplicate_scale_multiplier),
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                f"{action.label}: repeat the selected modular primitive with a deterministic transform offset; "
+                "MDL/MDX/WOK/LYT/VIS/PTH/.mod proof becomes stale."
+            ),
+        )
+
+    if key == "delete_selected":
+        if not ctx.primitive_name:
+            return _route(
+                action,
+                focus_component_mode="object",
+                focus_snap_mode="grid",
+                enabled=False,
+                disabled_reason="Delete needs an authored composition primitive selection first.",
+            )
+        return _route(
+            action,
+            focus_component_mode="object",
+            focus_snap_mode="grid",
+            command_method="remove_authored_room_primitive",
+            command_kwargs={
+                "room_resref": ctx.room_resref,
+                "primitive_name": ctx.primitive_name,
+            },
+            mutates_kmap=True,
+            authoring_context=(
+                "Delete: remove the selected authored primitive from the KMAP room composition; "
+                "MDL/MDX/WOK/LYT/VIS/PTH/.mod proof becomes stale and undo can restore the prior authored state."
+            ),
+        )
+
+    focus = _VERTEX_FOCUS.get(key)
+    if focus is not None:
+        mode, tool, snap = focus
+        return _route(action, focus_component_mode=mode, focus_snap_mode=snap, command_method="", command_kwargs={}, mutates_kmap=False)
+
+    return _route(action)
+
+
+def execute_map_studio_tool_belt_action(controller: Any, action_key: str, context: MapStudioToolActionContext | None = None) -> Any:
+    """Execute an already implemented headless Map Studio action."""
+
+    route = resolve_map_studio_tool_belt_action(action_key, context)
+    if not route.enabled:
+        raise ValueError(route.disabled_reason or f"Map Studio action '{action_key}' is not ready.")
+    if not route.command_method:
+        raise ValueError(f"Map Studio action '{action_key}' selects a workflow but has no headless command to execute.")
+    method = getattr(controller, route.command_method)
+    return method(**route.command_kwargs)

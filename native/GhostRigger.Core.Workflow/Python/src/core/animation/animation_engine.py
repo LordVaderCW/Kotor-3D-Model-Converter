@@ -99,6 +99,7 @@ class SuperModelResolver:
     # Configured by ``configure()``.  When None, the resolver still works
     # for in-memory / pre-loaded models but cannot load chains from disk.
     _resource_manager: Any = None
+    _resource_manager_revision = 0
 
     _NULL_REFS = frozenset({'', 'null', 'none'})
 
@@ -106,9 +107,18 @@ class SuperModelResolver:
     def configure(cls, resource_manager: Any) -> None:
         """Install the ResourceManager used to load supermodel MDL/MDX.
 
-        Safe to call repeatedly; later calls replace the previous manager.
+        Safe to call repeatedly. Cached chains remain valid only while both
+        the manager object and its published resource revision are unchanged.
         """
+
+        try:
+            revision = max(0, int(getattr(resource_manager, "revision", 0) or 0))
+        except (TypeError, ValueError):
+            revision = 0
+        if resource_manager is not cls._resource_manager or revision != cls._resource_manager_revision:
+            cls.clear_cache()
         cls._resource_manager = resource_manager
+        cls._resource_manager_revision = revision
 
     @classmethod
     def clear_cache(cls) -> None:
@@ -169,9 +179,14 @@ class SuperModelResolver:
             return None
 
         try:
-            super_model = cls._resource_manager.load_model(
-                resref, game_tag,
-            )
+            # Animation inheritance is part of the target game's model
+            # contract.  Prefer the strict loader when the configured resource
+            # provider exposes it so a K2 preview cannot inherit a K1-only
+            # supermodel.  Lightweight/legacy providers retain compatibility.
+            loader = getattr(cls._resource_manager, "load_model_strict", None)
+            if not callable(loader):
+                loader = cls._resource_manager.load_model
+            super_model = loader(resref, game_tag)
         except Exception as exc:  # pragma: no cover - defensive
             log.debug(
                 "SuperModelResolver: load_model(%r) raised %s",
@@ -181,8 +196,9 @@ class SuperModelResolver:
 
         cls._cache[key] = super_model
         # Proactively pre-load the rest of the chain so later lookups are hot.
-        if super_model is not None and not cls._is_null_ref(super_model.supermodel):
-            cls.load_supermodel(super_model.supermodel, game_tag)
+        next_super_ref = str(getattr(super_model, "supermodel", "") or "")
+        if super_model is not None and not cls._is_null_ref(next_super_ref):
+            cls.load_supermodel(next_super_ref, game_tag)
         return super_model
 
     @classmethod
@@ -437,6 +453,66 @@ def _ensure_quat_sign_consistency(values: List[List[float]]) -> List[List[float]
     return out
 
 
+_SANITIZED_CHANNEL_KEY = "_sanitized_channel_cache"
+
+
+def _sanitize_channel(times: List[float], values: List[List[float]]):
+    """One-time channel cleanup so per-frame sampling can skip validation.
+
+    Drops keyframes with non-finite components (the documented NaN-skip
+    semantics of ``_interp_channel``) and sign-normalizes quaternion
+    sequences once, instead of rebuilding the sequence on every sample.
+    """
+
+    if not times or not values:
+        return (), ()
+    clean_times: List[float] = []
+    clean_values: List[List[float]] = []
+    for index in range(min(len(times), len(values))):
+        value = values[index]
+        if _is_finite_vec(value):
+            clean_times.append(times[index])
+            clean_values.append(list(value))
+    if clean_values and len(clean_values[0]) == 4:
+        clean_values = _ensure_quat_sign_consistency(clean_values)
+    return clean_times, clean_values
+
+
+def _channel_samples(ctrl: dict):
+    """Cached sanitized (times, values) for a controller channel dict."""
+
+    cached = ctrl.get(_SANITIZED_CHANNEL_KEY)
+    if cached is None:
+        cached = _sanitize_channel(ctrl.get("times") or [], ctrl.get("values") or [])
+        ctrl[_SANITIZED_CHANNEL_KEY] = cached
+    return cached
+
+
+def _interp_channel_sanitized(times, values, t: float) -> Optional[List[float]]:
+    """Lean sampler over a pre-sanitized channel (finite, sign-consistent)."""
+
+    if not times:
+        return None
+    if t <= times[0]:
+        return list(values[0])
+    if t >= times[-1]:
+        return list(values[-1])
+    lo, hi = 0, len(times) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if times[mid] <= t:
+            lo = mid
+        else:
+            hi = mid
+    tf = (t - times[lo]) / max(1e-9, times[hi] - times[lo])
+    v0, v1 = values[lo], values[hi]
+    if len(v0) == 4:
+        return _slerp(v0, v1, tf)
+    if len(v0) == 3:
+        return list(_lerp3(v0, v1, tf))
+    return [_lerp(v0[k], v1[k], tf) for k in range(min(len(v0), len(v1)))]
+
+
 def _interp_channel(times: List[float], values: List[List[float]],
                     t: float) -> Optional[List[float]]:
     """
@@ -569,6 +645,35 @@ def _controller_matches(ctrl: Dict[str, Any], controller_type: int, controller_n
     return str(ctrl.get("name", "")).lower() == controller_name
 
 
+_SORTED_SAMPLING_TIMES_KEY = "_gr_sorted_sampling_times"
+
+
+def mark_controller_times_sorted_for_sampling(controller: Dict[str, Any]) -> bool:
+    """Mark one immutable-in-time-order list channel for zero-copy sampling.
+
+    The marker stores the exact list object, so replacing ``times``
+    automatically invalidates it. Callers retaining the list must keep its
+    order unchanged; controller values may still be replaced in place.
+    """
+
+    raw_times = controller.get("times", [])
+    raw_values = controller.get("values", [])
+    safe = (
+        isinstance(raw_times, list)
+        and isinstance(raw_values, list)
+        and bool(raw_times)
+        and len(raw_times) == len(raw_values)
+        and all(type(value) is float and math.isfinite(value) for value in raw_times)
+        and all(isinstance(value, list) for value in raw_values)
+        and all(raw_times[index - 1] <= raw_times[index] for index in range(1, len(raw_times)))
+    )
+    if safe:
+        controller[_SORTED_SAMPLING_TIMES_KEY] = raw_times
+        return True
+    controller.pop(_SORTED_SAMPLING_TIMES_KEY, None)
+    return False
+
+
 def _sample_controller_absolute(
     controllers: List[Dict[str, Any]],
     controller_type: int,
@@ -582,13 +687,26 @@ def _sample_controller_absolute(
     for ctrl in controllers:
         if not _controller_matches(ctrl, controller_type, controller_name):
             continue
-        times = [float(value) for value in ctrl.get("times", [])]
-        values = [list(value) for value in ctrl.get("values", [])]
-        if not times or not values:
+        raw_times = ctrl.get("times", [])
+        raw_values = ctrl.get("values", [])
+        if not raw_times or not raw_values:
             return None
-        rows = sorted(zip(times, values), key=lambda item: item[0])
-        times = [row[0] for row in rows]
-        values = [row[1] for row in rows]
+
+        # Dense validation clips can contain thousands of keys and are sampled
+        # thousands of times. Explicitly marked float/list channels have
+        # already paid the order-validation cost once and can be sampled
+        # without repeatedly copying and sorting every row. All unmarked
+        # inputs keep the exact historical normalization/stable-sort path.
+        direct_channel = ctrl.get(_SORTED_SAMPLING_TIMES_KEY) is raw_times
+        if direct_channel:
+            times = raw_times
+            values = raw_values
+        else:
+            times = [float(value) for value in raw_times]
+            values = [list(value) for value in raw_values]
+            rows = sorted(zip(times, values), key=lambda item: item[0])
+            times = [row[0] for row in rows]
+            values = [row[1] for row in rows]
         sample_time = time_seconds
         if clamp:
             sample_time = max(times[0], min(times[-1], sample_time))
@@ -621,12 +739,17 @@ def evaluate_aurora_animation_pose(
     *,
     clamp: bool = True,
 ) -> EvaluatedAuroraPose:
-    """Evaluate one Aurora animation block as absolute parent-local controllers.
+    """Evaluate one Aurora animation block with engine-verified key semantics.
 
     This helper is intentionally independent from viewport playback. It exists
     as a deterministic validation oracle for export/retargeting gates:
-    orientation and position keys replace the corresponding rest-local component,
-    unkeyed components stay at rest, and parent transforms propagate by FK.
+    POSITION keys are DELTA offsets ADDED to the rest-local position (matching
+    AnimationEngine._eval_node, xoreos ``arePositionFramesRelative()==true``
+    and KotorBlender ``p1 = restloc + animscale*val``; T2558 — this oracle
+    used to REPLACE positions, which offset every position-keyed bone by its
+    rest position and made audit poses disagree with the viewport), ORIENTATION
+    keys replace the rest-local rotation, unkeyed components stay at rest,
+    and parent transforms propagate by FK.
     """
 
     anim_nodes = {
@@ -651,9 +774,9 @@ def evaluate_aurora_animation_pose(
             )
             if sampled_position is not None and len(sampled_position) >= 3:
                 local_position = (
-                    float(sampled_position[0]),
-                    float(sampled_position[1]),
-                    float(sampled_position[2]),
+                    float(node.position[0]) + float(sampled_position[0]),
+                    float(node.position[1]) + float(sampled_position[1]),
+                    float(node.position[2]) + float(sampled_position[2]),
                 )
 
             sampled_rotation = _sample_controller_absolute(
@@ -720,6 +843,33 @@ class AnimationEngine:
         if model.root_node:
             for n in model.all_nodes():
                 name_key = n.name.lower()
+                # BAS preview models retain complete attachment DAGs beneath
+                # body sockets.  Those DAGs intentionally repeat ordinary
+                # Odyssey names such as ``rootdummy`` and ``torso_g``.  A
+                # single body animation pose must use the primary body node's
+                # bind transform for its rest-local position delta; allowing a
+                # later head attachment node to overwrite it collapses the
+                # body by roughly the body's rootdummy height.  Head-local
+                # animation remains independent through the attachment-source
+                # AnimationEngine in mesh_render_data.
+                existing = self._base_nodes.get(name_key)
+                if existing is not None:
+                    existing_is_attachment = bool(
+                        getattr(existing, "_gr_bas_attachment_layer", False)
+                    )
+                    incoming_is_attachment = bool(
+                        getattr(n, "_gr_bas_attachment_layer", False)
+                    )
+                    # Preserve the first native DAG node for duplicate Odyssey
+                    # names. K2 PFBCM contains a second ``lhand_g`` nested
+                    # beneath the real wrist joint; last-wins lookup selects
+                    # that helper, turns its parent into a name-based self
+                    # cycle, and stretches the hand away from the sleeve.
+                    # A primary body node may still replace an attachment node
+                    # in a BAS composite, but attachments and later native
+                    # duplicates never replace an established body joint.
+                    if not existing_is_attachment or incoming_is_attachment:
+                        continue
                 self._base_nodes[name_key] = n
                 self._node_kinds_by_name[name_key] = str(
                     getattr(n, "_gr_scene_node_kind", "") or classify_scene_node(n, self._scene_identity)
@@ -976,6 +1126,12 @@ class AnimationEngine:
             return AnimPose(time=t)
 
         pose = AnimPose(time=t)
+        # The emitter particle pass needs the active Animation block to sample
+        # emitter channels (birthrate/alpha gates such as the Star Map "on").
+        # Viewport models frequently carry an empty ``animations`` list — the
+        # Animation Browser resolves clips through source/supermodel chains —
+        # so the resolved block rides along on the evaluated pose.
+        pose._gr_animation = anim
         for anim_node in anim.nodes:
             np_ = self._eval_node(anim_node, t)
             if np_:
@@ -1115,7 +1271,11 @@ class AnimationEngine:
 
         for ctrl in anim_node.controllers:
             ctype = ctrl['type']
-            val = _interp_channel(ctrl['times'], ctrl['values'], t)
+            # Hot path: sample the cached pre-sanitized channel. Sanitizing
+            # (finite filter + quaternion sign consistency) used to run per
+            # sample per frame and dominated evaluate() cost on PIE modules.
+            channel_times, channel_values = _channel_samples(ctrl)
+            val = _interp_channel_sanitized(channel_times, channel_values, t)
             if val is None:
                 continue
 

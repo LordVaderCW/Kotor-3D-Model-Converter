@@ -27,7 +27,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_DIAGNOSTICS_VALIDATION_SERVICE",
             "source_path": "src/core/diagnostics/validation_service.py",
             "packaged_path": "Python/src/core/diagnostics/validation_service.py",
-            "sha256": "f872b684f7f0bf4197afbfbc02218eeb2d3eb81ce3c5ca446ba6cf395da26a05"
+            "sha256": "b2c941a6aed20b963a6726c814c00340bd6e2c5f9128e21c27ccf073edc1d570"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_INFRA_INIT",
@@ -39,7 +39,7 @@
             "resource_name": "PYTHON_PAYLOAD_INFRA_MCP_AUTOSTART",
             "source_path": "src/infra/mcp_autostart.py",
             "packaged_path": "Python/src/infra/mcp_autostart.py",
-            "sha256": "e3da53f25dd721f933e0bc61cd0550bc05f7f9259756738dff1306fcf5d4cf63"
+            "sha256": "9efd1a7022059b211175310a0f1c16b66ac315cac2f542188c148397f05444ea"
         }
     ]
 }

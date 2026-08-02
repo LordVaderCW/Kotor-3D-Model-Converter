@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .authored_module_project import AuthoredModuleProject, compile_authored_room_spec
-from .authored_room_composition import AuthoredRoomComposition
+from .authored_module_walkmesh import resolve_room_wok_module_offset
+from .authored_room_composition import AuthoredRoomComposition, PlacedRoomPrimitive
 from .authored_room_floorplan import FloorPlanRoomPrimitive
 from .authored_room_geometry import RectangularRoomPrimitive
 from .authored_terrain_builder import TerrainHeightfieldPrimitive
@@ -29,6 +30,8 @@ class AuthoredWalkmeshStatus:
     invalid_face_count: int = 0
     degenerate_face_count: int = 0
     non_manifold_edge_count: int = 0
+    open_edge_count: int = 0
+    steep_walkable_face_count: int = 0
     summary: str = "Walkmesh: no authored module loaded."
     next_action: str = "Create a starter room or terrain patch before inspecting walkmesh."
     warnings: tuple[str, ...] = ()
@@ -57,7 +60,8 @@ def _room_surface_payload(primitive: object) -> tuple[str, str, int] | None:
     if isinstance(primitive, TerrainHeightfieldPrimitive):
         return ("terrain heightfield", str(primitive.material.texture or ""), resolve_walkmesh_surface_id(primitive.floor_surface_id))
     if isinstance(primitive, AuthoredRoomComposition):
-        return ("composed room", str(primitive.floor.material.texture or ""), resolve_walkmesh_surface_id(primitive.floor.surface_id))
+        floor = primitive.floor.primitive if isinstance(primitive.floor, PlacedRoomPrimitive) else primitive.floor
+        return ("composed room", str(floor.material.texture or ""), resolve_walkmesh_surface_id(floor.surface_id))
     return None
 
 
@@ -129,16 +133,35 @@ def authored_walkmesh_status_for_project(project: AuthoredModuleProject) -> Auth
     invalid_faces = sum(audit.invalid_face_count for audit in audits)
     degenerate_faces = sum(audit.degenerate_face_count for audit in audits)
     non_manifold_edges = sum(audit.non_manifold_edge_count for audit in audits)
-    audit_warnings = tuple(warning for audit in audits for warning in audit.warnings)
+    open_edges = sum(audit.open_edge_count for audit in audits)
+    steep_walkable_faces = sum(audit.steep_walkable_face_count for audit in audits)
+    max_audit_slope = max((float(audit.max_walkable_slope_degrees) for audit in audits), default=0.0)
+    # Module-space alignment: a converted room can carry a room-local WOK
+    # mislabeled module-space, which floats its collision away from the
+    # rendered geometry.  The combiner auto-corrects; report it here so the
+    # Generate/Validate Walkmesh UI explains the repair instead of the map
+    # silently failing PIE with "player start not on a walkable face".
+    alignment_warnings = tuple(
+        warning
+        for room in rooms
+        for warning in (resolve_room_wok_module_offset(room)[1],)
+        if warning
+    )
+    audit_warnings = alignment_warnings + tuple(warning for audit in audits for warning in audit.warnings)
     audit_blocking = tuple(message for audit in audits for message in audit.blocking_messages)
     overlay = authored_terrain_walkability_overlay_for_project(project)
+    overlay_blocking = tuple(
+        validation.message
+        for validation in tuple(getattr(overlay, "room_validations", ()) or ())
+        if str(getattr(validation, "state", "") or "") == "invalid"
+    )
     if terrain_room_count > 0:
         total = walkable + non_walk
-        ready = total > 0 and walkable > 0 and not audit_blocking
+        ready = total > 0 and walkable > 0 and not audit_blocking and not overlay_blocking
         if ready:
-            next_action = "Inspect green/orange terrain overlay, fix steep samples if needed, then validate before staging."
+            next_action = "Inspect the green validated WOK overlay, fix steep samples if needed, then stage for game proof."
         else:
-            next_action = "Fix terrain WOK blockers, disconnected islands, invalid faces, or terrain samples before staging."
+            next_action = "Fix the red WOK overlay blockers, disconnected islands, invalid faces, missing perimeter, or terrain samples before staging."
         return AuthoredWalkmeshStatus(
             ready=ready,
             room_count=room_count,
@@ -151,6 +174,8 @@ def authored_walkmesh_status_for_project(project: AuthoredModuleProject) -> Auth
             invalid_face_count=invalid_faces,
             degenerate_face_count=degenerate_faces,
             non_manifold_edge_count=non_manifold_edges,
+            open_edge_count=open_edges,
+            steep_walkable_face_count=steep_walkable_faces,
             summary=(
                 f"Walkmesh: {terrain_room_count} terrain room(s), {walkable} walkable triangle(s), "
                 f"{non_walk} blocked triangle(s), {component_count} walkable island(s), "
@@ -158,7 +183,7 @@ def authored_walkmesh_status_for_project(project: AuthoredModuleProject) -> Auth
             ),
             next_action=next_action,
             warnings=tuple(overlay.warnings) + audit_warnings,
-            blocking_messages=audit_blocking,
+            blocking_messages=audit_blocking + overlay_blocking,
         )
 
     ready = walkable > 0 and not audit_blocking
@@ -168,11 +193,14 @@ def authored_walkmesh_status_for_project(project: AuthoredModuleProject) -> Auth
         terrain_room_count=0,
         walkable_triangle_count=walkable,
         non_walk_triangle_count=non_walk,
+        max_slope_degrees=max_audit_slope,
         walkable_component_count=component_count,
         disconnected_walkmesh_room_count=disconnected_rooms,
         invalid_face_count=invalid_faces,
         degenerate_face_count=degenerate_faces,
         non_manifold_edge_count=non_manifold_edges,
+        open_edge_count=open_edges,
+        steep_walkable_face_count=steep_walkable_faces,
         summary=(
             f"Walkmesh: {room_count} authored flat/composition room(s), {walkable} walkable triangle(s), "
             f"{component_count} walkable island(s). Use Room Material + Walkmesh or Primitive Material + Surface "

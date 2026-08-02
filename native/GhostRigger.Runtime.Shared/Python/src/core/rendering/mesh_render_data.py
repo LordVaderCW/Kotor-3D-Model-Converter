@@ -96,6 +96,13 @@ class ScopedAnimationPoseSet:
                 if str(getattr(pose, "_gr_animation_scene_import_id", "") or "") == node_import_id:
                     return pose
         node_source_id = _source_model_id_for_node(node)
+        # A scoped collection is intentionally stricter than a legacy single
+        # pose.  Identity-free module geometry must never inherit whichever
+        # character happens to be first in ``poses_by_character``.  Runtime
+        # actor descendants still resolve their inherited object/import/source
+        # identity through the parent-chain helpers above.
+        if not node_object_id and not node_import_id and not node_source_id:
+            return None
         for pose in self.poses_by_character.values():
             if _animation_pose_matches_node_identity(node, pose, node_object_id=node_object_id, node_import_id=node_import_id, node_source_id=node_source_id):
                 return pose
@@ -140,6 +147,15 @@ def iter_mesh_render_data(
             continue
         if positions is None or len(positions) == 0:
             continue
+        diffuse_name = _clean_tex_name(getattr(node, "texture", "") or "")
+        diffuse_source = textures.get(diffuse_name.lower()) or textures.get(diffuse_name)
+        texture_v_flip = bool(getattr(diffuse_source, "_gr_gpu_uv_v_flip", True))
+        node_v_flip = bool(getattr(node, "uv_v_flip", True))
+        if uvs0 is not None and node_v_flip and not texture_v_flip:
+            # WGPU/PyGFX shaders apply the KotOR V conversion. Match ModernGL
+            # by pre-flipping loose bottom-left DCC atlases to cancel it.
+            uvs0 = np.asarray(uvs0, dtype=np.float32).copy()
+            uvs0[:, 1] = 1.0 - uvs0[:, 1]
         skinning = _extract_skinning(
             node,
             len(positions),
@@ -175,6 +191,7 @@ def iter_mesh_render_data(
                     skinning,
                     node_anim_pose,
                     model=model,
+                    anim_base_pose=anim_base_pose,
                 )
                 if skinned_positions is not positions:
                     positions = skinned_positions
@@ -203,6 +220,7 @@ def iter_mesh_render_data(
                     skinning,
                     node_anim_pose,
                     model=model,
+                    anim_base_pose=anim_base_pose,
                 )
                 if skinned_positions is not positions:
                     positions = skinned_positions
@@ -211,7 +229,7 @@ def iter_mesh_render_data(
             except Exception:
                 pass
         material = _material_data(node, textures)
-        source_revision = _node_revision(node)
+        source_revision = (*_node_revision(node), int(node_v_flip and texture_v_flip))
         if getattr(skinning, "is_skinned", False):
             skin_lbs_input_mode = 1 if node_anim_pose is not None else 0
             source_revision = (
@@ -276,14 +294,28 @@ def _node_is_renderable_mesh(node) -> bool:
     return bool(getattr(node, "vertices", getattr(node, "verts", [])) and getattr(node, "faces", []))
 
 
+def _node_vertices_are_model_world(node) -> bool:
+    if bool(getattr(node, "_gr_vertices_in_kotor_world", False)):
+        return True
+    try:
+        return int(getattr(node, "vertex_space", 0) or 0) == 1
+    except Exception:
+        return False
+
+
 def _extract_node_arrays(node, *, anim_pose=None, vbo_builder=None):
     import numpy as np
 
     is_skin = bool(getattr(node, "is_skin", False))
     is_bas_attachment = bool(getattr(node, "_gr_bas_attachment_layer", False))
     bas_root = _bas_attachment_root_for_node(node) if is_bas_attachment else None
+    vertices_are_model_world = _node_vertices_are_model_world(node)
     world_pos, world_orient = _node_world_transform(node, anim_pose=anim_pose)
     world_matrix = node_world_matrix(node, anim_pose=anim_pose)
+    if vertices_are_model_world and not is_bas_attachment:
+        world_pos = (0.0, 0.0, 0.0)
+        world_orient = (0.0, 0.0, 0.0, 1.0)
+        world_matrix = np.eye(4, dtype=np.float32)
     if is_skin and bas_root is not None:
         # BAS skin attachments must stay out of the body palette, but their
         # bind-shape should remain local to the attachment root.  Keeping large
@@ -619,6 +651,10 @@ def bas_attachment_palette_model_for_node(node):
 def mesh_model_matrix_for_node(node, *, anim_pose=None):
     """Return the world/model matrix a renderer should apply to one mesh node."""
 
+    if _node_vertices_are_model_world(node) and not bool(getattr(node, "_gr_bas_attachment_layer", False)):
+        import numpy as np
+
+        return np.eye(4, dtype=np.float32)
     anim_pose = _effective_animation_pose_for_node(node, anim_pose)
     if bool(getattr(node, "_gr_bas_attachment_layer", False)):
         root = _bas_attachment_root_for_node(node)
@@ -797,7 +833,8 @@ def _node_has_lightmap(node, lightmap_name: str) -> bool:
 
 
 def _alpha_mode(node) -> str:
-    node_alpha = _clamp01(float(getattr(node, "alpha", 1.0) or 1.0))
+    raw_node_alpha = getattr(node, "alpha", None)
+    node_alpha = _clamp01(float(1.0 if raw_node_alpha is None else raw_node_alpha))
     txi_blend = int(getattr(node, "txi_blending", 0) or 0)
     alpha_test = float(getattr(node, "txi_alpha_test", 0.0) or 0.0)
     transparency_hint = int(getattr(node, "transparency_hint", 0) or 0)
@@ -897,7 +934,27 @@ def _node_world_transform(node, *, anim_pose=None) -> tuple[tuple[float, float, 
             wp = node.world_position()
             return tuple(float(v) for v in wp[:3]), (0.0, 0.0, 0.0, 1.0)
         except Exception:
-            return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+            # Lightweight runtime/test nodes do not always implement the model
+            # convenience methods.  Compose their explicit local transform
+            # through the parent chain instead of dropping socket placement.
+            try:
+                from src.core.geometry.model_data import _quat_mul, _quat_normalize_bind, _quat_rotate
+
+                parent = getattr(node, "parent", None)
+                local_pos = tuple(float(v) for v in getattr(node, "position", (0.0, 0.0, 0.0))[:3])
+                local_rot = tuple(float(v) for v in getattr(node, "rotation", (0.0, 0.0, 0.0, 1.0))[:4])
+                local_rot = tuple(_quat_normalize_bind(local_rot))
+                if parent is None:
+                    return local_pos, local_rot
+                parent_pos, parent_rot = _node_world_transform(parent, anim_pose=anim_pose)
+                offset = _quat_rotate(parent_rot, local_pos)
+                return (
+                    float(parent_pos[0]) + float(offset[0]),
+                    float(parent_pos[1]) + float(offset[1]),
+                    float(parent_pos[2]) + float(offset[2]),
+                ), tuple(_quat_mul(parent_rot, local_rot))
+            except Exception:
+                return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
 
 
 def node_world_matrix(node, *, anim_pose=None):
@@ -1020,13 +1077,166 @@ def _bas_attachment_socket_node(bas_root):
     return None
 
 
-def _bas_attachment_world_transform(node, bas_root, *, anim_pose=None):
+def _bas_attachment_world_transform(node, bas_root, *, anim_pose=None, transform_cache=None):
     from src.core.geometry.model_data import (
         _quat_mul,
         _quat_normalize,
         _quat_normalize_bind,
         _quat_rotate,
     )
+
+    # Retained renderers can ask for every node in the same detachable BAS head
+    # during one frame.  The uncached, renderer-neutral path below deliberately
+    # rebuilds the complete root chain, but doing that for each eye/face/skin
+    # node repeatedly rescans the same head pose and socket hierarchy.  Keep the
+    # cache caller-owned so animation-pose and scene changes invalidate it at the
+    # next frame boundary without persistent scene state.
+    if transform_cache is not None:
+        state_key = ("bas_attachment_root_pose", id(bas_root), id(anim_pose))
+        state = transform_cache.get(state_key)
+        if not (
+            isinstance(state, dict)
+            and state.get("root") is bas_root
+            and state.get("pose") is anim_pose
+        ):
+            socket = _bas_attachment_socket_node(bas_root)
+            socket_pose = getattr(anim_pose, "_gr_bas_socket_pose", anim_pose)
+            if socket is not None:
+                socket_wp, socket_wo = _node_world_transform(socket, anim_pose=socket_pose)
+                socket_base = (
+                    tuple(float(value) for value in socket_wp[:3]),
+                    tuple(float(value) for value in socket_wo[:4]),
+                )
+            else:
+                socket_base = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+            state = {
+                "root": bas_root,
+                "pose": anim_pose,
+                "socket_base": socket_base,
+                "pose_mode": _bas_attachment_pose_mode_for_root(bas_root, anim_pose),
+                "bind_states": {},
+            }
+            transform_cache[state_key] = state
+
+        # Validate the BAS chain while arranging it root-first.  If a malformed
+        # attachment does not actually reach its tagged root, retain the legacy
+        # full-chain fallback below instead of caching a different transform.
+        chain = []
+        current = node
+        visited: set[int] = set()
+        while current is not None:
+            current_id = id(current)
+            if current_id in visited or len(chain) > 512:
+                break
+            visited.add(current_id)
+            chain.append(current)
+            if current is bas_root:
+                break
+            current = getattr(current, "parent", None)
+
+        if chain and chain[-1] is bas_root:
+            chain.reverse()
+            pose_mode = str(state["pose_mode"] or "")
+            bind_states = state["bind_states"]
+            (base_position, base_orientation) = state["socket_base"]
+            wx, wy, wz = base_position
+            parent_orientation = base_orientation
+            start_index = 0
+
+            # A cached bind-state is the exact root-to-ancestor prefix needed by
+            # the original full-chain calculation.  It is intentionally distinct
+            # from that ancestor's leaf result because Odyssey's pure-X bind
+            # quaternion normalization differs for ancestors and leaves.
+            for index in range(len(chain) - 2, -1, -1):
+                cached_prefix = bind_states.get(id(chain[index]))
+                if cached_prefix is None:
+                    continue
+                (cached_position, cached_orientation) = cached_prefix
+                wx, wy, wz = cached_position
+                parent_orientation = cached_orientation
+                start_index = index + 1
+                break
+
+            for chain_node in chain[start_index:-1]:
+                pose_node = None
+                if pose_mode == "source_local" or (
+                    pose_mode == "inherited_head_local"
+                    and _bas_inherited_head_pose_node_allowed(chain_node)
+                ):
+                    pose_node = _pose_node_for_transform(chain_node, anim_pose)
+                if pose_node is not None:
+                    lx, ly, lz = getattr(
+                        pose_node,
+                        "position",
+                        getattr(chain_node, "position", (0.0, 0.0, 0.0)),
+                    )
+                    if not (math.isfinite(lx) and math.isfinite(ly) and math.isfinite(lz)):
+                        lx, ly, lz = getattr(chain_node, "position", (0.0, 0.0, 0.0))
+                    rot = list(
+                        getattr(
+                            pose_node,
+                            "rotation",
+                            getattr(chain_node, "rotation", (0.0, 0.0, 0.0, 1.0)),
+                        )
+                    )
+                    if not all(math.isfinite(value) for value in rot):
+                        rot = list(getattr(chain_node, "rotation", (0.0, 0.0, 0.0, 1.0)))
+                else:
+                    lx, ly, lz = getattr(chain_node, "position", (0.0, 0.0, 0.0))
+                    rot = list(getattr(chain_node, "rotation", (0.0, 0.0, 0.0, 1.0)))
+                node_rot = _quat_normalize_bind(rot)
+                rx, ry, rz = _quat_rotate(parent_orientation, (lx, ly, lz))
+                wx += rx
+                wy += ry
+                wz += rz
+                parent_orientation = _quat_mul(parent_orientation, node_rot)
+                bind_states[id(chain_node)] = (
+                    (float(wx), float(wy), float(wz)),
+                    tuple(float(value) for value in parent_orientation[:4]),
+                )
+
+            leaf = chain[-1]
+            pose_node = None
+            if pose_mode == "source_local" or (
+                pose_mode == "inherited_head_local"
+                and _bas_inherited_head_pose_node_allowed(leaf)
+            ):
+                pose_node = _pose_node_for_transform(leaf, anim_pose)
+            if pose_node is not None:
+                lx, ly, lz = getattr(
+                    pose_node,
+                    "position",
+                    getattr(leaf, "position", (0.0, 0.0, 0.0)),
+                )
+                if not (math.isfinite(lx) and math.isfinite(ly) and math.isfinite(lz)):
+                    lx, ly, lz = getattr(leaf, "position", (0.0, 0.0, 0.0))
+                rot = list(
+                    getattr(
+                        pose_node,
+                        "rotation",
+                        getattr(leaf, "rotation", (0.0, 0.0, 0.0, 1.0)),
+                    )
+                )
+                if not all(math.isfinite(value) for value in rot):
+                    rot = list(getattr(leaf, "rotation", (0.0, 0.0, 0.0, 1.0)))
+            else:
+                lx, ly, lz = getattr(leaf, "position", (0.0, 0.0, 0.0))
+                rot = list(getattr(leaf, "rotation", (0.0, 0.0, 0.0, 1.0)))
+            node_rot = _quat_normalize(rot)
+            rx, ry, rz = _quat_rotate(parent_orientation, (lx, ly, lz))
+            wx += rx
+            wy += ry
+            wz += rz
+            parent_orientation = _quat_mul(parent_orientation, node_rot)
+
+            length_sq = sum(float(value) * float(value) for value in parent_orientation[:4])
+            if length_sq > 1e-9 and abs(length_sq - 1.0) > 1e-4:
+                scale = 1.0 / math.sqrt(length_sq)
+                parent_orientation = [float(value) * scale for value in parent_orientation[:4]]
+            return (
+                (float(wx), float(wy), float(wz)),
+                tuple(float(value) for value in parent_orientation[:4]),
+            )
 
     socket = _bas_attachment_socket_node(bas_root)
     socket_pose = getattr(anim_pose, "_gr_bas_socket_pose", anim_pose)
@@ -1214,6 +1424,27 @@ def _source_model_id_for_node(node) -> int:
     return 0
 
 
+def runtime_source_model_for_node(node):
+    """Return the runtime actor model that owns ``node``'s skin palette.
+
+    PIE actors live inside a much larger resident map model.  Their qBone/tBone
+    rows and DFS indices still belong to the original character model, so a
+    renderer must not infer a palette from the map hierarchy.  The reference is
+    stored on the runtime wrapper and resolved through ancestors to avoid
+    retaining a duplicate strong reference on every copied Odyssey node.
+    """
+
+    current = node
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        source_model = getattr(current, "_gr_runtime_source_model_ref", None)
+        if source_model is not None:
+            return source_model
+        current = getattr(current, "parent", None)
+    return None
+
+
 def animation_pose_for_node(node, anim_pose):
     """Return the single character pose allowed to drive ``node``."""
 
@@ -1249,11 +1480,15 @@ def _animation_pose_matches_node_identity(
         node_object_id = _scene_object_id_for_node(node) if node_object_id is None else node_object_id
         if node_object_id and node_object_id != pose_object_id:
             return False
+        if node_object_id:
+            return True
     pose_import_id = str(getattr(anim_pose, "_gr_animation_scene_import_id", "") or "")
     if pose_import_id:
         node_import_id = _scene_import_id_for_node(node) if node_import_id is None else node_import_id
         if node_import_id and node_import_id != pose_import_id:
             return False
+        if node_import_id:
+            return True
     try:
         pose_source_id = int(getattr(anim_pose, "_gr_animation_source_model_id", 0) or 0)
     except Exception:
@@ -1306,6 +1541,53 @@ def _bas_attachment_local_transform(node, bas_root):
     return (float(wx), float(wy), float(wz)), tuple(float(v) for v in parent_orientation[:4])
 
 
+def _animated_world_cache_key_from_chain(chain) -> tuple:
+    key_parts = []
+    for chain_node in chain:
+        try:
+            position = tuple(round(float(v), 6) for v in tuple(getattr(chain_node, "position", (0.0, 0.0, 0.0)))[:3])
+        except Exception:
+            position = (0.0, 0.0, 0.0)
+        try:
+            rotation = tuple(round(float(v), 6) for v in tuple(getattr(chain_node, "rotation", (0.0, 0.0, 0.0, 1.0)))[:4])
+        except Exception:
+            rotation = (0.0, 0.0, 0.0, 1.0)
+        try:
+            source_position = tuple(
+                round(float(v), 6)
+                for v in tuple(getattr(chain_node, "_gr_scene_source_position", position))[:3]
+            )
+        except Exception:
+            source_position = position
+        key_parts.append(
+            (
+                id(chain_node),
+                int(getattr(chain_node, "_gr_revision", 0) or 0),
+                bool(getattr(chain_node, "_gr_scene_object_root", False)),
+                position,
+                source_position,
+                rotation,
+            )
+        )
+    return tuple(key_parts)
+
+
+def _animated_pose_cache_stamp(anim_pose) -> tuple:
+    def _stamp_value(name: str, fallback=0.0):
+        try:
+            return round(float(getattr(anim_pose, name, fallback) or fallback), 6)
+        except Exception:
+            return fallback
+
+    return (
+        _stamp_value("time"),
+        _stamp_value("current_time"),
+        _stamp_value("_gr_animation_time"),
+        int(getattr(anim_pose, "_gr_revision", 0) or 0),
+        str(getattr(anim_pose, "_gr_animation_name", "") or ""),
+    )
+
+
 def _animated_node_world_transform(node, anim_pose) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
     import math
 
@@ -1323,10 +1605,6 @@ def _animated_node_world_transform(node, anim_pose) -> tuple[tuple[float, float,
             setattr(anim_pose, "_gr_mesh_world_cache", cache)
         except Exception:
             pass
-    cached = cache.get(id(node))
-    if cached is not None:
-        return cached
-
     chain = []
     current = node
     visited: set[int] = set()
@@ -1338,6 +1616,10 @@ def _animated_node_world_transform(node, anim_pose) -> tuple[tuple[float, float,
         chain.append(current)
         current = getattr(current, "parent", None)
     chain.reverse()
+    cache_key = (id(node), _animated_pose_cache_stamp(anim_pose), _animated_world_cache_key_from_chain(chain))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     wx = wy = wz = 0.0
     parent_orientation = [0.0, 0.0, 0.0, 1.0]
@@ -1384,7 +1666,7 @@ def _animated_node_world_transform(node, anim_pose) -> tuple[tuple[float, float,
             scale = 1.0 / math.sqrt(length_sq)
             wo = tuple(float(v) * scale for v in wo[:4])
         result = ((float(wx), float(wy), float(wz)), tuple(float(v) for v in wo[:4]))
-    cache[id(node)] = result
+    cache[cache_key] = result
     return result
 
 
@@ -1394,16 +1676,19 @@ def _material_color(node) -> tuple[float, float, float, float]:
         r, g, b = (float(raw[0]), float(raw[1]), float(raw[2]))
     except Exception:
         r, g, b = (0.72, 0.74, 0.76)
-    alpha = float(getattr(node, "alpha", 1.0) or 1.0)
+    raw_alpha = getattr(node, "alpha", None)
+    alpha = float(1.0 if raw_alpha is None else raw_alpha)
     alpha *= float(getattr(node, "txi_wateralpha", 1.0) or 1.0)
     return (_clamp01(r), _clamp01(g), _clamp01(b), _clamp01(alpha))
 
 
-def _node_revision(node) -> tuple[int, int, int]:
+def _node_revision(node) -> tuple[int, ...]:
     return (
         len(getattr(node, "vertices", getattr(node, "verts", [])) or []),
         len(getattr(node, "faces", []) or []),
         int(getattr(node, "_gr_revision", 0) or 0),
+        int(getattr(node, "vertex_space", 0) or 0),
+        1 if bool(getattr(node, "_gr_vertices_in_kotor_world", False)) else 0,
     )
 
 

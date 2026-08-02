@@ -814,6 +814,13 @@ class ModelNode:
     # ── Emitter ──
     emitter_params: Dict[str, Any] = field(default_factory=dict)
 
+    # ── Reference ──
+    # Aurora reference nodes instance another MDL by resref.  Keep these
+    # separate from emitter metadata so stock room traffic such as Dantooine's
+    # C_Brith reference survives model conversion, cloning, and binary export.
+    reference_model:        str  = ""
+    reference_reattachable: bool = False
+
     # ── K2/TSL extra mesh fields (Kotor.NET TrimeshHeader TSLUnknown1/2) ──
     # Layout of the 8 bytes after the flag sequence in K2/TSL trimesh headers:
     #   byte 0: dirtenabled      — 1 = dirt decal overlay enabled
@@ -1274,7 +1281,12 @@ class ModelNode:
         self.tangents = result
 
     def clone_shallow(self) -> 'ModelNode':
-        n = ModelNode(name=self.name, flags=self.flags, index=self.index)
+        n = ModelNode(
+            name=self.name,
+            flags=self.flags,
+            index=self.index,
+            number=self.number,
+        )
         n.position = self.position
         n.rotation = self.rotation
         n.texture  = self.texture
@@ -1293,6 +1305,8 @@ class ModelNode:
         n.light_enabled      = self.light_enabled
         n.light_cone_degrees = self.light_cone_degrees
         n.light_area_size    = self.light_area_size
+        n.reference_model        = self.reference_model
+        n.reference_reattachable = self.reference_reattachable
         # Phase 3.7 fields
         n.mesh_average_point = self.mesh_average_point
         n.mesh_unknown0      = self.mesh_unknown0
@@ -1413,6 +1427,26 @@ class KotorModel:
     mdl_path: str = ""
     mdx_path: str = ""
 
+    # Binary model-header attachment contract. Most resources leave
+    # ``offset_to_super_root`` pointing at the geometry root, represented by an
+    # empty name here. Modular player heads are the important exception: stock
+    # KOTOR heads point it at ``neck_g`` so the engine can link the otherwise
+    # independent head DAG to the body's animated headhook.
+    super_root_node_name: str = ""
+
+    # Raw geometry-header node declaration. For standalone models this is
+    # commonly the local geometry-node count. Some native character families
+    # store a cumulative inheritance-chain span here (retail K2 PFHA04 declares
+    # 564 while containing 38 local nodes), while other families retain a
+    # local count. Preserve the resource's explicit value rather than deriving
+    # one generic rule from the in-memory tree.
+    geometry_node_count: int = 0
+
+    # Native character rigs use sparse node-header +2 identities. Generated
+    # models keep the historical dense fallback unless a donor-preserving
+    # workflow explicitly opts into retaining those native values.
+    preserve_native_supernode_numbers: bool = False
+
     @property
     def nodes(self) -> List[ModelNode]:
         """Convenience alias for all_nodes() — returns all nodes in DFS order.
@@ -1448,13 +1482,20 @@ class KotorModel:
             visited.add(nid)
             result.append(n)
             # Push children in reverse so first child is processed first
-            for c in reversed(n.children):
+            for c in reversed(getattr(n, "children", []) or []):
                 if id(c) not in visited:
                     stack.append(c)
         return result
 
     def mesh_nodes(self) -> List[ModelNode]:
-        return [n for n in self.all_nodes() if n.is_mesh]
+        """Return mesh nodes while ignoring renderer/editor helper records.
+
+        Lighting and camera workbenches may append lightweight runtime helper
+        objects to ``all_nodes()``.  Those records deliberately are not full
+        :class:`ModelNode` instances, so model inspection must treat a missing
+        mesh flag as ``False`` instead of aborting the whole model load.
+        """
+        return [n for n in self.all_nodes() if bool(getattr(n, "is_mesh", False))]
 
     def bone_nodes(self) -> List[ModelNode]:
         """Return all skeleton/joint nodes (non-mesh dummy nodes).
@@ -1466,7 +1507,7 @@ class KotorModel:
         Previously this only returned nodes where is_dummy=True (flags==HEADER),
         silently omitting all flags=0 bone nodes from the skeleton list.
         """
-        return [n for n in self.all_nodes() if n.type_label == 'dummy']
+        return [n for n in self.all_nodes() if getattr(n, "type_label", "") == 'dummy']
 
     def find_node(self, name: str) -> Optional[ModelNode]:
         nl = name.lower()

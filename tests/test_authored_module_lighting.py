@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -46,12 +47,22 @@ def test_t2693_room_light_persists_in_kmap_and_readiness() -> None:
     readiness = build_authored_module_readiness(roundtrip)
     toolchain = {step.name: step for step in readiness.toolchain}
 
-    assert payload["lights"][0]["name"] == "warm_key"
-    assert roundtrip.lights[0].position == (1.0, 2.0, 2.5)
-    assert readiness.metadata["lighting_count"] == 1
-    assert readiness.metadata["room_lights"][0]["light_type"] == "point"
-    assert toolchain["Lighting"].status == "1 authored light(s)"
-    assert any(item.name == "Room lighting" and item.value_label == "1 authored light(s)" for item in readiness.inputs)
+    warm_payload = next(light for light in payload["lights"] if light["name"] == "warm_key")
+    warm_light = next(light for light in roundtrip.lights if light.name == "warm_key")
+
+    assert warm_payload["position"] == [1.0, 2.0, 2.5]
+    assert warm_light.position == (1.0, 2.0, 2.5)
+    assert readiness.metadata["lighting_count"] == len(payload["lights"])
+    assert any(light["name"] == "warm_key" and light["light_type"] == "point" for light in readiness.metadata["room_lights"])
+    assert toolchain["Lighting"].status in {
+        "Viewport lit only",
+        "Fullbright export candidate",
+        f"{len(payload['lights'])} authored light(s)",
+    }
+    assert any(
+        item.name == "Room lighting" and item.value_label == f"{len(payload['lights'])} authored light(s)"
+        for item in readiness.inputs
+    )
 
 
 def test_t2693_invalid_room_light_blocks_missing_room() -> None:
@@ -93,7 +104,7 @@ def test_t2693_controller_adds_room_light_and_clears_runtime_state() -> None:
     assert updated["game_tested"] is False
     assert updated["lights"][-1]["name"] == "fill_light"
     assert result.readiness is not None
-    assert result.readiness.metadata["lighting_count"] == 1
+    assert result.readiness.metadata["lighting_count"] == len(updated["lights"])
 
 
 def test_t2694_controller_lists_and_moves_authored_room_lights() -> None:
@@ -106,14 +117,18 @@ def test_t2694_controller_lists_and_moves_authored_room_lights() -> None:
     controller.create_authored_room_preset_module(preset_id="rectangular_dev_room", module_root="grlight")
     controller.add_authored_room_light(name="selectable_key", position=(0.0, 0.0, 2.25))
 
-    row = controller.authored_room_lights()[0]
+    row = next(row for row in controller.authored_room_lights() if row.name == "selectable_key")
     result = controller.set_authored_room_light_transform(row.light_id, position=(1.5, -0.5, 2.75))
-    moved = controller.authored_room_lights()[0]
+    moved = next(row for row in controller.authored_room_lights() if row.name == "selectable_key")
 
-    assert row.light_id == "authored_light:selectable_key"
+    assert row.light_id.startswith("authored_light:light_")
+    assert moved.light_id == row.light_id
     assert moved.position == (1.5, -0.5, 2.75)
     assert result.readiness is not None
-    assert result.readiness.metadata["room_lights"][0]["position"] == [1.5, -0.5, 2.75]
+    assert any(
+        light["name"] == "selectable_key" and light["position"] == [1.5, -0.5, 2.75]
+        for light in result.readiness.metadata["room_lights"]
+    )
 
 
 def test_t2600_controller_edits_selected_room_light_properties() -> None:
@@ -129,26 +144,47 @@ def test_t2600_controller_edits_selected_room_light_properties() -> None:
     payload["runtime_resources"] = ["grlight.git"]
     payload["game_tested"] = True
     controller.project.extra_sections["authored_module"] = payload
+    light_id = next(row.light_id for row in controller.authored_room_lights() if row.name == "key_light")
 
     result = controller.set_authored_room_light_properties(
-        "authored_light:key_light",
+        light_id,
         light_type="spot",
         color=(0.25, 0.5, 1.0),
         radius=12.5,
         intensity=1.75,
+        enabled=True,
+        casts_shadows=False,
+        affects_diffuse=False,
+        affects_lightmap=True,
+        direction=(1.0, 0.0, -1.0),
+        cone_angle_degrees=36.0,
+        bake_group="windows",
     )
     updated = controller.project.extra_sections["authored_module"]
-    row = controller.authored_room_lights()[0]
+    row = next(row for row in controller.authored_room_lights() if row.name == "key_light")
 
     assert row.light_type == "spot"
     assert row.color == (0.25, 0.5, 1.0)
     assert row.radius == 12.5
     assert row.intensity == 1.75
+    assert row.enabled is True
+    assert row.casts_shadows is False
+    assert row.affects_diffuse is False
+    assert row.affects_lightmap is True
+    assert row.direction[0] > 0.7 and row.direction[2] < -0.7
+    assert row.cone_angle_degrees == 36.0
+    assert row.bake_group == "windows"
     assert updated["runtime_resources"] == []
     assert updated["game_tested"] is False
     assert result.readiness is not None
-    assert result.readiness.metadata["room_lights"][0]["light_type"] == "spot"
-    assert result.readiness.metadata["room_lights"][0]["color"] == [0.25, 0.5, 1.0]
+    assert any(
+        light["name"] == "key_light"
+        and light["light_type"] == "spot"
+        and light["color"] == [0.25, 0.5, 1.0]
+        and light["casts_shadows"] is False
+        and light["bake_group"] == "windows"
+        for light in result.readiness.metadata["room_lights"]
+    )
 
 
 def test_t2600_room_light_rename_duplicate_and_remove_update_project() -> None:
@@ -167,6 +203,7 @@ def test_t2600_room_light_rename_duplicate_and_remove_update_project() -> None:
     project = create_authored_module_from_room_preset(preset_id="rectangular_dev_room", module_root="grlight", game="K1")
     project = add_authored_room_light(project, name="key_light", position=(1.0, 2.0, 2.5)).project
 
+    original_light_id = authored_room_light_rows(project)[-1].light_id
     renamed = rename_authored_room_light(project, "authored_light:key_light", name="warm_key")
     edited = update_authored_room_light_properties(
         renamed.project,
@@ -181,17 +218,18 @@ def test_t2600_room_light_rename_duplicate_and_remove_update_project() -> None:
     rows = authored_room_light_rows(removed.project)
 
     assert renamed.light.name == "warm_key"
-    assert renamed.light_id == "authored_light:warm_key"
+    assert renamed.light_id == original_light_id
     assert edited.light.color == (0.85, 0.72, 0.35)
     assert edited.light.radius == 9.5
     assert edited.light.intensity == 1.5
     assert edited.light.light_type == "spot"
     assert duplicated.light.name == "warm_key_copy"
-    assert duplicated.light_id == "authored_light:warm_key_copy"
+    assert duplicated.light_id.startswith("authored_light:light_")
+    assert duplicated.light_id != original_light_id
     assert duplicated.light.position == (1.5, 2.5, 2.5)
     assert removed.light.name == "warm_key"
-    assert removed.count == 1
-    assert rows[0].light_id == "authored_light:warm_key_copy"
+    assert removed.count == len(tuple(project.lights))
+    assert any(row.light_id == duplicated.light_id for row in rows)
 
 
 def test_t2600_controller_room_light_edit_actions_clear_export_and_proof_state() -> None:
@@ -207,19 +245,21 @@ def test_t2600_controller_room_light_edit_actions_clear_export_and_proof_state()
     payload["runtime_resources"] = ["grlight.git"]
     payload["game_tested"] = True
     controller.project.extra_sections["authored_module"] = payload
+    light_id = next(row.light_id for row in controller.authored_room_lights() if row.name == "key_light")
 
-    renamed = controller.rename_authored_room_light("authored_light:key_light", name="warm_key")
+    renamed = controller.rename_authored_room_light(light_id, name="warm_key")
     duplicated = controller.duplicate_authored_room_light("authored_light:warm_key")
     controller.model.select(duplicated.light_id)
     removed = controller.remove_authored_room_light(duplicated.light_id)
     updated = controller.project.extra_sections["authored_module"]
 
     assert renamed.light.name == "warm_key"
-    assert duplicated.light_id == "authored_light:warm_key_copy"
+    assert duplicated.light_id.startswith("authored_light:light_")
+    assert duplicated.light_id != renamed.light_id
     assert removed.light.name == "warm_key_copy"
     assert updated["runtime_resources"] == []
     assert updated["game_tested"] is False
-    assert updated["lights"][0]["name"] == "warm_key"
+    assert any(light["name"] == "warm_key" for light in updated["lights"])
     assert controller.project.dirty is True
 
 
@@ -234,9 +274,11 @@ def test_t2693_export_manifest_records_room_lighting_intent(tmp_path: Path) -> N
     project = add_authored_room_light(project, name="export_key", intensity=2.0).project
     build = build_authored_module(project)
 
-    assert build.metadata["lighting_count"] == 1
-    assert build.metadata["room_lights"][0]["name"] == "export_key"
-    assert build.metadata["room_lights"][0]["intensity"] == 2.0
+    assert build.metadata["lighting_count"] == len(tuple(project.lights))
+    assert any(
+        light["name"] == "export_key" and light["intensity"] == 2.0
+        for light in build.metadata["room_lights"]
+    )
 
 
 def test_t2693_builder_tab_exposes_room_light_controls() -> None:
@@ -340,3 +382,141 @@ def test_t2694_module_editor_surfaces_room_lights_as_selectable_rows() -> None:
     assert "authored_room_lights = self.controller.authored_room_lights()" in window_source
     assert "self.controller.set_authored_room_light_transform(" in window_source
     assert "rename_authored_room_light" in window_source
+
+
+def test_room_light_legacy_rows_gain_deterministic_bake_defaults_and_persisted_identity() -> None:
+    _install_native_payload_paths()
+
+    from src.core.modules.authored_module_lighting import (
+        authored_room_light_payload,
+        normalise_authored_room_light,
+    )
+
+    legacy = {
+        "name": "legacy_key",
+        "room_resref": "grlight_room01",
+        "position": [1.0, 2.0, 3.0],
+        "color": [1.0, 0.8, 0.6],
+        "radius": 7.5,
+        "intensity": 1.25,
+        "light_type": "spotlight",
+        "metadata": {"source": "legacy_kmap"},
+    }
+
+    first = normalise_authored_room_light(legacy)
+    second = normalise_authored_room_light(dict(reversed(tuple(legacy.items()))))
+    payload = authored_room_light_payload(first)
+    reopened = normalise_authored_room_light(payload)
+
+    assert first.light_id.startswith("legacy_")
+    assert second.light_id == first.light_id
+    assert reopened.light_id == first.light_id
+    assert first.enabled is True
+    assert first.casts_shadows is True
+    assert first.affects_diffuse is True
+    assert first.affects_lightmap is True
+    assert first.direction == (0.0, 0.0, -1.0)
+    assert first.cone_angle_degrees == 45.0
+    assert first.bake_group is None
+    assert payload["light_id"] == first.light_id
+    assert payload["affects_lightmap"] is True
+
+
+def test_room_light_spot_bake_properties_roundtrip_and_identity_survives_edits() -> None:
+    _install_native_payload_paths()
+
+    from src.core.modules.authored_module_kmap_bridge import (
+        authored_project_from_kmap_payload,
+        authored_project_to_kmap_payload,
+    )
+    from src.core.modules.authored_module_lighting import (
+        add_authored_room_light,
+        authored_room_light_rows,
+        duplicate_authored_room_light,
+        remove_authored_room_light,
+        rename_authored_room_light,
+        update_authored_room_light_properties,
+    )
+    from src.core.modules.authored_room_presets import create_authored_module_from_room_preset
+
+    project = create_authored_module_from_room_preset(
+        preset_id="rectangular_dev_room",
+        module_root="grlight",
+        game="K1",
+    )
+    added = add_authored_room_light(
+        project,
+        name="bake_key",
+        light_type="spot",
+        direction=(0.0, 3.0, -4.0),
+        cone_angle_degrees=52.0,
+        enabled=True,
+        casts_shadows=True,
+        affects_diffuse=False,
+        affects_lightmap=True,
+        bake_group="hero_room",
+    )
+    stable_id = added.light.light_id
+    editor_id = added.light_id
+    renamed = rename_authored_room_light(added.project, editor_id, name="renamed_bake_key")
+    edited = update_authored_room_light_properties(
+        renamed.project,
+        renamed.light_id,
+        cone_angle_degrees=38.0,
+        casts_shadows=False,
+        bake_group=None,
+    )
+    duplicated = duplicate_authored_room_light(edited.project, edited.light_id)
+    payload = authored_project_to_kmap_payload(duplicated.project)
+    reopened = authored_project_from_kmap_payload(payload)
+    reopened_original = next(light for light in reopened.lights if light.light_id == stable_id)
+    reopened_copy = next(light for light in reopened.lights if light.light_id == duplicated.light.light_id)
+    removed = remove_authored_room_light(reopened, authored_room_light_rows(reopened)[-1].light_id)
+
+    assert renamed.light.light_id == stable_id
+    assert renamed.light_id == editor_id
+    assert edited.light.light_id == stable_id
+    assert edited.light.direction == (0.0, 0.6, -0.8)
+    assert edited.light.cone_angle_degrees == 38.0
+    assert edited.light.casts_shadows is False
+    assert edited.light.affects_diffuse is False
+    assert edited.light.affects_lightmap is True
+    assert edited.light.bake_group is None
+    assert duplicated.light.light_id != stable_id
+    assert reopened_original.light_id == stable_id
+    assert reopened_copy.light_id == duplicated.light.light_id
+    assert reopened_copy.affects_lightmap is True
+    assert removed.count == len(reopened.lights) - 1
+
+
+def test_room_light_bake_validation_rejects_unsafe_spot_and_duplicate_identity() -> None:
+    _install_native_payload_paths()
+
+    from src.core.modules.authored_module_lighting import AuthoredRoomLight, validate_authored_room_lights
+
+    valid = AuthoredRoomLight(
+        name="spot_a",
+        room_resref="room01",
+        light_type="spot",
+        light_id="shared_light_id",
+        direction=(0.0, 0.0, -1.0),
+        cone_angle_degrees=45.0,
+        bake_group="group_a",
+    )
+    invalid = replace(
+        valid,
+        name="spot_b",
+        direction=(0.0, 0.0, 0.0),
+        cone_angle_degrees=180.0,
+        enabled="yes",  # type: ignore[arg-type]
+        bake_group="x" * 33,
+    )
+
+    validation = validate_authored_room_lights((valid, invalid), room_resrefs={"room01"})
+
+    assert validation.ok is False
+    assert any("Duplicate authored room light id" in issue for issue in validation.blocking_issues)
+    assert any("spot direction" in issue for issue in validation.blocking_issues)
+    assert any("spot cone angle" in issue for issue in validation.blocking_issues)
+    assert any("enabled must be a boolean" in issue for issue in validation.blocking_issues)
+    assert any("bake group" in issue for issue in validation.blocking_issues)

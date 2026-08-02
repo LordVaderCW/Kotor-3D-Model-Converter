@@ -4,12 +4,48 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .dependencies import Image, _NUMPY, _PIL, log, np
 from src.math.frame_math import _clean_tex_name, _clamp, _lerp
 from src.core.graphics.tpc import _extract_txi_from_tpc, _is_tpc_data, _is_tpc_file, _load_tpc_bytes
 from src.core.graphics.txi import _apply_txi_to_node, _extract_alpha_test_from_tpc, _parse_txi_string
+
+
+def _uses_bottom_left_uv_tga_profile(raw: bytes) -> bool:
+    """Identify the narrow loose-TGA profile emitted by this DCC workflow.
+
+    Stock KotOR binary meshes use the renderer's Direct3D-style V conversion.
+    KotorBlender-authored geometry can instead retain Blender's bottom-left UVs.
+    The binary MDL format does not record which convention its author used, so
+    loose textures need a conservative provenance hint. Paint.NET's TGA 2.0
+    writer supplies one: the affected workflow writes bottom-origin, RLE
+    true-colour images and records ``Paint.NET`` in the extension area.
+
+    Requiring all three properties keeps ordinary uncompressed override TGAs
+    (including Ghost Studio's PFBC09 output), stock TPC data, and generic RLE
+    textures on the established KotOR path.
+    """
+    try:
+        if len(raw) < 26 or raw[2] != 10 or (raw[17] & 0x20):
+            return False
+        if raw[-18:] != b"TRUEVISION-XFILE.\x00":
+            return False
+        extension_offset = int.from_bytes(raw[-26:-22], "little")
+        if extension_offset <= 0 or extension_offset + 468 > len(raw) - 26:
+            return False
+        extension = raw[extension_offset:extension_offset + 495]
+        if len(extension) < 468 or int.from_bytes(extension[:2], "little") < 468:
+            return False
+        software_id = extension[426:467].split(b"\x00", 1)[0]
+        return software_id.strip().lower().startswith(b"paint.net")
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def _gpu_uv_v_flip_for_loose_texture(raw: bytes) -> bool:
+    """Return the renderer V-conversion policy for a non-TPC loose texture."""
+    return not _uses_bottom_left_uv_tga_profile(raw)
 
 # ─────────────────────────────────────────────────────────────────────
 #  Texture loader
@@ -22,7 +58,9 @@ class TextureCache:
     - Supports DXT1 (enc=2), DXT5 (enc=4), uncompressed Grey/RGB/RGBA
     - Supports plain TGA, PNG via Pillow
     - Loads and caches TXI metadata (from embedded TPC TXI or standalone .txi files)
-    Returns PIL.Image in RGBA mode at full resolution (capped at MAX_SIZE).
+    Returns PIL.Image in RGBA mode at viewport resolution. TPC sources select
+    the first authored mip within MAX_SIZE before decompression; ordinary image
+    sources retain the resize fallback.
     """
 
     MAX_SIZE = 512   # max viewport texture resolution per axis
@@ -33,12 +71,19 @@ class TextureCache:
 
     def __init__(self):
         self._cache: Dict[str, Optional['Image.Image']] = {}
+        # Explicit authored previews (for example a Head Builder PNG published
+        # under its final KOTOR ResRef) are not archive-cache entries.  Keep
+        # them in a separate residency layer so a ResourceManager revision or
+        # search-path refresh cannot silently replace them with the white
+        # missing-texture fallback while the same preview model is still live.
+        self._published_images: Dict[str, 'Image.Image'] = {}
         self._txi_cache: Dict[str, str] = {}   # name → TXI string ('' if absent)
         self._search_dirs: List[str] = []
         self._game_library = None   # Optional GameLibrary for BIF-backed loading
         self._game_tag: str = "K1"
         self._installation = None  # Optional KotorInstallation (fast path, legacy)
         self._resource_manager = None  # Optional ResourceManager (new unified path)
+        self._resource_manager_revision = -1
         self._lock = threading.Lock()  # thread-safe access (render + prewarm threads)
         # Per-name load lock dict: prevents two threads loading the SAME texture simultaneously
         # while not blocking threads loading DIFFERENT textures (vs. a single global lock).
@@ -55,6 +100,7 @@ class TextureCache:
             if new_dirs != self._search_dirs:
                 self._search_dirs = new_dirs
                 self._cache.clear()
+                self._cache.update(self._published_images)
                 self._txi_cache.clear()
                 # Clear per-key load locks too (keys may no longer be relevant)
                 with self._load_locks_lock:
@@ -72,6 +118,7 @@ class TextureCache:
                 self._game_library = library
                 self._game_tag = game_tag
                 self._cache.clear()
+                self._cache.update(self._published_images)
                 self._txi_cache.clear()
                 with self._load_locks_lock:
                     self._load_locks.clear()
@@ -82,6 +129,7 @@ class TextureCache:
                 # from the correct game's archives.
                 self._game_tag = game_tag
                 self._cache.clear()
+                self._cache.update(self._published_images)
                 self._txi_cache.clear()
                 with self._load_locks_lock:
                     self._load_locks.clear()
@@ -98,6 +146,7 @@ class TextureCache:
                 self._installation = installation
                 self._game_tag = game_tag
                 self._cache.clear()
+                self._cache.update(self._published_images)
                 self._txi_cache.clear()
                 with self._load_locks_lock:
                     self._load_locks.clear()
@@ -115,10 +164,13 @@ class TextureCache:
         Clears all caches when the manager reference or game tag changes.
         """
         with self._lock:
+            revision = int(getattr(manager, "revision", 0) or 0) if manager is not None else -1
             changed = (manager is not self._resource_manager or
-                       game_tag != self._game_tag)
+                       game_tag != self._game_tag or
+                       revision != self._resource_manager_revision)
             if changed:
                 self._resource_manager = manager
+                self._resource_manager_revision = revision
                 self._game_tag = game_tag
                 # Also keep _installation in sync for legacy code paths
                 if manager is not None:
@@ -127,6 +179,7 @@ class TextureCache:
                     # We don't set it here to avoid the old path running — the new
                     # _resource_manager path takes priority in _load().
                 self._cache.clear()
+                self._cache.update(self._published_images)
                 self._txi_cache.clear()
                 with self._load_locks_lock:
                     self._load_locks.clear()
@@ -159,6 +212,7 @@ class TextureCache:
             with self._lock:
                 search_dirs = list(self._search_dirs)
                 game_library = self._game_library
+                resource_manager = self._resource_manager
                 game_tag = self._game_tag
 
             # 1. Look for standalone .txi file on disk
@@ -193,6 +247,26 @@ class TextureCache:
                             log.debug(f"TXI TPC extract error {tex_path}: {e}")
                     if txi_str:
                         break
+
+            # 2.5 Unified ResourceManager (standalone TXI resource, then the
+            # TXI embedded in the TPC).  The main window attaches textures via
+            # set_resource_manager(); without this step, texture-pack TPCs
+            # (e.g. plc_starmap_06 with 'blending 1') never delivered their TXI
+            # and additive surfaces rendered opaque.
+            if not txi_str and resource_manager is not None:
+                try:
+                    txi_str = str(resource_manager.get_txi(clean, game_tag) or '').strip()
+                except Exception as e:
+                    log.debug(f"TXI resource-manager lookup error '{clean}': {e}")
+                if not txi_str:
+                    try:
+                        raw = resource_manager.get_texture(clean, game_tag)
+                        if raw and _is_tpc_data(raw):
+                            txi_str = _extract_txi_from_tpc(raw)
+                            if txi_str:
+                                log.debug(f"TXI '{clean}' extracted from ResourceManager TPC")
+                    except Exception as e:
+                        log.debug(f"TXI resource-manager TPC extract error '{clean}': {e}")
 
             # 3. Load from BIF/ERF archive via GameLibrary
             if not txi_str and game_library is not None:
@@ -244,6 +318,7 @@ class TextureCache:
             with self._lock:
                 search_dirs = list(self._search_dirs)
                 game_library = self._game_library
+                resource_manager = self._resource_manager
                 game_tag = self._game_tag
             # 1. Search on-disk directories
             for search_dir in search_dirs:
@@ -258,6 +333,14 @@ class TextureCache:
                             return header
                     except Exception:
                         pass
+            # 1.5 Unified ResourceManager (KEY/BIF, texture packs, Override)
+            if resource_manager is not None:
+                try:
+                    raw = resource_manager.get_texture(clean, game_tag)
+                    if raw and len(raw) >= 128 and _is_tpc_data(raw[:128]):
+                        return raw[:128]
+                except Exception:
+                    pass
             # 2. BIF/ERF archive
             if game_library is not None:
                 try:
@@ -309,6 +392,174 @@ class TextureCache:
             with self._lock:
                 self._cache[key] = img
         return img
+
+    @staticmethod
+    def normalize_dirty_regions(
+        image_size: tuple[int, int],
+        regions: Optional[Iterable[object]],
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Clip dirty rectangles to an image without changing row orientation.
+
+        Rectangles use ``(x, y, width, height)`` in the cached PIL image's
+        pixel coordinate system.  GhostRigger's decoded KOTOR images are stored
+        bottom-up, so PIL row zero is also the row uploaded to GPU texture row
+        zero.  This helper deliberately performs no vertical flip.
+
+        A region may also be a mapping/object exposing ``x``, ``y``,
+        ``width`` and ``height``.  ``None`` means the whole image; malformed or
+        empty rectangles are ignored.
+        """
+        width, height = (max(0, int(v)) for v in image_size[:2])
+        if width <= 0 or height <= 0:
+            return ()
+        if regions is None:
+            return ((0, 0, width, height),)
+
+        normalized: list[tuple[int, int, int, int]] = []
+        for region in regions:
+            try:
+                if isinstance(region, dict):
+                    x = int(region.get("x", region.get("left", 0)))
+                    y = int(region.get("y", region.get("top", 0)))
+                    w = int(region.get("width", region.get("w", 0)))
+                    h = int(region.get("height", region.get("h", 0)))
+                elif all(hasattr(region, attr) for attr in ("x", "y", "width", "height")):
+                    x = int(getattr(region, "x"))
+                    y = int(getattr(region, "y"))
+                    w = int(getattr(region, "width"))
+                    h = int(getattr(region, "height"))
+                else:
+                    x, y, w, h = (int(value) for value in region)  # type: ignore[misc]
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            x0 = max(0, x)
+            y0 = max(0, y)
+            x1 = min(width, x + w)
+            y1 = min(height, y + h)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            rect = (x0, y0, x1 - x0, y1 - y0)
+            if rect not in normalized:
+                normalized.append(rect)
+        return tuple(normalized)
+
+    def update_image_regions(
+        self,
+        name: str,
+        image: 'Image.Image',
+        regions: Optional[Iterable[object]] = None,
+    ) -> tuple['Image.Image', tuple[tuple[int, int, int, int], ...]]:
+        """Publish authored RGBA pixels while preserving cached image identity.
+
+        When a texture with the same dimensions is already cached, dirty pixels
+        are pasted into that object instead of replacing it.  Software and GPU
+        caches key on image identity, so preserving the object lets the renderer
+        update only the dirty regions.  A size change necessarily installs a new
+        image and reports the whole image dirty.
+
+        The returned image is the authoritative cache object and should be sent
+        to the active GPU renderer together with the returned clipped regions.
+        No model, scene, framebuffer or unrelated texture cache is invalidated.
+        """
+        if not _PIL:
+            raise RuntimeError("Pillow is required for live texture updates")
+        clean = _clean_tex_name(name or "")
+        if not clean:
+            raise ValueError("texture name is required")
+        stem, extension = os.path.splitext(clean)
+        if extension.lower() in {
+            ".tga", ".tpc", ".png", ".dds", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff",
+        }:
+            clean = stem
+        if image is None or not hasattr(image, "size"):
+            raise TypeError("image must be a PIL image")
+
+        incoming = image if getattr(image, "mode", "") == "RGBA" else image.convert("RGBA")
+        incoming_size = tuple(int(v) for v in incoming.size)
+        if incoming_size[0] <= 0 or incoming_size[1] <= 0:
+            raise ValueError("texture image dimensions must be positive")
+        requested = self.normalize_dirty_regions(incoming_size, regions)
+        key = clean.lower()
+
+        with self._lock:
+            previous = self._cache.get(key)
+            same_shape = (
+                previous is not None
+                and getattr(previous, "mode", "") == "RGBA"
+                and tuple(getattr(previous, "size", ())) == incoming_size
+            )
+            if same_shape:
+                target = previous
+                if target is not incoming:
+                    for x, y, width, height in requested:
+                        box = (x, y, x + width, y + height)
+                        target.paste(incoming.crop(box), (x, y))
+                    self._copy_texture_attrs(incoming, target)
+            else:
+                target = incoming
+                # A new allocation has no resident pixels yet.  Report a full
+                # update even when the caller supplied a narrower dirty set.
+                requested = ((0, 0, incoming_size[0], incoming_size[1]),)
+                self._cache[key] = target
+
+            # Same-object edits still need derived mip data to be regenerated.
+            self._mip_bias_cache.pop(id(target), None)
+            if previous is not None and previous is not target:
+                self._mip_bias_cache.pop(id(previous), None)
+
+        return target, requested
+
+    def publish_bytes(
+        self,
+        name: str,
+        raw: bytes,
+    ) -> Optional['Image.Image']:
+        """Publish authored bytes under an explicit preview texture ResRef.
+
+        A Head Builder source PNG can keep its descriptive filename while the
+        candidate model references its final KOTOR ResRef. Decode through the
+        normal loose-texture orientation path and cache it under that ResRef;
+        no source rename or copy is required.
+        """
+
+        clean = _clean_tex_name(name or "")
+        if not clean or not isinstance(raw, (bytes, bytearray)) or not raw:
+            return None
+        payload = bytes(raw)
+        image = self._load_bytes(payload)
+        if image is None:
+            return None
+        image = self._resize_if_needed(image, clean)
+        try:
+            image = self._apply_kotor_alpha(
+                payload,
+                image,
+                _parse_txi_string(""),
+            )
+        except Exception:
+            pass
+        published, _regions = self.update_image_regions(clean, image, None)
+        with self._lock:
+            self._published_images[clean.lower()] = published
+        return published
+
+    def clear_published_images(self) -> None:
+        """Release model-scoped authored preview aliases.
+
+        Viewports call this before loading a different model, then republish
+        that model's explicit texture map.  Archive/resource invalidation keeps
+        the active aliases resident, but changing the preview model does not
+        leak them into unrelated work.
+        """
+
+        with self._lock:
+            for key, published in tuple(self._published_images.items()):
+                if self._cache.get(key) is published:
+                    self._cache.pop(key, None)
+                self._mip_bias_cache.pop(id(published), None)
+            self._published_images.clear()
 
     def _load(self, name: str) -> Optional['Image.Image']:
         """Load texture by name: disk search dirs first, then BIF archives.
@@ -375,6 +626,59 @@ class TextureCache:
                     return None
                 except Exception as e:
                     log.debug(f"Texture load error {path}: {e}")
+            # Case-insensitive stem/prefix match for DCC sidecars (FBX .fbm folders).
+            # Some FBX import paths inherit KOTOR's 32-byte texture field cap before
+            # the renderer sees the source texture name.  The sidecar image keeps its
+            # full DCC stem, so accept a unique longer on-disk stem that starts with
+            # the requested name.
+            try:
+                prefix_matches = []
+                for child in os.scandir(search_dir):
+                    if not child.is_file():
+                        continue
+                    stem, ext = os.path.splitext(child.name)
+                    stem_key = stem.lower()
+                    if ext.lower() not in (
+                        '.tga', '.tpc', '.png', '.dds', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff',
+                    ):
+                        continue
+                    if stem_key == name:
+                        prefix_matches = [child]
+                        break
+                    if stem_key.startswith(name) or name.startswith(stem_key):
+                        prefix_matches.append(child)
+                if len(prefix_matches) != 1:
+                    continue
+                child = prefix_matches[0]
+                stem, ext = os.path.splitext(child.name)
+                if ext.lower() not in (
+                    '.tga', '.tpc', '.png', '.dds', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff',
+                ):
+                    continue
+                path = child.path
+                try:
+                    img = self._load_file(path)
+                    if img is not None:
+                        img = self._resize_if_needed(img, name)
+                        try:
+                            with open(path, 'rb') as fraw:
+                                raw_bytes = fraw.read(512)
+                            txi_s = getattr(img, '_txi_str', None)
+                            if txi_s is None:
+                                txi_s = self.get_txi(name)
+                            txi_m = _parse_txi_string(txi_s) if txi_s else _parse_txi_string('')
+                            img = self._apply_kotor_alpha(raw_bytes, img, txi_m)
+                        except Exception:
+                            pass
+                        log.debug(f"Texture '{name}' loaded from {os.path.basename(path)}")
+                        return img
+                except MemoryError:
+                    log.warning(f"Texture '{name}': out of memory — skipping")
+                    return None
+                except Exception as e:
+                    log.debug(f"Texture load error {path}: {e}")
+            except OSError:
+                pass
         # ── 2. ResourceManager (unified BIF/ERF/Override, <2ms) ─────────────
         # New primary archive backend — replaces the split installation/game_library path.
         # Checks: Override > module ERFs > TexturePacks ERFs > BIF in correct priority.
@@ -457,7 +761,11 @@ class TextureCache:
 
     @staticmethod
     def _copy_texture_attrs(src: 'Image.Image', dst: 'Image.Image') -> 'Image.Image':
-        for attr in ('_gr_gpu_uv_v_flip', '_txi_str', '_tpc_raw', '_txi_alpha_test'):
+        for attr in (
+            '_gr_gpu_uv_v_flip', '_txi_str', '_tpc_raw', '_txi_alpha_test',
+            '_tpc_mip_level', '_tpc_mip_size', '_tpc_source_size',
+            '_tpc_viewport_max_size',
+        ):
             if hasattr(src, attr):
                 try:
                     setattr(dst, attr, getattr(src, attr))
@@ -570,14 +878,15 @@ class TextureCache:
         V-flip formula (tv = (1-v)*h) produces correct UV mapping.
         KotOR MDL UV V=0 means TOP of texture (Direct3D/top-down convention).
         The render-time flip converts from KotOR UV-space to PIL row-space.
-        - TPC files: _load_tpc_bytes() returns bottom-up (flips DXT and uncompressed).
+        - TPC files: _load_tpc_bytes(max_size=MAX_SIZE) selects an authored mip
+          before conversion and returns it bottom-up.
         - Standard TGA files (bottom-up origin): PIL loads bottom-up correctly.
         - PNG/other: PIL loads top-down, must flip to bottom-up.
         """
         if not _PIL:
             return None
         if _is_tpc_data(raw):
-            img = _load_tpc_bytes(raw)
+            img = _load_tpc_bytes(raw, max_size=self.MAX_SIZE)
             if img is not None:
                 img._gr_gpu_uv_v_flip = True  # type: ignore[attr-defined]
             return img
@@ -597,7 +906,13 @@ class TextureCache:
             # preserved the bottom-up layout), causing them to remain top-down
             # and render upside-down.
             img = img.transpose(Image.FLIP_TOP_BOTTOM)
-            img._gr_gpu_uv_v_flip = False  # type: ignore[attr-defined]
+            # The uploaded rows now follow OpenGL's bottom-up convention, so
+            # KOTOR/D3D UVs (V=0 at the top) still require the shader's V
+            # conversion.  Imported DCC nodes opt out with uv_v_flip=False.
+            # Marking normalized TGA/PNG images False here inverted custom
+            # character atlases such as PFBC09 after otherwise-correct UV and
+            # anatomy splitting.
+            img._gr_gpu_uv_v_flip = _gpu_uv_v_flip_for_loose_texture(raw)  # type: ignore[attr-defined]
             return img
         except Exception:
             return None
@@ -611,7 +926,7 @@ class TextureCache:
         All returned images are in bottom-up orientation so that the render-time
         V-flip (tv = (1-v)*h) produces correct UV mapping.
         KotOR MDL UV V=0 = top of texture (Direct3D convention).
-        - TPC files: bottom-up from _load_tpc_bytes() (flips DXT and uncompressed).
+        - TPC files: bottom-up from the authored-mip viewport fast path.
         - All PIL-opened images (TGA, PNG, DDS): PIL always returns top-down
           → flip to bottom-up for consistency.
         """
@@ -623,7 +938,7 @@ class TextureCache:
             return None
 
         if _is_tpc_data(raw):
-            img = _load_tpc_bytes(raw)
+            img = _load_tpc_bytes(raw, max_size=self.MAX_SIZE)
             if img is not None:
                 img._gr_gpu_uv_v_flip = True  # type: ignore[attr-defined]
             return img
@@ -638,7 +953,9 @@ class TextureCache:
                 # TGA variants to top-down during Image.open().  Flip ALL images
                 # to bottom-up so the renderer's V-flip formula works correctly.
                 img = img.transpose(Image.FLIP_TOP_BOTTOM)
-                img._gr_gpu_uv_v_flip = False  # type: ignore[attr-defined]
+                # Bottom-up GPU rows need the per-node KOTOR/D3D V conversion;
+                # DCC/OpenGL UV nodes explicitly disable it with uv_v_flip=False.
+                img._gr_gpu_uv_v_flip = _gpu_uv_v_flip_for_loose_texture(raw)  # type: ignore[attr-defined]
                 return img
             except Exception:
                 pass

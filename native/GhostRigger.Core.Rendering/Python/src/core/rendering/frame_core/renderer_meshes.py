@@ -32,6 +32,7 @@ from .mixin_imports import (
     np,
 )
 from src.core.rendering.mesh_render_data import _pose_node_for_transform
+from src.core.rendering.gpu_diagnostics_records import _node_uses_single_tile_atlas
 
 
 class RendererMeshMixin:
@@ -286,7 +287,11 @@ class RendererMeshMixin:
                 # face/head mesh.  This exposes them through the eye-socket and
                 # mouth-gap openings in the face geometry.
                 _is_trans_flat = (_th_flat > 0 or node_alpha < 0.999 or _is_inner_geo_flat)
-                _tier_flat = 1 if _is_trans_flat else 0
+                # Background geometry must be a distinct first pass.  A tiny
+                # centroid-depth bias is not sufficient for giant sky panels:
+                # their centroid can sort in front of ordinary room triangles
+                # and paint an opaque sky over the map in this CPU painter.
+                _tier_flat = -1 if bool(getattr(node, 'background_geometry', False)) else (1 if _is_trans_flat else 0)
                 tris.append((sort_key, ((p0[0],p0[1]), (p1[0],p1[1]), (p2[0],p2[1])), fill, is_sel, fi, node_alpha, _tier_flat))
                 if len(tris) >= tri_cap:
                     break
@@ -480,7 +485,6 @@ class RendererMeshMixin:
                 _pn_si = _pose_node_for_transform(node, self._anim_pose)
                 if _pn_si is not None and _pn_si.selfillum is not None:
                     selfillum = _pn_si.selfillum
-            si_boost = max(selfillum)
 
             # Get single-tex image + array once per node
             if not flat_only and not _node_is_multitex and has_uvs:
@@ -511,21 +515,14 @@ class RendererMeshMixin:
             # use normal 0..1 character atlases without TXI clamp flags; wrapping
             # those UVs makes armor panels sample the opposite edge of the atlas.
             # Nodes with true tiled UVs or animated/procedural TXI still use repeat.
-            if not _accel_clamp_s or not _accel_clamp_t:
-                _has_no_repeat_features = bool(
-                    getattr(node, 'txi_blending', 0) == 0
-                    and getattr(node, 'txi_proceduretype', '') == ''
-                    and not getattr(node, 'animate_uv', False)
-                )
-                if _has_no_repeat_features and node.uvs:
-                    _sample = node.uvs[:min(30, len(node.uvs))]
-                    _uv_in_range = all(
-                        0.0 <= u <= 1.0 and 0.0 <= v <= 1.0
-                        for u, v in _sample
-                    )
-                    if _uv_in_range:
-                        _accel_clamp_s = True
-                        _accel_clamp_t = True
+            # Shared single-tile-atlas test (see gpu_diagnostics_records):
+            # clamps character/item atlases whose UV island stays within one
+            # tile even if a few verts overshoot [0,1], instead of the old
+            # first-30-vertex sample that both missed later overshoots and
+            # depended on vertex ordering.
+            if (not _accel_clamp_s or not _accel_clamp_t) and _node_uses_single_tile_atlas(node):
+                _accel_clamp_s = True
+                _accel_clamp_t = True
             # UV animation (animate_uv): add time-based scroll offset.
             _accel_animate_uv = bool(getattr(node, 'animate_uv', False))
             _accel_uv_scroll_u = 0.0
@@ -642,6 +639,28 @@ class RendererMeshMixin:
                         v1r += _accel_uv_scroll_v
                         v2r += _accel_uv_scroll_v
 
+                    # Resolve the face image before the V-orientation step. A
+                    # loose DCC-authored TGA can opt out of the renderer's
+                    # KotOR/D3D V conversion while stock textures retain it.
+                    if _node_is_multitex:
+                        _raw_ft = self._get_tex_for_face(node, _fi)
+                        _pil_ft = self.tex_cache.get_mip1(_raw_ft) if (_use_lq and _raw_ft) else _raw_ft
+                        _face_pil_tex = _pil_ft
+                        _ta = self._tex_arr_cache.get(_pil_ft) if _pil_ft else None
+                    else:
+                        _face_pil_tex = _pil_tex
+                        _ta = _tex_arr
+                    _effective_v_flip = (
+                        bool(getattr(node, "uv_v_flip", True))
+                        and bool(getattr(_face_pil_tex, "_gr_gpu_uv_v_flip", True))
+                    )
+                    if not _effective_v_flip:
+                        # The accelerated rasterizer applies 1-v internally;
+                        # pre-flip to cancel it for bottom-left DCC UVs.
+                        v0r = 1.0 - v0r
+                        v1r = 1.0 - v1r
+                        v2r = 1.0 - v2r
+
                     # Seam fix (reuse existing helpers)
                     # Only apply when span < 1.0 — multi-tile faces (span >= 1.0)
                     # are handled by the accel rasterizer's frac() UV wrapping and
@@ -665,13 +684,6 @@ class RendererMeshMixin:
                             v2r = _uwrap_global(v0r, v2r)
                     uv0 = (u0r, v0r); uv1 = (u1r, v1r); uv2 = (u2r, v2r)
 
-                    # Multi-tex face texture
-                    if _node_is_multitex:
-                        _raw_ft = self._get_tex_for_face(node, _fi)
-                        _pil_ft = self.tex_cache.get_mip1(_raw_ft) if (_use_lq and _raw_ft) else _raw_ft
-                        _ta = self._tex_arr_cache.get(_pil_ft) if _pil_ft else None
-                    else:
-                        _ta = _tex_arr
                     face_tex_arr.append(_ta)
                 else:
                     uv0 = uv1 = uv2 = (0.5, 0.5)
@@ -693,12 +705,12 @@ class RendererMeshMixin:
                 ndotl = nx*light_dir[0] + ny*light_dir[1] + nz*light_dir[2]
                 ndotl_f = max(0.0, ndotl) + max(0.0, -ndotl) * (0.55 if is_two_sided else 0.35)
                 shade = ambient + (1.0 - ambient) * ndotl_f
-                shade = max(shade, si_boost)
 
                 dr, dg, db = diff
-                shade_r = int(_clamp(shade * (0.5 + dr*0.5) * 255, 0, 255))
-                shade_g = int(_clamp(shade * (0.5 + dg*0.5) * 255, 0, 255))
-                shade_b = int(_clamp(shade * (0.5 + db*0.5) * 255, 0, 255))
+                si_r, si_g, si_b = selfillum
+                shade_r = int(_clamp((shade + si_r) * (0.5 + dr*0.5) * 255, 0, 255))
+                shade_g = int(_clamp((shade + si_g) * (0.5 + dg*0.5) * 255, 0, 255))
+                shade_b = int(_clamp((shade + si_b) * (0.5 + db*0.5) * 255, 0, 255))
 
                 face_x0.append(int(p0[0])); face_y0.append(int(p0[1]))
                 face_x1.append(int(p1[0])); face_y1.append(int(p1[1]))
@@ -1089,17 +1101,12 @@ class RendererMeshMixin:
             # axes.  This prevents bright corner pixels (e.g. yellow at V≈1.0 of the
             # bantha texture) from bleeding into near-boundary UVs through bilinear
             # interpolation.  Tiling nodes (UVs outside [0,1]) keep GL_REPEAT.
-            if not _node_txi_clamp_s or not _node_txi_clamp_t:
-                _has_explicit_repeat = bool(getattr(node, 'txi_blending', 0) == 0 and
-                                            getattr(node, 'txi_proceduretype', '') == '' and
-                                            not getattr(node, 'animate_uv', False))
-                if _has_explicit_repeat and node.uvs:
-                    _sample = node.uvs[:min(30, len(node.uvs))]
-                    _uv_in_range = all(0.0 <= u <= 1.0 and 0.0 <= v <= 1.0
-                                       for u, v in _sample)
-                    if _uv_in_range:
-                        _node_txi_clamp_s = True
-                        _node_txi_clamp_t = True
+            # Shared single-tile-atlas test (see gpu_diagnostics_records) — keeps
+            # this PIL path in lockstep with the accel/GPU paths and fixes the
+            # same overshoot-wraps-to-opposite-edge bug.
+            if (not _node_txi_clamp_s or not _node_txi_clamp_t) and _node_uses_single_tile_atlas(node):
+                _node_txi_clamp_s = True
+                _node_txi_clamp_t = True
             # Beaming nodes use additive blending (glow/lightshaft effect).
             # background_geometry nodes (skybox/floor tiles) need no special depth bias —
             # they are sorted naturally by depth, just like opaque geometry.
@@ -1354,10 +1361,14 @@ class RendererMeshMixin:
                         uv0 = (uv0[0], _clamp(uv0[1], 0.0, 1.0))
                         uv1 = (uv1[0], _clamp(uv1[1], 0.0, 1.0))
                         uv2 = (uv2[0], _clamp(uv2[1], 0.0, 1.0))
-                    if not bool(getattr(node, "uv_v_flip", True)):
+                    if not (
+                        bool(getattr(node, "uv_v_flip", True))
+                        and bool(getattr(face_tex, "_gr_gpu_uv_v_flip", True))
+                    ):
                         # _paste_textured_triangle always applies the KotOR
-                        # V flip. Imported DCC meshes keep bottom-left UVs,
-                        # so pre-flip here to cancel that renderer-level flip.
+                        # V flip. Imported DCC meshes and provenance-marked
+                        # loose atlases keep bottom-left UVs, so pre-flip here
+                        # to cancel that renderer-level flip.
                         uv0 = (uv0[0], 1.0 - uv0[1])
                         uv1 = (uv1[0], 1.0 - uv1[1])
                         uv2 = (uv2[0], 1.0 - uv2[1])
@@ -1401,10 +1412,7 @@ class RendererMeshMixin:
                 # Two-sided materials get stronger back-face lighting (cloth/glass)
                 ndotl_f = max(0.0, ndotl) + max(0.0, -ndotl) * (0.55 if is_two_sided else 0.35)
                 si_r, si_g, si_b = selfillum
-                # Self-illumination raises the minimum shade (emissive surfaces stay bright)
-                si_boost = max(si_r, si_g, si_b)
                 shade = ambient + (1.0 - ambient) * ndotl_f
-                shade = max(shade, si_boost)
 
                 # Flat fill color for untextured or fallback
                 # face_tex = per-face correct texture (multi-tex) or node tex (single)
@@ -1421,16 +1429,17 @@ class RendererMeshMixin:
                     tr, tg, tb = self.tex_cache.sample(sample_tex, uc, vc,
                                                         clamp_s=_node_txi_clamp_s,
                                                         clamp_t=_node_txi_clamp_t)
-                    # Per-channel: texture * lighting * diffuse tint + SI
+                    # Per-channel Odyssey contract:
+                    # texture * (lighting + selfillum) * diffuse tint.
                     dr, dg, db = diff
-                    r = int(_clamp(tr * shade * (0.5 + dr*0.5) + si_r * 255, 0, 255))
-                    g = int(_clamp(tg * shade * (0.5 + dg*0.5) + si_g * 255, 0, 255))
-                    b = int(_clamp(tb * shade * (0.5 + db*0.5) + si_b * 255, 0, 255))
+                    r = int(_clamp(tr * (shade + si_r) * (0.5 + dr*0.5), 0, 255))
+                    g = int(_clamp(tg * (shade + si_g) * (0.5 + dg*0.5), 0, 255))
+                    b = int(_clamp(tb * (shade + si_b) * (0.5 + db*0.5), 0, 255))
                     fill = (r, g, b)
                 else:
-                    r = int(_clamp(diff[0] * shade * 255 + si_r * 255, 0, 255))
-                    g = int(_clamp(diff[1] * shade * 255 + si_g * 255, 0, 255))
-                    b = int(_clamp(diff[2] * shade * 255 + si_b * 255, 0, 255))
+                    r = int(_clamp(diff[0] * (shade + si_r) * 255, 0, 255))
+                    g = int(_clamp(diff[1] * (shade + si_g) * 255, 0, 255))
+                    b = int(_clamp(diff[2] * (shade + si_b) * 255, 0, 255))
                     fill = (r, g, b)
 
                 # shade_color for texture modulation (applied inside _paste_textured_triangle)
@@ -1549,7 +1558,11 @@ class RendererMeshMixin:
                 # the opaque head/body mesh and are visible through the eye-socket
                 # / mouth-gap geometric openings in the face mesh.
                 _is_trans_tex = (_th_tex > 0 or is_transparent or is_additive or _is_inner_geo_tex)
-                _tier_tex = 1 if _is_trans_tex else 0
+                # Draw sky/backdrop panels before every ordinary opaque face.
+                # This CPU backend has no depth buffer, so a dedicated tier is
+                # required; centroid sorting alone lets a huge sky triangle
+                # overwrite closer rooms even though the camera is inside it.
+                _tier_tex = -1 if _node_bg_geom else (1 if _is_trans_tex else 0)
                 tris.append((sort_key,
                              ((p0[0], p0[1]), (p1[0], p1[1]), (p2[0], p2[1])),
                              fill, shade_col, face_tex, uv0, uv1, uv2, is_sel,
@@ -1565,7 +1578,7 @@ class RendererMeshMixin:
                 break
 
         # ── Sort: two-pass (tier) then back-to-front (painter's algorithm) ──
-        # PRIMARY key: tier (0=opaque, 1=transparent/additive).
+        # PRIMARY key: tier (-1=background, 0=opaque, 1=transparent/additive).
         # All opaque triangles render before any transparent triangle
         # regardless of depth.  This prevents transparent inner geometry
         # (eyes, glass, droid lenses) from occluding opaque face/body meshes

@@ -99,6 +99,12 @@ Safe editing tips:
   Editor previews are local until explicitly applied.
 - Run `python tools/validate_themes.py` after editing packaged defaults.
 
+Layout `<spacing>` may tune menus with `menuBarHeight`,
+`menuMinimumWidth`, `menuHorizontalPadding`, `menuShortcutGap`,
+`menuIndicatorWidth`, and `menuSubmenuArrowWidth`. GhostStudio combines these
+with the active font metrics so long action labels, check/icon columns,
+shortcuts, and submenu arrows remain fully visible instead of being clipped.
+
 Viewport command bars use `viewportToolbar.background` and
 `viewportToolbar.border` so the Theme Editor can style their framed surface
 separately from general application toolbars.
@@ -114,3 +120,58 @@ overlays can stay readable in both dark and light themes.
 ## Module Editor
 
 The standalone Module Editor uses existing theme tokens and layout metrics rather than adding a separate palette. It exposes a `moduleEditor` toolbar layout id for density/button sizing and keeps panels compatible with Default, Matrix, Droid, Dark, Light, Classic plus Default, Compact, Wide, and Cinematic layouts.
+
+Map Studio's horizontal editor splitter allows either authoring rail to
+collapse completely. **View > Maximize Viewport** (`Ctrl+Space`) temporarily
+hides both rails, the top authoring strips, and lower docks, then restores the
+previous arrangement when toggled again.
+
+## GUI Editor
+
+The standalone GUI Editor inherits the active application palette and uses the
+stable `guiEditorCatalog` and `guiEditorInspector` panel layout ids for its
+retail-resource browser and typed selection inspector. Its texture-backed,
+direct-manipulation canvas is custom painted through the active Qt palette; it
+introduces no private colour tokens. Add/delete controls, drag/resize handles,
+validation, and file commands remain inside the standalone workbench. The
+main-workbench GUI Editor command is separate from Map Studio, and PIE consumes
+only the renderer-neutral preview payload.
+
+## Custom Rigged Character Builder
+
+The standalone Custom Rigged Character Builder registers as
+`customRiggedCharacterBuilder`. It uses the active Qt palette, existing
+viewport/theme services, and existing layout metrics; it introduces no private
+Matrix-only colors or fixed splitter contract. Its import, rig, ground,
+animation, material, gameplay, validation, and install pages must remain
+readable in Default/native, Matrix, Droid, Dark, Light, and Classic themes.
+
+## Custom KOTOR Head Builder
+
+The Character Builder selector exposes the Custom KOTOR Head entry through the
+stable card layout id `characterBuilderMode.native_kotor_head`. The entry reuses
+the existing themed Character Builder window, viewport, rail, inspector, and
+layout metrics in Head mode; it introduces no private colors, splitter sizes,
+or button modes.
+
+The patch-required Facial Performance Head entry uses the stable card layout id
+`characterBuilderMode.facial_performance_head`. Its warning, synchronized
+dialogue audio/LIP controls, and playback status use the normal palette,
+group-box, form, input, and button roles. No facial-workflow colour token or
+fixed panel dimension is introduced.
+
+The vanilla component recipe is part of the existing
+`headBuilderProperties` surface. Its carrier, face, eyes, eyelids/lashes, hair,
+alien-family, and build controls use ordinary themed forms, grids, labels, and
+buttons. They add no private colour tokens or fixed panel dimensions.
+
+## Scripting Suite
+
+The standalone Scripting Suite registers as
+`scriptingDialogueStudio`. It inherits the active application palette and uses
+existing `main`, `library`, and `output_log` layout metrics for toolbar density,
+resource-browser width, editor space, and diagnostics height. No scripting-only
+colour tokens are required. Its left navigation composes all twelve preserved
+authoring, data, project, package, tutorial, blueprint, and integration pages in
+the same workbench. Community layouts can therefore resize the suite without
+introducing a second theme or crowding the main viewport.

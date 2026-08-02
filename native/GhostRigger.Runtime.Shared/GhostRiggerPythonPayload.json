@@ -39,7 +39,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_ASSETS_RESOURCE_MANAGER",
             "source_path": "src/core/assets/resource_manager.py",
             "packaged_path": "Python/src/core/assets/resource_manager.py",
-            "sha256": "65c1b858613f738a5708ddee45599f43a59e93f2c66972bfb2b2a55bec76156b"
+            "sha256": "f315d584449cccb77df10db46d5ec3e2d09a17ecf2c02a260b3c26f034fd3091"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_PORTS_INIT",
@@ -87,7 +87,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RENDERING_MESH_RENDER_DATA",
             "source_path": "src/core/rendering/mesh_render_data.py",
             "packaged_path": "Python/src/core/rendering/mesh_render_data.py",
-            "sha256": "5cd1fa04f32bc134fb66eb529fdb9a2ca3c8b199f328de32d51a682f482a9f60"
+            "sha256": "221b4004860f1ab2b8ac78725a82dfa28612f1abc58b994cd30659b6874dac9b"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RENDERING_RENDERER_BACKEND",
@@ -105,13 +105,13 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RENDERING_RENDERER_INTERFACE",
             "source_path": "src/core/rendering/renderer_interface.py",
             "packaged_path": "Python/src/core/rendering/renderer_interface.py",
-            "sha256": "d3ddda6533de69b0596b85159c75f0984910fb8e28e56cd6a43953252f95886d"
+            "sha256": "7764e2e2df08e0cefc7420ed7372488b301f8bbd820cc851edcb19d70a1af0c9"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RENDERING_SKELETON_RENDER_DATA",
             "source_path": "src/core/rendering/skeleton_render_data.py",
             "packaged_path": "Python/src/core/rendering/skeleton_render_data.py",
-            "sha256": "d5e563da0c1435b38a8795d5a94fe9f2f10992ba5afcbaa5de67bcb4de02a5c6"
+            "sha256": "194881f9cbab06423161d31cbc7c2d39194cce16ff63471507f2d21ee4e186ae"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RESOURCES_INIT",
@@ -123,7 +123,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RESOURCES_GAME_RESOURCE_PROVIDER",
             "source_path": "src/core/resources/game_resource_provider.py",
             "packaged_path": "Python/src/core/resources/game_resource_provider.py",
-            "sha256": "f36cafda7c61df4e11a64dbb3a612384e9f34893bb0741887d17dd37b9cac9c6"
+            "sha256": "b02b90ff851d70042f893ea753a9195828e8907719db979554e093be125d7ba2"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_SCENE_SCENE_OBJECT",

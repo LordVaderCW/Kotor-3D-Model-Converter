@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 def _renderer_for_backend(backend: RendererBackend, settings: RendererSettings | None = None) -> ViewportRendererPort:
     backend = supported_renderer_backend(backend)
     if backend == RendererBackend.MODERNGL_GL330:
-        return ModernGLRenderer()
+        return ModernGLRenderer(settings=settings)
     if backend == RendererBackend.WGPU_D3D12:
         return WgpuRenderer(RendererBackend.WGPU_D3D12, settings=settings)
     if backend == RendererBackend.PYGFX_WGPU:
@@ -288,6 +288,22 @@ class FallbackViewportRenderer(ViewportRendererPort):
         if active is not None and hasattr(active, "reset_framebuffers"):
             active.reset_framebuffers()
 
+    def update_texture_regions(self, texture_name: str, image, regions, *, finalize: bool = True) -> bool:
+        """Delegate a targeted live-texture write to the active backend."""
+        active = object.__getattribute__(self, "_active")
+        update = getattr(active, "update_texture_regions", None) if active is not None else None
+        if callable(update):
+            return bool(update(texture_name, image, regions, finalize=bool(finalize)))
+        return False
+
+    def invalidate_texture(self, texture_name: str, image=None) -> bool:
+        """Targeted fallback for backends without partial texture writes."""
+        active = object.__getattribute__(self, "_active")
+        invalidate = getattr(active, "invalidate_texture", None) if active is not None else None
+        if callable(invalidate):
+            return bool(invalidate(texture_name, image=image))
+        return False
+
     def invalidate_node(self, node) -> None:
         active = object.__getattribute__(self, "_active")
         if active is not None and hasattr(active, "invalidate_node"):
@@ -298,13 +314,19 @@ class FallbackViewportRenderer(ViewportRendererPort):
         if active is not None and hasattr(active, "invalidate_node_cache"):
             active.invalidate_node_cache()
 
-    def invalidate_transform_cache(self, reason: str = "transforms changed") -> None:
+    def invalidate_transform_cache(self, reason: str = "transforms changed", node=None) -> None:
         active = object.__getattribute__(self, "_active")
         if active is None:
             return
         invalidate = getattr(active, "invalidate_transform_cache", None)
         if callable(invalidate):
-            invalidate(reason)
+            try:
+                invalidate(reason, node=node)
+            except TypeError:
+                # Older renderer ports invalidate their complete transform queue
+                # and accept only the reason.  Keep those backends compatible
+                # while allowing retained renderers to evict one actor subtree.
+                invalidate(reason)
         elif hasattr(active, "invalidate_node_cache"):
             active.invalidate_node_cache()
 

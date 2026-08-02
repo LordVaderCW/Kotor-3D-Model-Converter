@@ -8,6 +8,18 @@ from .snap_view_bar import *  # noqa: F401,F403
 
 
 class ViewportOverlayLayersMixin:
+    def _map_studio_clean_viewport_enabled(self) -> bool:
+        presentation = getattr(self, "_map_studio_viewport_presentation", None)
+        if isinstance(presentation, dict) and "clean_display" in presentation:
+            return bool(presentation.get("clean_display"))
+        return bool(self.property("_gr_map_studio_clean_viewport"))
+
+    def _map_studio_presentation_flag(self, key: str, default: bool = False) -> bool:
+        presentation = getattr(self, "_map_studio_viewport_presentation", None)
+        if isinstance(presentation, dict) and key in presentation:
+            return bool(presentation.get(key))
+        return bool(default)
+
     @staticmethod
     def _map_studio_distance_to_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
         dx = bx - ax
@@ -33,6 +45,28 @@ class ViewportOverlayLayersMixin:
             except ValueError:
                 pass
         return (82, 255, 122, max(0, min(255, int(alpha))))
+
+    def _map_studio_theme_rgba(
+        self,
+        token: str,
+        fallback: object,
+        alpha: int = 220,
+    ) -> tuple[int, int, int, int]:
+        """Resolve an overlay color through the active Ghost theme."""
+
+        value = fallback
+        theme = getattr(self, "_current_theme", None)
+        if theme is not None:
+            try:
+                value = theme.color(str(token or ""), str(fallback or ""))
+            except Exception:
+                value = fallback
+        elif str(token or "") in {"info", "accent.primary", "accent.secondary"}:
+            try:
+                value = self.palette().color(QtGui.QPalette.ColorRole.Highlight).name()
+            except Exception:
+                value = fallback
+        return self._map_studio_marker_rgba(value, alpha)
 
     def _map_studio_project_point(self, point: object, w: int, h: int):
         try:
@@ -189,14 +223,84 @@ class ViewportOverlayLayersMixin:
                     return str(zone.get("placement_id", "") or "")
         return ""
 
+    def _draw_map_studio_speaker_billboard(self, draw, icon: object, w: int, h: int) -> None:
+        """Draw one selectable, screen-facing sound marker without fake geometry."""
+
+        projected = self._map_studio_project_point(getattr(icon, "position", ()), w, h)
+        if projected is None:
+            return
+        cx, cy = float(projected[0]), float(projected[1])
+        color = self._map_studio_theme_rgba(
+            str(getattr(icon, "color_role", "") or "info"),
+            getattr(icon, "color", "#4080ff"),
+            245,
+        )
+        text_color = self._map_studio_theme_rgba("viewport.text", "#ffffff", 245)
+        background = self._map_studio_theme_rgba("viewport.background", "#20242a", 220)
+        placement_id = str(getattr(icon, "placement_id", "") or "")
+        label = str(getattr(icon, "label", "") or placement_id or "Sound")
+        radius = 15.0
+        self._add_map_studio_marker_hit_zone(
+            placement_id,
+            "circle",
+            center=(cx, cy),
+            radius=radius + 5.0,
+        )
+        draw.ellipse(
+            [cx - radius, cy - radius, cx + radius, cy + radius],
+            fill=(background[0], background[1], background[2], 205),
+            outline=(0, 0, 0, 220),
+            width=3,
+        )
+        draw.ellipse(
+            [cx - radius + 2.0, cy - radius + 2.0, cx + radius - 2.0, cy + radius - 2.0],
+            outline=color,
+            width=2,
+        )
+        # Speaker body/cone plus two radiating audio arcs.  Keeping this in
+        # screen space makes it legible at any camera distance, like Unreal's
+        # audio actor billboard.
+        draw.rectangle([cx - 9.0, cy - 4.0, cx - 5.0, cy + 4.0], fill=color)
+        draw.polygon(
+            [
+                (cx - 5.0, cy - 5.0),
+                (cx + 1.0, cy - 10.0),
+                (cx + 1.0, cy + 10.0),
+                (cx - 5.0, cy + 5.0),
+            ],
+            fill=color,
+        )
+        draw.arc([cx - 2.0, cy - 8.0, cx + 10.0, cy + 8.0], start=-55, end=55, fill=color, width=2)
+        draw.arc([cx - 3.0, cy - 12.0, cx + 16.0, cy + 12.0], start=-50, end=50, fill=color, width=2)
+        text_position = (cx + radius + 6.0, cy - 7.0)
+        try:
+            bounds = draw.textbbox(text_position, label)
+            self._add_map_studio_marker_hit_zone(
+                placement_id,
+                "rect",
+                bounds=(float(bounds[0]) - 4.0, float(bounds[1]) - 3.0, float(bounds[2]) + 4.0, float(bounds[3]) + 3.0),
+            )
+            draw.rectangle(
+                [bounds[0] - 4.0, bounds[1] - 3.0, bounds[2] + 4.0, bounds[3] + 3.0],
+                fill=(background[0], background[1], background[2], 195),
+                outline=(color[0], color[1], color[2], 190),
+                width=1,
+            )
+        except Exception:
+            pass
+        draw.text(text_position, label, fill=text_color)
+
     def _draw_map_studio_placement_markers(self, draw, w: int, h: int) -> None:
         self._map_studio_marker_hit_zones = []
         geometry = getattr(self, "_map_studio_marker_geometry", None)
         if geometry is None:
             return
+        clean_display = self._map_studio_clean_viewport_enabled()
+        placement_guides_active = self._map_studio_presentation_flag("show_placement_guides", not clean_display)
         footprints = tuple(getattr(geometry, "footprints", ()) or ())
         lines = tuple(getattr(geometry, "lines", ()) or ())
-        if not footprints and not lines:
+        icons = tuple(getattr(geometry, "icons", ()) or ())
+        if not footprints and not lines and not icons:
             return
         try:
             for footprint in footprints:
@@ -209,9 +313,12 @@ class ViewportOverlayLayersMixin:
                         break
                     projected.append((proj[0], proj[1]))
                 if len(projected) >= 3:
-                    color = self._map_studio_marker_rgba(getattr(footprint, "color", ""), 220)
-                    fill = (color[0], color[1], color[2], 34)
-                    outline = (color[0], color[1], color[2], 205)
+                    color = self._map_studio_marker_rgba(
+                        getattr(footprint, "color", ""),
+                        120 if clean_display and not placement_guides_active else 220,
+                    )
+                    fill = (color[0], color[1], color[2], 14 if clean_display and not placement_guides_active else 34)
+                    outline = (color[0], color[1], color[2], 110 if clean_display and not placement_guides_active else 205)
                     closed = projected + [projected[0]]
                     xs = [float(p[0]) for p in projected]
                     ys = [float(p[1]) for p in projected]
@@ -221,16 +328,19 @@ class ViewportOverlayLayersMixin:
                         bounds=(min(xs) - 8.0, min(ys) - 8.0, max(xs) + 8.0, max(ys) + 8.0),
                     )
                     draw.polygon(projected, fill=fill)
-                    draw.line(closed, fill=(0, 0, 0, 125), width=4)
-                    draw.line(closed, fill=outline, width=2)
+                    draw.line(closed, fill=(0, 0, 0, 70 if clean_display and not placement_guides_active else 125), width=3 if clean_display and not placement_guides_active else 4)
+                    draw.line(closed, fill=outline, width=1 if clean_display and not placement_guides_active else 2)
             for guide in lines:
                 start = self._map_studio_project_point(getattr(guide, "start", ()), w, h)
                 end = self._map_studio_project_point(getattr(guide, "end", ()), w, h)
                 if start is None or end is None:
                     continue
-                color = self._map_studio_marker_rgba(getattr(guide, "color", ""), 235)
+                color = self._map_studio_marker_rgba(
+                    getattr(guide, "color", ""),
+                    120 if clean_display and not placement_guides_active else 235,
+                )
                 role = str(getattr(guide, "role", "") or "")
-                width = 3 if role == "facing" else 2
+                width = 1 if clean_display and not placement_guides_active else 3 if role == "facing" else 2
                 sx, sy = float(start[0]), float(start[1])
                 ex, ey = float(end[0]), float(end[1])
                 self._add_map_studio_marker_hit_zone(
@@ -249,12 +359,26 @@ class ViewportOverlayLayersMixin:
                         t1 = (index + 1) / segments
                         p0 = (sx + (ex - sx) * t0, sy + (ey - sy) * t0)
                         p1 = (sx + (ex - sx) * t1, sy + (ey - sy) * t1)
-                        draw.line([p0, p1], fill=(0, 0, 0, 145), width=width + 2)
+                        draw.line([p0, p1], fill=(0, 0, 0, 70 if clean_display and not placement_guides_active else 145), width=width + 2)
                         draw.line([p0, p1], fill=color, width=width)
                 else:
-                    draw.line([(sx, sy), (ex, ey)], fill=(0, 0, 0, 145), width=width + 2)
+                    draw.line([(sx, sy), (ex, ey)], fill=(0, 0, 0, 70 if clean_display and not placement_guides_active else 145), width=width + 2)
                     draw.line([(sx, sy), (ex, ey)], fill=color, width=width)
-                radius = 4
+                if role == "sky_traffic_path":
+                    # A sampled spline can contain dozens of segments; node
+                    # dots on every sample obscure the actual flight path.
+                    continue
+                if role == "sky_traffic_direction":
+                    dx, dy = ex - sx, ey - sy
+                    length = max(1.0, (dx * dx + dy * dy) ** 0.5)
+                    ux, uy = dx / length, dy / length
+                    arrow_size = 9.0 if clean_display else 12.0
+                    wing = arrow_size * 0.45
+                    base_x, base_y = ex - (ux * arrow_size), ey - (uy * arrow_size)
+                    left = (base_x - (uy * wing), base_y + (ux * wing))
+                    right = (base_x + (uy * wing), base_y - (ux * wing))
+                    draw.polygon([(ex, ey), left, right], fill=color)
+                radius = 3 if clean_display and not placement_guides_active else 4
                 self._add_map_studio_marker_hit_zone(
                     getattr(guide, "placement_id", ""),
                     "circle",
@@ -281,8 +405,37 @@ class ViewportOverlayLayersMixin:
                         outline=(0, 0, 0, 180),
                         width=1,
                     )
+            for icon in icons:
+                if str(getattr(icon, "icon", "") or "").strip().lower() == "speaker":
+                    self._draw_map_studio_speaker_billboard(draw, icon, w, h)
         except Exception as exc:
             log.debug("Map Studio placement marker overlay failed: %s", exc)
+
+    def _map_studio_level_room_presentation(self, room_resref: object) -> tuple[bool, float]:
+        payload = getattr(self, "_map_studio_level_presentation", None)
+        if not isinstance(payload, dict):
+            return (True, 0.0)
+        mapping = dict(payload.get("room_levels") or {})
+        room = str(room_resref or "").strip().lower()
+        if room not in mapping:
+            return (True, 0.0)
+        level = int(mapping[room])
+        mode = str(payload.get("mode") or "stacked")
+        active = int(payload.get("active_level_index", 0) or 0)
+        if mode == "solo":
+            return (level == active, 0.0)
+        if mode == "exploded":
+            ordered = sorted({int(value) for value in mapping.values()})
+            rank = ordered.index(level) if level in ordered else 0
+            return (True, max(0.0, float(payload.get("exploded_gap", 1.5) or 0.0)) * rank)
+        return (True, 0.0)
+
+    @staticmethod
+    def _map_studio_offset_level_point(point: object, z_offset: float) -> tuple[float, float, float]:
+        values = tuple(point or ())
+        if len(values) < 3:
+            return (0.0, 0.0, float(z_offset))
+        return (float(values[0]), float(values[1]), float(values[2]) + float(z_offset))
 
     def _draw_map_studio_room_outlines(self, draw, w: int, h: int) -> None:
         self._map_studio_room_outline_hit_zones = []
@@ -291,6 +444,20 @@ class ViewportOverlayLayersMixin:
         geometry = getattr(self, "_map_studio_room_outline_geometry", None)
         if geometry is None:
             return
+        clean_display = self._map_studio_clean_viewport_enabled()
+        show_room_guides = self._map_studio_presentation_flag("show_room_guides", not clean_display)
+        show_room_vertices = self._map_studio_presentation_flag("show_room_vertex_handles", not clean_display)
+        show_primitive_handles = self._map_studio_presentation_flag("show_primitive_handles", True)
+        subtle_outlines = self._map_studio_presentation_flag("subtle_room_outlines", clean_display)
+        preview_model_loaded = self._map_studio_presentation_flag("preview_model_loaded", False)
+        show_render_geometry_overlay = self._map_studio_presentation_flag(
+            "show_render_geometry_overlay",
+            not preview_model_loaded,
+        )
+        show_room_mesh_fill_overlay = self._map_studio_presentation_flag(
+            "show_room_mesh_fill_overlay",
+            not preview_model_loaded,
+        )
         polygons = tuple(getattr(geometry, "polygons", ()) or ())
         lines = tuple(getattr(geometry, "lines", ()) or ())
         primitive_handles = tuple(getattr(geometry, "primitive_handles", ()) or ())
@@ -298,7 +465,14 @@ class ViewportOverlayLayersMixin:
             return
         try:
             for polygon in polygons:
-                points = tuple(getattr(polygon, "points", ()) or ())
+                room_resref = getattr(polygon, "room_resref", "")
+                visible, z_offset = self._map_studio_level_room_presentation(room_resref)
+                if not visible:
+                    continue
+                points = tuple(
+                    self._map_studio_offset_level_point(point, z_offset)
+                    for point in tuple(getattr(polygon, "points", ()) or ())
+                )
                 projected = []
                 for point in points:
                     proj = self._map_studio_project_point(point, w, h)
@@ -309,20 +483,9 @@ class ViewportOverlayLayersMixin:
                 if len(projected) < 3:
                     continue
                 role = str(getattr(polygon, "role", "") or "")
-                color = self._map_studio_marker_rgba(getattr(polygon, "color", ""), 230)
+                color = self._map_studio_marker_rgba(getattr(polygon, "color", ""), 145 if preview_model_loaded else 170 if subtle_outlines else 230)
                 closed = projected + [projected[0]]
-                fill_alpha = 24 if role == "floor" else 8
-                draw.polygon(projected, fill=(color[0], color[1], color[2], fill_alpha))
-                width = 3 if role == "floor" else 2
-                dash = role == "ceiling"
-                if dash:
-                    for start, end in zip(closed, closed[1:]):
-                        self._draw_map_studio_dashed_line(draw, start, end, color=color, width=width)
-                else:
-                    draw.line(closed, fill=(0, 0, 0, 150), width=width + 2)
-                    draw.line(closed, fill=color, width=width)
                 if role == "floor":
-                    room_resref = getattr(polygon, "room_resref", "")
                     for edge_index, (start_point, end_point, screen_start, screen_end) in enumerate(
                         zip(points, points[1:] + points[:1], projected, projected[1:] + projected[:1])
                     ):
@@ -331,7 +494,7 @@ class ViewportOverlayLayersMixin:
                             edge_index,
                             start=(float(screen_start[0]), float(screen_start[1])),
                             end=(float(screen_end[0]), float(screen_end[1])),
-                            tolerance=8.0,
+                            tolerance=12.0,
                             world_start=start_point,
                             world_end=end_point,
                         )
@@ -344,16 +507,50 @@ class ViewportOverlayLayersMixin:
                             radius=10.0,
                             world_point=point,
                         )
-                        radius = 4
-                        draw.ellipse(
-                            [sx - radius, sy - radius, sx + radius, sy + radius],
-                            fill=(color[0], color[1], color[2], 235),
-                            outline=(0, 0, 0, 190),
-                            width=1,
-                        )
+                        if show_room_vertices:
+                            radius = 4
+                            draw.ellipse(
+                                [sx - radius, sy - radius, sx + radius, sy + radius],
+                                fill=(color[0], color[1], color[2], 235),
+                                outline=(0, 0, 0, 190),
+                                width=1,
+                            )
+                if not show_render_geometry_overlay:
+                    continue
+                fill_alpha = (
+                    62 if show_room_mesh_fill_overlay and subtle_outlines and role == "floor"
+                    else 34 if show_room_mesh_fill_overlay and subtle_outlines
+                    else 24 if show_room_mesh_fill_overlay and role == "floor"
+                    else 8 if show_room_mesh_fill_overlay
+                    else 0
+                )
+                if fill_alpha > 0:
+                    draw.polygon(projected, fill=(color[0], color[1], color[2], fill_alpha))
+                width = 1 if preview_model_loaded else 2 if subtle_outlines and role == "floor" else 1 if subtle_outlines else 3 if role == "floor" else 2
+                dash = role == "ceiling"
+                if dash:
+                    for start, end in zip(closed, closed[1:]):
+                        self._draw_map_studio_dashed_line(draw, start, end, color=color, width=width)
+                else:
+                    shadow_alpha = 60 if preview_model_loaded else 95 if subtle_outlines else 150
+                    draw.line(closed, fill=(0, 0, 0, shadow_alpha), width=width + 2)
+                    draw.line(closed, fill=color, width=width)
+            if not show_room_guides:
+                lines = ()
+            if not show_render_geometry_overlay:
+                lines = ()
             for guide in lines:
-                start = self._map_studio_project_point(getattr(guide, "start", ()), w, h)
-                end = self._map_studio_project_point(getattr(guide, "end", ()), w, h)
+                visible, z_offset = self._map_studio_level_room_presentation(
+                    getattr(guide, "room_resref", "")
+                )
+                if not visible:
+                    continue
+                start = self._map_studio_project_point(
+                    self._map_studio_offset_level_point(getattr(guide, "start", ()), z_offset), w, h
+                )
+                end = self._map_studio_project_point(
+                    self._map_studio_offset_level_point(getattr(guide, "end", ()), z_offset), w, h
+                )
                 if start is None or end is None:
                     continue
                 color = self._map_studio_marker_rgba(getattr(guide, "color", ""), 220)
@@ -365,7 +562,8 @@ class ViewportOverlayLayersMixin:
                     draw.line([(start[0], start[1]), (end[0], end[1])], fill=(0, 0, 0, 150), width=width + 2)
                     draw.line([(start[0], start[1]), (end[0], end[1])], fill=color, width=width)
             self._draw_map_studio_room_outline_edge_highlight(draw, w, h)
-            self._draw_map_studio_room_primitive_handles(draw, primitive_handles, w, h)
+            if show_render_geometry_overlay and show_primitive_handles:
+                self._draw_map_studio_room_primitive_handles(draw, primitive_handles, w, h)
             self._draw_map_studio_room_outline_snap_highlight(draw, w, h)
         except Exception as exc:
             log.debug("Map Studio room outline overlay failed: %s", exc)
@@ -373,6 +571,8 @@ class ViewportOverlayLayersMixin:
     def _draw_map_studio_terrain_walkability(self, draw, w: int, h: int) -> None:
         overlay = getattr(self, "_map_studio_terrain_walkability_overlay", None)
         if overlay is None:
+            return
+        if self._map_studio_clean_viewport_enabled() and not self._map_studio_presentation_flag("show_terrain_walkability", False):
             return
         triangles = tuple(getattr(overlay, "triangles", ()) or ())
         if not triangles:
@@ -390,28 +590,162 @@ class ViewportOverlayLayersMixin:
                 if len(projected) < 3:
                     continue
                 walkable = bool(getattr(triangle, "walkable", False))
-                color = self._map_studio_marker_rgba(
-                    getattr(triangle, "color", "#00ff7a" if walkable else "#ff9f1c"),
-                    225,
+                state = str(getattr(triangle, "validation_state", "unknown") or "unknown").strip().lower()
+                color_role = str(getattr(triangle, "color_role", "") or "")
+                if not color_role:
+                    color_role = "success" if state == "valid" else "error" if state == "invalid" else "warning"
+                fallback = getattr(
+                    triangle,
+                    "color",
+                    "#1b8f45" if state == "valid" else "#c93434" if state == "invalid" else "#d8a326",
                 )
-                fill_alpha = 28 if walkable else 48
-                outline_alpha = 145 if walkable else 225
+                color = self._map_studio_theme_rgba(color_role, fallback, 235)
+                fill_alpha = 46 if state == "valid" else 78 if state == "invalid" else 58
+                outline_alpha = 175 if state == "valid" else 235 if state == "invalid" else 210
                 draw.polygon(projected, fill=(color[0], color[1], color[2], fill_alpha))
                 closed = projected + [projected[0]]
-                draw.line(closed, fill=(0, 0, 0, 120), width=3 if not walkable else 2)
-                draw.line(closed, fill=(color[0], color[1], color[2], outline_alpha), width=2 if not walkable else 1)
-                if not walkable:
+                draw.line(closed, fill=(0, 0, 0, 135), width=3 if state == "invalid" else 2)
+                draw.line(closed, fill=(color[0], color[1], color[2], outline_alpha), width=2 if state == "invalid" else 1)
+                if state == "invalid":
                     draw.line(
                         [projected[0], projected[2]],
-                        fill=(255, 64, 64, 210),
+                        fill=(color[0], color[1], color[2], 235),
                         width=2,
                     )
+                    draw.line(
+                        [projected[1], ((projected[0][0] + projected[2][0]) * 0.5, (projected[0][1] + projected[2][1]) * 0.5)],
+                        fill=(color[0], color[1], color[2], 235),
+                        width=2,
+                    )
+                elif not walkable:
+                    # Blocked faces can be intentional inside a valid WOK.
+                    # Mark them subtly without misrepresenting the room as a
+                    # failed red walkmesh.
+                    draw.line([projected[0], projected[2]], fill=(0, 0, 0, 135), width=1)
         except Exception as exc:
             log.debug("Map Studio terrain walkability overlay failed: %s", exc)
+
+    def _draw_map_studio_building_preview(self, draw, w: int, h: int) -> None:
+        """Draw one Pascal-style wall path without ever touching the scene image."""
+
+        preview = getattr(self, "_map_studio_building_preview", None)
+        if not isinstance(preview, dict) or not bool(preview.get("active", False)):
+            return
+        try:
+            opening = preview.get("opening")
+            if isinstance(opening, dict):
+                start = tuple(float(value) for value in tuple(opening.get("world_start") or ())[:3])
+                end = tuple(float(value) for value in tuple(opening.get("world_end") or ())[:3])
+                if len(start) != 3 or len(end) != 3:
+                    return
+                dx, dy = end[0] - start[0], end[1] - start[1]
+                edge_length = max(1.0e-8, (dx * dx + dy * dy) ** 0.5)
+                ux, uy = dx / edge_length, dy / edge_length
+                center_fraction = max(0.0, min(1.0, float(opening.get("center_fraction", 0.5) or 0.5)))
+                width = max(0.01, float(opening.get("width", 1.25) or 1.25))
+                height = max(0.01, float(opening.get("height", 2.2) or 2.2))
+                bottom = float(opening.get("bottom", 0.0) or 0.0)
+                center_x = start[0] + dx * center_fraction
+                center_y = start[1] + dy * center_fraction
+                half = width * 0.5
+                left = (center_x - ux * half, center_y - uy * half)
+                right = (center_x + ux * half, center_y + uy * half)
+                base_z = start[2] + bottom
+                corners = (
+                    (left[0], left[1], base_z),
+                    (right[0], right[1], base_z),
+                    (right[0], right[1], base_z + height),
+                    (left[0], left[1], base_z + height),
+                )
+                projected = [self._map_studio_project_point(point, w, h) for point in corners]
+                if any(point is None for point in projected):
+                    return
+                screen = [(float(point[0]), float(point[1])) for point in projected]
+                valid = bool(opening.get("valid", False))
+                role = "success" if valid else "danger"
+                fallback = "#58e88b" if valid else "#ff5a67"
+                color = self._map_studio_theme_rgba(role, fallback, 245)
+                draw.polygon(screen, fill=(color[0], color[1], color[2], 46 if valid else 62))
+                draw.line(screen + [screen[0]], fill=(0, 0, 0, 215), width=5)
+                draw.line(screen + [screen[0]], fill=color, width=3)
+                if not valid:
+                    draw.line((screen[0], screen[2]), fill=color, width=2)
+                    draw.line((screen[1], screen[3]), fill=color, width=2)
+                label_point = screen[2]
+                kind = str(opening.get("opening_kind") or preview.get("tool") or "opening").title()
+                reason = str(opening.get("reason") or "")
+                label = f"{kind} · {'Click to place' if valid else reason or 'Invalid'}"
+                draw.text((label_point[0] + 9.0, label_point[1] - 10.0), label, fill=color)
+                return
+            world_points = [tuple(float(value) for value in tuple(point)[:3]) for point in tuple(preview.get("points") or ())]
+            hover = preview.get("hover_world")
+            hover_world = tuple(float(value) for value in tuple(hover)[:3]) if hover is not None else None
+            wall_height = max(0.05, float(preview.get("wall_height", 3.0) or 3.0))
+            close_ready = bool(preview.get("close_ready", False))
+            base_color = self._map_studio_theme_rgba("accent.primary", "#00e5ff", 245)
+            close_color = self._map_studio_theme_rgba("success", "#58e88b", 250)
+            color = close_color if close_ready else base_color
+            path_world = list(world_points)
+            if hover_world is not None:
+                path_world.append(hover_world)
+            projected = []
+            for point in path_world:
+                result = self._map_studio_project_point(point, w, h)
+                if result is None:
+                    projected = []
+                    break
+                projected.append((float(result[0]), float(result[1])))
+            if projected:
+                for start, end in zip(projected, projected[1:]):
+                    draw.line((start, end), fill=(0, 0, 0, 210), width=6)
+                    draw.line((start, end), fill=color, width=3)
+            if close_ready and len(world_points) >= 3:
+                closed_points = []
+                for point in world_points:
+                    result = self._map_studio_project_point(point, w, h)
+                    if result is None:
+                        closed_points = []
+                        break
+                    closed_points.append((float(result[0]), float(result[1])))
+                if len(closed_points) >= 3:
+                    draw.polygon(closed_points, fill=(color[0], color[1], color[2], 24))
+                    draw.line(closed_points + [closed_points[0]], fill=color, width=2)
+            for index, point in enumerate(world_points):
+                base = self._map_studio_project_point(point, w, h)
+                top = self._map_studio_project_point((point[0], point[1], point[2] + wall_height), w, h)
+                if base is None:
+                    continue
+                bx, by = float(base[0]), float(base[1])
+                radius = 7 if index == 0 else 5
+                point_color = close_color if index == 0 and close_ready else base_color
+                draw.ellipse((bx - radius, by - radius, bx + radius, by + radius), fill=(18, 22, 27, 225), outline=point_color, width=3 if index == 0 else 2)
+                if top is not None:
+                    tx, ty = float(top[0]), float(top[1])
+                    self._map_studio_draw_dashed_line(
+                        draw,
+                        (bx, by),
+                        (tx, ty),
+                        fill=(base_color[0], base_color[1], base_color[2], 150),
+                        width=1,
+                        dash=5.0,
+                        gap=4.0,
+                    )
+            if hover_world is not None:
+                result = self._map_studio_project_point(hover_world, w, h)
+                if result is not None:
+                    hx, hy = float(result[0]), float(result[1])
+                    draw.ellipse((hx - 6, hy - 6, hx + 6, hy + 6), outline=color, width=2)
+                    snap_label = str(preview.get("snap_label") or "")
+                    label = "Click to close room" if close_ready else snap_label or f"Corner {len(world_points) + 1}"
+                    draw.text((hx + 10, hy - 9), label, fill=color)
+        except Exception as exc:
+            log.debug("Map Studio building preview overlay failed: %s", exc)
 
     def _draw_map_studio_terrain_brush_cursor(self, draw, w: int, h: int) -> None:
         cursor = getattr(self, "_map_studio_terrain_brush_cursor", None)
         if not isinstance(cursor, dict):
+            return
+        if self._map_studio_clean_viewport_enabled() and not self._map_studio_presentation_flag("show_terrain_brush", False):
             return
         center = self._map_studio_project_point(cursor.get("world_position", ()), w, h)
         edge = self._map_studio_project_point(cursor.get("world_radius_position", ()), w, h)
@@ -421,18 +755,28 @@ class ViewportOverlayLayersMixin:
             cx, cy = float(center[0]), float(center[1])
             ex, ey = float(edge[0]), float(edge[1])
             radius = max(7.0, min(260.0, ((ex - cx) ** 2 + (ey - cy) ** 2) ** 0.5))
-            color = self._map_studio_marker_rgba(cursor.get("color", "#00ff7a"), 235)
+            color = self._map_studio_theme_rgba(
+                str(cursor.get("color_role", "accent") or "accent"),
+                str(cursor.get("color", "#00e5ff") or "#00e5ff"),
+                245,
+            )
             bounds = (cx - radius, cy - radius, cx + radius, cy + radius)
-            draw.ellipse(bounds, outline=(0, 0, 0, 190), width=4)
+            draw.ellipse(bounds, outline=(0, 0, 0, 205), width=4)
             draw.ellipse(bounds, outline=color, width=2)
-            draw.line([(cx - radius, cy), (cx + radius, cy)], fill=(color[0], color[1], color[2], 175), width=1)
-            draw.line([(cx, cy - radius), (cx, cy + radius)], fill=(color[0], color[1], color[2], 175), width=1)
-            sample = cursor.get("sample", ())
+            hardness = max(0.0, min(1.0, float(cursor.get("hardness", 0.5) or 0.0)))
+            inner_radius = max(4.0, radius * hardness)
+            inner_bounds = (cx - inner_radius, cy - inner_radius, cx + inner_radius, cy + inner_radius)
+            # The inner ring communicates the hard core without washing a
+            # large part of the scene in translucent cyan.  A compact meter
+            # below the cursor still gives Photoshop-style fill/empty feedback.
+            draw.ellipse(inner_bounds, outline=(0, 0, 0, 180), width=2)
+            draw.ellipse(inner_bounds, outline=(color[0], color[1], color[2], 205), width=1)
+            draw.ellipse((cx - 3.0, cy - 3.0, cx + 3.0, cy + 3.0), fill=color, outline=(0, 0, 0, 220), width=1)
             brush = str(cursor.get("brush", "") or "brush")
-            room = str(cursor.get("room_resref", "") or "")
-            label = f"{brush} {room} r{int(cursor.get('radius_samples', 0) or 0)}"
-            if isinstance(sample, (tuple, list)) and len(sample) >= 2:
-                label = f"{label} [{int(sample[0])},{int(sample[1])}]"
+            label = (
+                f"{brush.replace('_', ' ').title()} · "
+                f"{int(cursor.get('radius_samples', 0) or 0)} cells · H {int(round(hardness * 100.0))}%"
+            )
             text_pos = (cx + radius + 8.0, cy - 10.0)
             try:
                 text_box = draw.textbbox(text_pos, label)
@@ -444,12 +788,400 @@ class ViewportOverlayLayersMixin:
             except Exception:
                 pass
             draw.text(text_pos, label, fill=(color[0], color[1], color[2], 245))
+            meter_left = cx - min(radius, 54.0)
+            meter_right = cx + min(radius, 54.0)
+            meter_y = cy + radius + 7.0
+            draw.line((meter_left, meter_y, meter_right, meter_y), fill=(0, 0, 0, 210), width=5)
+            filled_right = meter_left + ((meter_right - meter_left) * hardness)
+            if filled_right > meter_left:
+                draw.line((meter_left, meter_y, filled_right, meter_y), fill=color, width=3)
         except Exception as exc:
             log.debug("Map Studio terrain brush cursor overlay failed: %s", exc)
 
+    def _draw_map_studio_texture_paint_cursor(self, draw, w: int, h: int) -> None:
+        """Draw texture-space size and hardness rings over the picked surface."""
+
+        cursor = getattr(self, "_map_studio_texture_paint_cursor", None)
+        if not isinstance(cursor, dict):
+            return
+        try:
+            outer = list(tuple(cursor.get("outer") or ()))
+            inner = list(tuple(cursor.get("inner") or ()))
+            center = tuple(cursor.get("center") or ())
+            if len(outer) < 3 or len(center) < 2:
+                return
+            valid = bool(cursor.get("valid", False))
+            color = self._map_studio_theme_rgba(
+                "success" if valid else "error",
+                "#00e5ff" if valid else "#ff5c5c",
+                245,
+            )
+
+            def closed(points):
+                return points + [points[0]] if points else points
+
+            draw.line(closed(outer), fill=(0, 0, 0, 210), width=5)
+            draw.line(closed(outer), fill=color, width=2)
+            if len(inner) >= 3:
+                draw.line(closed(inner), fill=(0, 0, 0, 180), width=3)
+                draw.line(closed(inner), fill=(color[0], color[1], color[2], 180), width=1)
+            cx, cy = float(center[0]), float(center[1])
+            draw.line([(cx - 4.0, cy), (cx + 4.0, cy)], fill=color, width=1)
+            draw.line([(cx, cy - 4.0), (cx, cy + 4.0)], fill=color, width=1)
+            if not valid:
+                draw.line([(cx - 6.0, cy - 6.0), (cx + 6.0, cy + 6.0)], fill=color, width=2)
+                draw.line([(cx - 6.0, cy + 6.0), (cx + 6.0, cy - 6.0)], fill=color, width=2)
+        except Exception as exc:
+            log.debug("Map Studio texture paint cursor overlay failed: %s", exc)
+
+    def _draw_map_studio_component_selection(self, draw, w: int, h: int) -> None:
+        """Selected components render YELLOW (selection owns that color now)."""
+
+        selection = getattr(self, "_map_studio_component_selection", None)
+        if not selection:
+            return
+        for entry in selection:
+            try:
+                component = str(entry.get("component_type", "") or "")
+                world = tuple(entry.get("face_world_points", ()) or ())
+                projected = []
+                for point in world[:3]:
+                    proj = self._map_studio_project_point(point, w, h)
+                    if proj is None:
+                        projected = []
+                        break
+                    projected.append((float(proj[0]), float(proj[1])))
+                if component == "face" and len(projected) >= 3:
+                    draw.polygon(projected, fill=(255, 214, 74, 88))
+                    closed = projected + [projected[0]]
+                    draw.line(closed, fill=(255, 214, 74, 255), width=2)
+                elif component == "edge" and len(projected) >= 3:
+                    edge = tuple(entry.get("edge_indices", (0, 1)) or (0, 1))
+                    start = projected[int(edge[0]) % 3]
+                    end = projected[int(edge[1]) % 3]
+                    draw.line([start, end], fill=(255, 214, 74, 255), width=4)
+                elif component == "vertex":
+                    proj = self._map_studio_project_point(tuple(entry.get("world_point", ()) or ()), w, h)
+                    if proj is not None:
+                        cx, cy = float(proj[0]), float(proj[1])
+                        draw.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), outline=(255, 214, 74, 255), width=3)
+            except Exception:
+                continue
+
+    def _draw_map_studio_component_extrude_gizmo(self, draw, w: int, h: int) -> None:
+        """Maya-style extrude gizmo: axis arrow at the armed face/edge anchor."""
+
+        payload = getattr(self, "_map_studio_component_extrude", None)
+        if not isinstance(payload, dict):
+            return
+        try:
+            anchor = tuple(payload.get("anchor", ()) or ())
+            axis = tuple(payload.get("axis", ()) or ())
+            if len(anchor) < 3 or len(axis) < 3:
+                return
+            distance = float(payload.get("distance", 0.0) or 0.0)
+            arrow_len = max(1.0, abs(distance))
+            tip_world = (
+                anchor[0] + axis[0] * arrow_len,
+                anchor[1] + axis[1] * arrow_len,
+                anchor[2] + axis[2] * arrow_len,
+            )
+            base = self._map_studio_project_point(anchor, w, h)
+            tip = self._map_studio_project_point(tip_world, w, h)
+            if base is None or tip is None:
+                return
+            bx, by = float(base[0]), float(base[1])
+            tx, ty = float(tip[0]), float(tip[1])
+            operator = str(payload.get("operator", "extrude") or "extrude")
+            color = (
+                (77, 184, 255) if operator == "bevel" else (86, 214, 122)
+            ) if bool(payload.get("dragging", False)) else (255, 214, 74)
+            draw.line([(bx, by), (tx, ty)], fill=(0, 0, 0, 170), width=6)
+            draw.line([(bx, by), (tx, ty)], fill=(color[0], color[1], color[2], 255), width=3)
+            # Arrowhead: two short strokes back from the tip.
+            vx, vy = tx - bx, ty - by
+            length = max(1.0e-6, (vx * vx + vy * vy) ** 0.5)
+            ux, uy = vx / length, vy / length
+            px, py = -uy, ux
+            for side in (1.0, -1.0):
+                draw.line(
+                    [(tx, ty), (tx - ux * 12.0 + px * 6.0 * side, ty - uy * 12.0 + py * 6.0 * side)],
+                    fill=(color[0], color[1], color[2], 255),
+                    width=3,
+                )
+            draw.ellipse((bx - 4, by - 4, bx + 4, by + 4), outline=(color[0], color[1], color[2], 255), width=2)
+            if operator == "bevel":
+                label = (
+                    f"bevel {distance:.3f}m | {int(payload.get('segments', 1) or 1)} seg | "
+                    f"profile {float(payload.get('profile', 0.5) or 0.0):.2f}"
+                )
+            else:
+                label = f"{distance:+.2f}m" if abs(distance) > 1.0e-6 else "drag to extrude"
+            draw.text((tx + 8, ty - 8), label, fill=(color[0], color[1], color[2], 245))
+            # Maya-style axis-orientation badge: click toggles normal <-> world.
+            if operator == "bevel":
+                return
+            offset = tuple(payload.get("toggle_offset", (26.0, -26.0)) or (26.0, -26.0))
+            world_mode = str(payload.get("axis_mode", "normal")) == "world"
+            badge_x, badge_y = bx + float(offset[0]), by + float(offset[1])
+            badge_color = (77, 184, 255) if world_mode else (255, 214, 74)
+            draw.ellipse(
+                (badge_x - 9, badge_y - 9, badge_x + 9, badge_y + 9),
+                fill=(20, 20, 20, 200),
+                outline=(badge_color[0], badge_color[1], badge_color[2], 255),
+                width=2,
+            )
+            draw.text(
+                (badge_x - 4, badge_y - 7),
+                "W" if world_mode else "N",
+                fill=(badge_color[0], badge_color[1], badge_color[2], 255),
+            )
+        except Exception as exc:
+            log.debug("Map Studio extrude gizmo overlay failed: %s", exc)
+
+    @staticmethod
+    def _map_studio_draw_dashed_line(
+        draw,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        *,
+        fill: tuple[int, int, int, int],
+        width: int,
+        dash: float = 7.0,
+        gap: float = 5.0,
+    ) -> None:
+        """Draw one screen-space dashed segment without renderer mutation."""
+
+        ax, ay = float(start[0]), float(start[1])
+        bx, by = float(end[0]), float(end[1])
+        dx, dy = bx - ax, by - ay
+        length = (dx * dx + dy * dy) ** 0.5
+        if length <= 1.0e-6:
+            return
+        ux, uy = dx / length, dy / length
+        cursor = 0.0
+        stride = max(1.0, float(dash)) + max(0.0, float(gap))
+        while cursor < length:
+            stop = min(length, cursor + max(1.0, float(dash)))
+            draw.line(
+                [
+                    (ax + ux * cursor, ay + uy * cursor),
+                    (ax + ux * stop, ay + uy * stop),
+                ],
+                fill=fill,
+                width=max(1, int(width)),
+            )
+            cursor += stride
+
+    def _draw_map_studio_modeling_points_overlay(self, draw, w: int, h: int) -> None:
+        """Paint Maya-style Quad Draw anchors and the prospective closing edge.
+
+        The payload contains world-space feedback only.  Drawing it here keeps
+        the first three clicks visible without touching the KMAP or the live
+        imported mesh before the fourth click commits the quad.
+        """
+
+        overlay = getattr(self, "_map_studio_modeling_points_overlay", None)
+        if not isinstance(overlay, dict) or str(overlay.get("tool") or "") != "quad_draw":
+            return
+        try:
+            points = tuple(overlay.get("points") or ())[:3]
+            projected: list[tuple[float, float]] = []
+            for point in points:
+                screen = self._map_studio_project_point(point, w, h)
+                if screen is None:
+                    continue
+                projected.append((float(screen[0]), float(screen[1])))
+            if not projected:
+                return
+
+            anchor_color = self._map_studio_theme_rgba("accent.secondary", "#00e5ff", 255)
+            preview_color = self._map_studio_theme_rgba("accent.primary", "#ff9f43", 235)
+            if len(projected) >= 2:
+                draw.line(projected, fill=(0, 0, 0, 205), width=7)
+                draw.line(projected, fill=anchor_color, width=3)
+
+            preview_point = tuple(overlay.get("preview_point") or ())
+            preview_screen = self._map_studio_project_point(preview_point, w, h) if len(preview_point) >= 3 else None
+            if preview_screen is not None:
+                candidate = (float(preview_screen[0]), float(preview_screen[1]))
+                self._map_studio_draw_dashed_line(
+                    draw,
+                    projected[-1],
+                    candidate,
+                    fill=(0, 0, 0, 195),
+                    width=6,
+                    dash=7.0,
+                    gap=5.0,
+                )
+                self._map_studio_draw_dashed_line(
+                    draw,
+                    projected[-1],
+                    candidate,
+                    fill=preview_color,
+                    width=3,
+                    dash=7.0,
+                    gap=5.0,
+                )
+                if len(projected) == 3 and bool(overlay.get("close_preview", False)):
+                    self._map_studio_draw_dashed_line(
+                        draw,
+                        candidate,
+                        projected[0],
+                        fill=(0, 0, 0, 195),
+                        width=6,
+                        dash=7.0,
+                        gap=5.0,
+                    )
+                    self._map_studio_draw_dashed_line(
+                        draw,
+                        candidate,
+                        projected[0],
+                        fill=preview_color,
+                        width=3,
+                        dash=7.0,
+                        gap=5.0,
+                    )
+                cx, cy = candidate
+                draw.ellipse((cx - 5.0, cy - 5.0, cx + 5.0, cy + 5.0), fill=(0, 0, 0, 205))
+                draw.ellipse(
+                    (cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5),
+                    outline=preview_color,
+                    width=2,
+                )
+
+            for index, (cx, cy) in enumerate(projected, start=1):
+                draw.ellipse((cx - 7.0, cy - 7.0, cx + 7.0, cy + 7.0), fill=(0, 0, 0, 220))
+                draw.ellipse(
+                    (cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5),
+                    fill=anchor_color,
+                    outline=(255, 255, 255, 235),
+                    width=1,
+                )
+                draw.text((cx + 8.0, cy - 11.0), str(index), fill=anchor_color)
+        except Exception as exc:
+            log.debug("Map Studio modeling point overlay failed: %s", exc)
+
+    def _draw_map_studio_hover_highlight(self, draw, w: int, h: int) -> None:
+        payload = getattr(self, "_map_studio_hover_highlight", None)
+        if not isinstance(payload, dict):
+            return
+        if self._map_studio_clean_viewport_enabled() and not self._map_studio_presentation_flag("show_hover_highlight", True):
+            return
+        try:
+            component = str(payload.get("component_type", "") or "")
+            placement_drop = bool(payload.get("placement_drop", False))
+            world_points = tuple(payload.get("world_points", ()) or ())
+            projected = []
+            for point in world_points[:3]:
+                proj = self._map_studio_project_point(point, w, h)
+                if proj is None:
+                    projected = []
+                    break
+                projected.append((float(proj[0]), float(proj[1])))
+            if placement_drop:
+                # Reuse the established walkable-green cue so a drag has one
+                # unambiguous valid landing color across every theme.
+                color = (0, 255, 122)
+            elif component == "walkmesh_face":
+                color = (0, 255, 122) if bool(payload.get("walkable", False)) else (255, 95, 95)
+            else:
+                # Orange is reserved for the live component/edge-selector cue;
+                # yellow remains reserved for committed component selection.
+                color = (255, 128, 16)
+            if component in {"face", "walkmesh_face"} and len(projected) >= 3:
+                draw.polygon(projected, fill=(color[0], color[1], color[2], 34))
+                closed = projected + [projected[0]]
+                draw.line(closed, fill=(0, 0, 0, 140), width=4)
+                draw.line(closed, fill=(color[0], color[1], color[2], 215), width=2)
+            elif component == "edge" and len(projected) >= 3:
+                edge = tuple(payload.get("edge_indices", (0, 1)) or (0, 1))
+                start = projected[int(edge[0]) % 3]
+                end = projected[int(edge[1]) % 3]
+                draw.line([start, end], fill=(0, 0, 0, 190), width=7)
+                draw.line([start, end], fill=(255, 128, 16, 255), width=4)
+            elif component == "vertex":
+                proj = self._map_studio_project_point(tuple(payload.get("world_point", ()) or ()), w, h)
+                if proj is None:
+                    return
+                cx, cy = float(proj[0]), float(proj[1])
+                bounds = (cx - 5.0, cy - 5.0, cx + 5.0, cy + 5.0)
+                draw.ellipse(bounds, outline=(0, 0, 0, 200), width=4)
+                draw.ellipse(bounds, outline=(255, 128, 16, 255), width=3)
+
+            if placement_drop:
+                proj = self._map_studio_project_point(tuple(payload.get("world_point", ()) or ()), w, h)
+                if proj is not None:
+                    cx, cy = float(proj[0]), float(proj[1])
+                    draw.ellipse((cx - 12.0, cy - 12.0, cx + 12.0, cy + 12.0), fill=(0, 0, 0, 150))
+                    draw.ellipse(
+                        (cx - 9.0, cy - 9.0, cx + 9.0, cy + 9.0),
+                        outline=(0, 255, 122, 255),
+                        width=3,
+                    )
+                    draw.line((cx - 15.0, cy, cx + 15.0, cy), fill=(0, 255, 122, 255), width=2)
+                    draw.line((cx, cy - 15.0, cx, cy + 15.0), fill=(0, 255, 122, 255), width=2)
+                    label = str(payload.get("placement_label", "object") or "object")
+                    draw.text((cx + 16.0, cy - 9.0), f"Drop {label}", fill=(230, 255, 241, 255))
+                    if bool(payload.get("magnet_snapped", False)):
+                        snap_proj = self._map_studio_project_point(
+                            tuple(payload.get("snapped_world_point", ()) or ()),
+                            w,
+                            h,
+                        )
+                        if snap_proj is not None:
+                            sx, sy = float(snap_proj[0]), float(snap_proj[1])
+                            draw.line((cx, cy, sx, sy), fill=(0, 0, 0, 205), width=6)
+                            draw.line((cx, cy, sx, sy), fill=(0, 255, 122, 245), width=3)
+                            diamond = ((sx, sy - 9.0), (sx + 9.0, sy), (sx, sy + 9.0), (sx - 9.0, sy))
+                            draw.polygon(diamond, fill=(0, 0, 0, 190))
+                            inner = ((sx, sy - 6.0), (sx + 6.0, sy), (sx, sy + 6.0), (sx - 6.0, sy))
+                            draw.polygon(inner, outline=(0, 255, 122, 255), width=3)
+                            target = str(payload.get("magnet_target_label", "kit edge") or "kit edge")
+                            draw.text((sx + 12.0, sy + 7.0), f"Snap to {target}", fill=(230, 255, 241, 255))
+
+            # The edge-selector widget makes the next operation's
+            # direction predictable.  Faces point from their center to the
+            # cursor-nearest edge; vertices point along the chosen incident
+            # edge.  Edges already communicate direction through the orange
+            # segment itself.
+            if component in {"face", "vertex"}:
+                selector_origin = self._map_studio_project_point(
+                    tuple(payload.get("selector_origin_world_point", ()) or ()), w, h
+                )
+                selector_target = self._map_studio_project_point(
+                    tuple(payload.get("selector_world_point", ()) or ()), w, h
+                )
+                if selector_origin is not None and selector_target is not None:
+                    start = (float(selector_origin[0]), float(selector_origin[1]))
+                    end = (float(selector_target[0]), float(selector_target[1]))
+                    if abs(end[0] - start[0]) + abs(end[1] - start[1]) > 1.0:
+                        draw.line([start, end], fill=(0, 0, 0, 210), width=6)
+                        draw.line([start, end], fill=(255, 128, 16, 255), width=3)
+                        draw.ellipse(
+                            (end[0] - 3.0, end[1] - 3.0, end[0] + 3.0, end[1] + 3.0),
+                            fill=(255, 128, 16, 255),
+                        )
+        except Exception as exc:
+            log.debug("Map Studio hover highlight overlay failed: %s", exc)
+
     def _draw_map_studio_room_primitive_handles(self, draw, primitive_handles: tuple[object, ...], w: int, h: int) -> None:
+        clean_display = self._map_studio_clean_viewport_enabled()
+        subtle_handles = self._map_studio_presentation_flag("subtle_primitive_handles", clean_display)
+        show_labels = self._map_studio_presentation_flag("show_primitive_labels", not clean_display)
+        selected = {
+            (str(room or ""), str(name or ""))
+            for room, name in tuple(getattr(self, "_map_studio_room_primitive_selection", ()) or ())
+        }
         for handle in primitive_handles:
-            footprint = tuple(getattr(handle, "footprint", ()) or ())
+            room_resref = getattr(handle, "room_resref", "")
+            visible, z_offset = self._map_studio_level_room_presentation(room_resref)
+            if not visible:
+                continue
+            footprint = tuple(
+                self._map_studio_offset_level_point(point, z_offset)
+                for point in tuple(getattr(handle, "footprint", ()) or ())
+            )
             projected = []
             for point in footprint:
                 proj = self._map_studio_project_point(point, w, h)
@@ -457,20 +1189,23 @@ class ViewportOverlayLayersMixin:
                     projected = []
                     break
                 projected.append((float(proj[0]), float(proj[1])))
-            center = self._map_studio_project_point(getattr(handle, "center", ()), w, h)
+            offset_center = self._map_studio_offset_level_point(getattr(handle, "center", ()), z_offset)
+            center = self._map_studio_project_point(offset_center, w, h)
             if center is None:
                 continue
-            color = self._map_studio_marker_rgba(getattr(handle, "color", "#ff9f43"), 235)
-            room_resref = getattr(handle, "room_resref", "")
+            color = self._map_studio_marker_rgba(getattr(handle, "color", "#ff9f43"), 155 if subtle_handles else 235)
             primitive_name = getattr(handle, "primitive_name", "")
-            world_center = tuple(getattr(handle, "center", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0))
+            is_selected = (str(room_resref or ""), str(primitive_name or "")) in selected
+            if is_selected:
+                color = (255, 204, 0, 255)
+            world_center = offset_center
             if len(projected) >= 3:
                 closed = projected + [projected[0]]
                 xs = [point[0] for point in projected]
                 ys = [point[1] for point in projected]
-                draw.polygon(projected, fill=(color[0], color[1], color[2], 18))
-                draw.line(closed, fill=(0, 0, 0, 145), width=4)
-                draw.line(closed, fill=color, width=2)
+                draw.polygon(projected, fill=(color[0], color[1], color[2], 12 if subtle_handles else 18))
+                draw.line(closed, fill=(0, 0, 0, 90 if subtle_handles else 145), width=3 if subtle_handles else 4)
+                draw.line(closed, fill=color, width=4 if is_selected else (1 if subtle_handles else 2))
                 self._add_map_studio_room_primitive_hit_zone(
                     room_resref,
                     primitive_name,
@@ -489,10 +1224,134 @@ class ViewportOverlayLayersMixin:
                 radius=11.0,
                 world_center=world_center,
             )
-            draw.polygon(diamond, fill=(color[0], color[1], color[2], 225), outline=(0, 0, 0, 190))
+            draw.polygon(
+                diamond,
+                fill=(color[0], color[1], color[2], 155 if subtle_handles else 225),
+                outline=(255, 255, 255, 245) if is_selected else (0, 0, 0, 125 if subtle_handles else 190),
+            )
             label = str(getattr(handle, "primitive_type", "") or "")
-            if label:
+            if label and show_labels:
                 draw.text((cx + 8, cy - 8), label, fill=color)
+
+    def _draw_map_studio_universal_transform_overlay(self, draw, w: int, h: int) -> None:
+        overlay = getattr(self, "_map_studio_universal_transform_overlay", None)
+        if overlay is None:
+            return
+        edge_lines = tuple(getattr(overlay, "edge_lines", ()) or ())
+        handles = tuple(getattr(overlay, "handles", ()) or ())
+        clean_display = self._map_studio_clean_viewport_enabled()
+        show_dimensions = self._map_studio_presentation_flag("show_transform_dimensions", not clean_display)
+        show_handle_labels = self._map_studio_presentation_flag("show_gimbal_labels", not clean_display)
+        labels = tuple(getattr(overlay, "dimension_labels", ()) or ()) if show_dimensions else ()
+        if not edge_lines and not handles and not labels:
+            return
+        try:
+            for line in edge_lines:
+                start = self._map_studio_project_point(getattr(line, "start", ()), w, h)
+                end = self._map_studio_project_point(getattr(line, "end", ()), w, h)
+                if start is None or end is None:
+                    continue
+                color = self._map_studio_marker_rgba(getattr(line, "color", "#00e5ff"), 205 if clean_display else 235)
+                points = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
+                draw.line(points, fill=(0, 0, 0, 150 if clean_display else 190), width=4 if clean_display else 5)
+                draw.line(points, fill=color, width=1 if clean_display else 2)
+
+            for label in labels:
+                start = self._map_studio_project_point(getattr(label, "start", ()), w, h)
+                end = self._map_studio_project_point(getattr(label, "end", ()), w, h)
+                midpoint = self._map_studio_project_point(getattr(label, "midpoint", ()), w, h)
+                if start is None or end is None or midpoint is None:
+                    continue
+                color = self._map_studio_marker_rgba(getattr(label, "color", "#ffd84a"), 245)
+                line_points = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
+                self._draw_map_studio_dashed_line(draw, line_points[0], line_points[1], color=color, width=2)
+                text = str(getattr(label, "label", "") or "")
+                if text:
+                    text_pos = (float(midpoint[0]) + 8.0, float(midpoint[1]) - 10.0)
+                    try:
+                        text_box = draw.textbbox(text_pos, text)
+                        draw.rectangle(
+                            (text_box[0] - 4, text_box[1] - 2, text_box[2] + 4, text_box[3] + 2),
+                            fill=(0, 0, 0, 175),
+                            outline=(color[0], color[1], color[2], 185),
+                        )
+                    except Exception:
+                        pass
+                    draw.text(text_pos, text, fill=color)
+
+            room_resref = getattr(overlay, "room_resref", "")
+            primitive_name = getattr(overlay, "primitive_name", "")
+            mode = str(getattr(self, "_map_studio_transform_gizmo_mode", "translate") or "translate").lower()
+            center_world = getattr(overlay, "center", (0.0, 0.0, 0.0))
+            center_projected = self._map_studio_project_point(center_world, w, h)
+            if center_projected is not None and mode == "rotate":
+                cx, cy = float(center_projected[0]), float(center_projected[1])
+                dimensions = tuple(getattr(overlay, "dimensions", (1.0, 1.0, 1.0)) or (1.0, 1.0, 1.0))
+                max_dimension = max([float(value) for value in dimensions[:3]] + [1.0])
+                radius = max(24.0, min(96.0, max_dimension * 18.0))
+                for index, (axis, color_hex) in enumerate((("X", "#ff4d4d"), ("Y", "#43d17a"), ("Z", "#58a6ff"))):
+                    color = self._map_studio_marker_rgba(color_hex, 235)
+                    inset = float(index) * 7.0
+                    draw.ellipse(
+                        [cx - radius + inset, cy - radius * 0.55 + inset, cx + radius - inset, cy + radius * 0.55 - inset],
+                        outline=(0, 0, 0, 215),
+                        width=5,
+                    )
+                    draw.ellipse(
+                        [cx - radius + inset, cy - radius * 0.55 + inset, cx + radius - inset, cy + radius * 0.55 - inset],
+                        outline=color,
+                        width=2,
+                    )
+                    draw.text((cx + radius - inset + 5.0, cy - 8.0 + (index * 12.0)), axis, fill=color)
+            for handle in handles:
+                role = str(getattr(handle, "role", "") or "")
+                if mode == "rotate" and role != "translate":
+                    continue
+                if mode == "scale" and role not in {"translate", "corner_scale"}:
+                    continue
+                if mode not in {"rotate", "scale"} and role == "corner_scale":
+                    continue
+                projected = self._map_studio_project_point(getattr(handle, "position", ()), w, h)
+                if projected is None:
+                    continue
+                cx, cy = float(projected[0]), float(projected[1])
+                color = self._map_studio_marker_rgba(getattr(handle, "color", "#00ff7a"), 245)
+                radius = 7.0 if role == "translate" else 5.0
+                if mode == "translate" and center_projected is not None and role == "axis_translate":
+                    start = (float(center_projected[0]), float(center_projected[1]))
+                    end = (cx, cy)
+                    draw.line([start, end], fill=(0, 0, 0, 220), width=6)
+                    draw.line([start, end], fill=color, width=3)
+                if role == "corner_scale":
+                    diamond = [(cx, cy - radius), (cx + radius, cy), (cx, cy + radius), (cx - radius, cy)]
+                    draw.polygon(diamond, fill=color, outline=(0, 0, 0, 220))
+                elif mode == "scale" and role == "translate":
+                    draw.rectangle(
+                        [cx - radius, cy - radius, cx + radius, cy + radius],
+                        fill=color,
+                        outline=(0, 0, 0, 220),
+                        width=2,
+                    )
+                else:
+                    draw.ellipse(
+                        [cx - radius, cy - radius, cx + radius, cy + radius],
+                        fill=color,
+                        outline=(0, 0, 0, 220),
+                        width=2,
+                    )
+                self._add_map_studio_room_primitive_hit_zone(
+                    room_resref,
+                    primitive_name,
+                    kind="circle",
+                    center=(cx, cy),
+                    radius=13.0,
+                    world_center=getattr(overlay, "center", (0.0, 0.0, 0.0)),
+                )
+                label_text = str(getattr(handle, "label", "") or "")
+                if label_text and role != "corner_scale" and show_handle_labels:
+                    draw.text((cx + 8.0, cy - 8.0), label_text, fill=color)
+        except Exception as exc:
+            log.debug("Map Studio universal transform overlay failed: %s", exc)
 
     def _draw_map_studio_room_outline_edge_highlight(self, draw, w: int, h: int) -> None:
         highlight = getattr(self, "_map_studio_room_outline_edge_highlight", None)
@@ -1142,12 +2001,22 @@ class ViewportOverlayLayersMixin:
             self._fps_frames = 0
 
     def _draw_performance_overlay(self, img, w: int, h: int):
+        if bool(self.property("_gr_suppress_renderer_diagnostics")):
+            return img
+        if bool(
+            getattr(self, "_map_studio_authoring_chrome_enabled", False)
+            and getattr(self, "_nav_dragging", "")
+        ):
+            # Active Map Studio navigation uses a lean overlay set.  The full
+            # diagnostics HUD is restored by the release-frame redraw.
+            return img
         try:
-            from PIL import ImageDraw
+            from PIL import Image, ImageDraw
 
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
-            draw = ImageDraw.Draw(img, "RGBA")
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay, "RGBA")
             fps = self._fps_display
             if fps <= 0.0 and self._last_render_ms > 0.0:
                 fps = 1000.0 / max(self._last_render_ms, 1.0)
@@ -1180,7 +2049,7 @@ class ViewportOverlayLayersMixin:
                 outline=(42, 90, 62),
                 max_width=max_width,
             )
-            return img
+            return Image.alpha_composite(img, overlay)
         except Exception as exc:
             log.debug("Viewport FPS overlay draw failed: %s", exc)
             return img

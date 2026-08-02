@@ -221,7 +221,7 @@ uniform float u_shininess;      // Phong shininess exponent (overridden per-node
 uniform int   u_lm_shade;       // FIX-LMSHADE: 1 = lightmap-only shading (skip Phong)
 uniform float u_lightmap_intensity;
 uniform int   u_lightmap_mode;  // 0 baked multiply, 1 Phong modulate, 2 emissive add
-uniform int   u_scene_lighting; // 0 unlit, 1 studio, 2 Aurora scene lights
+uniform int   u_scene_lighting; // 0 unlit, 1 studio, 2 Aurora scene lights, 3 baked-lightmap preview
 uniform float u_scene_ambient;
 uniform int   u_scene_light_count;
 uniform int   u_scene_light_enabled[16];
@@ -247,6 +247,14 @@ uniform int   u_proc_type;      // 0=none, 1=cycle, 2=water, 3=random, 4=ringtex
 
 // Camera position for specular + env map sphere projection
 uniform vec3  u_cam_pos;
+
+// Map Studio routes the measured ARE distance-fog values through these
+// uniforms only for its authored-preview model.  They default off for every
+// model/particle view, preserving existing retail rendering byte-for-byte.
+uniform int   u_map_fog_enabled;
+uniform vec3  u_map_fog_color;
+uniform float u_map_fog_near;
+uniform float u_map_fog_far;
 
 // v7.2 Order-Independent Transparency (Finding 5.5 — reone f_oit_model.glsl)
 uniform int   u_oit_enabled;    // 1 = weighted-blended OIT output mode
@@ -281,6 +289,9 @@ vec3 sceneLightShade(vec3 N, vec3 V, vec3 world_pos, float spec_intensity, float
 
         if (kind == 1) {
             L = normalize(-u_scene_light_dir[i]);
+        } else if (kind == 4) {
+            // Ambient lights are global energy, not local point emitters.
+            attenuation = 1.0;
         } else {
             vec3 delta = u_scene_light_pos[i] - world_pos;
             float dist = length(delta);
@@ -301,7 +312,7 @@ vec3 sceneLightShade(vec3 N, vec3 V, vec3 world_pos, float spec_intensity, float
             }
         }
 
-        if (u_scene_light_ambient_only[i] == 1) {
+        if (u_scene_light_ambient_only[i] == 1 || kind == 4) {
             accum += color * attenuation;
         } else {
             float ndotl = max(dot(N, L), 0.0);
@@ -453,7 +464,12 @@ void main() {
         vec4 lm_samp = texture(u_lm_tex, v_uv_lm);
         debug_lightmap_rgb = lm_samp.rgb;
         float lm_strength = clamp(u_lightmap_intensity, 0.0, 4.0);
-        vec3 baked_light = mix(vec3(1.0), lm_samp.rgb * 2.0, clamp(lm_strength, 0.0, 1.0));
+        // Preserve the user-facing intensity blend, but restore the validated
+        // pre-lighting-system KotOR preview target.  The May lightmap audit
+        // used 2.5x overbright plus a 0.03 floor; the later generic-lighting
+        // rewrite accidentally replaced that target with 2.0x and no floor.
+        vec3 baked_target = lm_samp.rgb * 2.5 + vec3(0.03);
+        vec3 baked_light = mix(vec3(1.0), baked_target, clamp(lm_strength, 0.0, 1.0));
         if (u_lightmap_mode == 1) {
             float ndotl  = max(dot(N, u_light_dir),  0.0);
             float ndotl2 = max(dot(N, u_light_dir2), 0.0);
@@ -472,15 +488,20 @@ void main() {
             // Diagnostic: documented original overbright 2.0, no ambient floor.
             lit_color = diffuse_samp.rgb * lm_samp.rgb * 2.0;
         } else {
-            // FIX-LMBRIGHT: Raised overbright 2.0 → 2.5 + ambient floor 0.03
+            // FIX-LMBRIGHT: 2.5x overbright + 0.03 ambient floor.
             lit_color = diffuse_samp.rgb * baked_light;
             if (u_lm_composite_mode == 3) {
                 lit_color = clamp(lit_color, 0.0, 1.0);
             }
         }
 
-        // Self-illumination still applies additively
-        lit_color += u_selfillum;
+        // Odyssey self-illumination is a lighting contribution that is still
+        // modulated by the diffuse texture.  Adding the controller RGB as a
+        // flat colour destroys dark texture detail (DOR_LKO04 becomes an
+        // opaque white panel).  reone's retro shader computes
+        // ``(lighting + selfIllum) * mainTex`` and KotOR.js applies the same
+        // texture-preserving contract.
+        lit_color += diffuse_samp.rgb * u_selfillum;
 
         // Environment map compositing (rare for modules but handle it)
         if (u_has_env == 1) {
@@ -546,11 +567,11 @@ void main() {
             diffuse_samp.a = 1.0;
         }
 
-        // -- Self-illumination (additive glow)
-        // v7.1 (Finding 5.6 — reone context.cpp GL_MAX blend equation):
-        // Self-illumination uses additive compositing. For surfaces with
-        // selfillum > 0, clamp so glow doesn't over-brighten dark areas.
-        lit_color += u_selfillum;
+        // -- Self-illumination (texture-modulated lighting contribution)
+        // Preserve the albedo/atlas contours while raising their emitted
+        // light.  A flat RGB add turns high selfillum stock doors and props
+        // into featureless white silhouettes.
+        lit_color += diffuse_samp.rgb * u_selfillum;
 
         // -- Lightmap compositing for non-lm_shade path (fallback):
         // This handles lightmapped nodes that somehow reach this path
@@ -559,7 +580,8 @@ void main() {
             vec4 lm_samp = texture(u_lm_tex, v_uv_lm);
             debug_lightmap_rgb = lm_samp.rgb;
             float lm_strength = clamp(u_lightmap_intensity, 0.0, 4.0);
-            vec3 baked_light = mix(vec3(1.0), lm_samp.rgb * 2.0, clamp(lm_strength, 0.0, 1.0));
+            vec3 baked_target = lm_samp.rgb * 2.5 + vec3(0.03);
+            vec3 baked_light = mix(vec3(1.0), baked_target, clamp(lm_strength, 0.0, 1.0));
             if (u_lightmap_mode == 2) {
                 lit_color += lm_samp.rgb * lm_strength;
             } else if (u_lm_composite_mode == 1) {
@@ -576,7 +598,10 @@ void main() {
     }
 
     if (u_scene_lighting == 0) {
-        lit_color = diffuse_samp.rgb + u_selfillum;
+        float selfillum_peak = max(u_selfillum.r, max(u_selfillum.g, u_selfillum.b));
+        lit_color = selfillum_peak > 0.0001
+            ? diffuse_samp.rgb * max(vec3(0.25), u_selfillum)
+            : diffuse_samp.rgb;
     }
 
     if (u_render_mode == 1) {
@@ -587,6 +612,27 @@ void main() {
         diffuse_samp.a = 1.0;
     }
 
+    // The blade mask is already an emissive RGB texture.  Preserve its black
+    // card edges and colored falloff exactly; adding u_selfillum would turn the
+    // whole additive quad into a visible rectangle.
+    if (featureEnabled(u_features, FEAT_SABER)) {
+        lit_color = diffuse_samp.rgb;
+    }
+
+    // TXI 'blending additive' surfaces are unlit emissive textures in the
+    // Odyssey engine (reone/xoreos draw them fullbright).  Phong shading plus
+    // the flat u_selfillum term pushes overlapping additive shells (e.g. the
+    // K1 Star Map SkyDome pair) to solid white under ONE,ONE blending.
+    // Untextured additive planes (texture 'null' + selfillum, e.g. the Star
+    // Map lightflare burst) glow with their selfillum color instead of the
+    // white fallback texture.
+    if (u_blend_mode == 1 && !sprite_emissive) {
+        lit_color = diffuse_samp.rgb;
+        if (u_has_tex == 0) {
+            lit_color = diffuse_samp.rgb * u_selfillum;
+        }
+    }
+
     if (u_selected == 1) {
         lit_color = mix(lit_color, vec3(1.0, 0.78, 0.12), 0.45);
     }
@@ -595,6 +641,21 @@ void main() {
         vec3 tint = spriteEmissionTint(diffuse_samp.rgb);
         vec3 emission = max(diffuse_samp.rgb, tint * (0.45 + diffuse_samp.a * 0.55));
         lit_color = max(lit_color, emission * (1.0 + clamp(u_sprite_glow, 0.0, 4.0)));
+    }
+
+    // K1 exterior SunFog uses camera distance.  Never apply this to additive
+    // effects or sprite-emissive particles: those retain their established
+    // renderer path, and the state is opt-in for a Map Studio world preview.
+    // Map Studio feeds a compact-view calibrated range here; the authored ARE
+    // range remains untouched for package export and real-game rendering.
+    if (u_map_fog_enabled == 1 && u_blend_mode != 1 && !sprite_emissive) {
+        float fog_range = max(0.001, u_map_fog_far - u_map_fog_near);
+        float fog_linear = clamp((length(v_world_pos - u_cam_pos) - u_map_fog_near) / fog_range, 0.0, 1.0);
+        // A slightly front-loaded atmospheric ramp makes the state readable
+        // inside author-sized clearings instead of requiring a 70 m sightline.
+        float fog_amount = 1.0 - exp(-2.15 * fog_linear);
+        fog_amount = fog_amount * fog_amount * (3.0 - 2.0 * fog_amount);
+        lit_color = mix(lit_color, u_map_fog_color, fog_amount);
     }
 
     lit_color = clamp(lit_color, 0.0, 1.0);
@@ -647,6 +708,11 @@ void main() {
         frag_color = vec4(lit_color * final_alpha * w, final_alpha * w);
         // Note: second render target (revealage) would need MRT support;
         // for now we encode revealage in alpha and use single-target approximation.
+    } else if (u_blend_mode == 1) {
+        // Additive blending is ONE,ONE: destination ignores alpha entirely, so
+        // node-alpha fades (Star Map SkyDome off/on animation) must premultiply
+        // into the added color or additive surfaces can never fade out.
+        frag_color = vec4(lit_color * final_alpha, final_alpha);
     } else {
         frag_color = vec4(lit_color, final_alpha);
     }

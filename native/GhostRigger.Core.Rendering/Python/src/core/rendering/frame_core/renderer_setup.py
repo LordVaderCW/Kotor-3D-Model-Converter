@@ -310,7 +310,13 @@ class RendererSetupMixin:
 
             if dt > 0.0:
                 for n in self.model.all_nodes():
-                    if not n.is_dangly or not n.vertices:
+                    # Retained scene composition may include lightweight
+                    # helper/wrapper nodes (for example ``SimpleNamespace``
+                    # roots) alongside full ``ModelNode`` instances.  Dangly
+                    # simulation is optional, so only opt in nodes that
+                    # explicitly expose both the flag and geometry instead of
+                    # aborting the entire animation tick on a helper node.
+                    if not bool(getattr(n, "is_dangly", False)) or not getattr(n, "vertices", None):
                         continue
                     nid = id(n)
                     if nid not in self._dangly_sims:
@@ -366,25 +372,70 @@ class RendererSetupMixin:
     # consistent behaviour across viewport rendering, compute_bounds, and render_bounds.
     _BASE_SKELETONS = KOTOR_BASE_SKELETONS
 
-    def set_character_animation_pose(self, character_instance_id: str, pose, name: str = "", time: float = 0.0, length: float = 0.0):
+    def set_character_animation_pose(
+        self,
+        character_instance_id: str,
+        pose,
+        name: str = "",
+        time: float = 0.0,
+        length: float = 0.0,
+        *,
+        request_render: bool = True,
+    ):
         """Set one character's pose without disturbing other sequence poses."""
 
-        character_id = str(character_instance_id or "").strip()
-        if not character_id:
+        self.set_character_animation_poses(
+            ((character_instance_id, pose, name, time, length),),
+            request_render=request_render,
+        )
+
+    def set_character_animation_poses(self, rows, *, request_render: bool = True):
+        """Commit many scoped character poses with one cache invalidation.
+
+        Runtime previews can contain dozens of retained Odyssey actors.  The
+        historical one-at-a-time path rebuilt the composed pose set, cleared
+        all skin/transform caches, and queued a repaint for every actor.  This
+        batch contract performs those shared operations once, allowing the Qt
+        viewport to submit exactly one coherent animation/transform/camera
+        frame after every pose has been staged.
+        """
+
+        changed = False
+        for row in tuple(rows or ()):
+            try:
+                character_instance_id, pose, name, time, length = row
+            except (TypeError, ValueError):
+                continue
+            character_id = str(character_instance_id or "").strip()
+            if not character_id:
+                continue
+            changed = True
+            if pose is None:
+                self._anim_poses_by_character.pop(character_id, None)
+                self._anim_pose_metadata_by_character.pop(character_id, None)
+            else:
+                self._anim_poses_by_character[character_id] = pose
+                self._anim_pose_metadata_by_character[character_id] = {
+                    "name": str(name or getattr(pose, "_gr_animation_name", "") or ""),
+                    "time": float(time),
+                    "length": float(length),
+                }
+        if not changed:
             return
-        if pose is None:
-            self._anim_poses_by_character.pop(character_id, None)
-            self._anim_pose_metadata_by_character.pop(character_id, None)
-        else:
-            self._anim_poses_by_character[character_id] = pose
-            self._anim_pose_metadata_by_character[character_id] = {
-                "name": str(name or getattr(pose, "_gr_animation_name", "") or ""),
-                "time": float(time),
-                "length": float(length),
-            }
         scoped_pose = self._compose_scoped_animation_pose_set()
         if scoped_pose is None:
-            self.set_animation_pose(None)
+            for sim in self._dangly_sims.values():
+                try:
+                    sim.reset()
+                except Exception:
+                    pass
+            self._dangly_last_time = 0.0
+            self._anim_base_pose = None
+            self._anim_pose = None
+            self._anim_name = ""
+            self._anim_time = 0.0
+            self._anim_length = 0.0
+            self._invalidate_animation_pose_caches(request_render=request_render)
             return
         self._anim_pose = scoped_pose
         metadata = list(self._anim_pose_metadata_by_character.values())
@@ -392,7 +443,7 @@ class RendererSetupMixin:
         self._anim_name = " + ".join(names[:3]) + (" ..." if len(names) > 3 else "")
         self._anim_time = max((float(item.get("time", 0.0) or 0.0) for item in metadata), default=0.0)
         self._anim_length = max((float(item.get("length", 0.0) or 0.0) for item in metadata), default=0.0)
-        self._invalidate_animation_pose_caches()
+        self._invalidate_animation_pose_caches(request_render=request_render)
 
     def clear_character_animation_pose(self, character_instance_id: str) -> None:
         self.set_character_animation_pose(character_instance_id, None)
@@ -408,7 +459,7 @@ class RendererSetupMixin:
         except Exception:
             return None
 
-    def _invalidate_animation_pose_caches(self) -> None:
+    def _invalidate_animation_pose_caches(self, *, request_render: bool = True) -> None:
         self._wt_cache.clear()
         self._bone_transforms_cache = None
         self._bone_transforms_pose_id = -1
@@ -416,7 +467,7 @@ class RendererSetupMixin:
         self._gpu_parity_skin_verts_cache = {}
         self.is_interactive = False
         _req = getattr(self, '_request_render', None)
-        if _req is not None:
+        if request_render and _req is not None:
             try:
                 _req(fast=True)
             except Exception:

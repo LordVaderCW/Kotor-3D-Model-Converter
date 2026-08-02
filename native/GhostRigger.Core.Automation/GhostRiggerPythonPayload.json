@@ -2,7 +2,7 @@
     "schema": "ghostrigger_python_payload.v1",
     "phase": "P1.5 embedded python payload",
     "project": "GhostRigger.Core.Automation",
-    "file_count": 35,
+    "file_count": 46,
     "originals_remain_in_src": true,
     "files": [
         {
@@ -18,22 +18,40 @@
             "sha256": "86eb48b37db9af78e0054a6f2865dd56d224b4a132a87a76b0fe418275f48861"
         },
         {
+            "resource_name": "PYTHON_PAYLOAD_GHOSTSTUDIO_SPATIAL_MCP_INIT",
+            "source_path": "src/ghoststudio_spatial_mcp/__init__.py",
+            "packaged_path": "Python/src/ghoststudio_spatial_mcp/__init__.py",
+            "sha256": "c1f01775d4a953ecf00fb8563c8d32e75977a81b4fcec5b9d05542a49782a50f"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_GHOSTSTUDIO_SPATIAL_MCP_SERVER",
+            "source_path": "src/ghoststudio_spatial_mcp/server.py",
+            "packaged_path": "Python/src/ghoststudio_spatial_mcp/server.py",
+            "sha256": "10469f8ac26b9d9083b71598af75121d5c1e78d51b20088c8ad53f0b5e93e1bd"
+        },
+        {
             "resource_name": "PYTHON_PAYLOAD_IPC_INIT",
             "source_path": "src/ipc/__init__.py",
             "packaged_path": "Python/src/ipc/__init__.py",
-            "sha256": "2175c1a4a3936d61f50566ac96b8b52b85fd41dd73702232f154b51ce91efc4d"
+            "sha256": "267a49f5daaa5ee80eb0f265311ef5a92ffd0b3faa905f907c654855534d5d2b"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_IPC_CLIENT",
             "source_path": "src/ipc/client.py",
             "packaged_path": "Python/src/ipc/client.py",
-            "sha256": "a8e3870df3664d9a0425d560f22a5d8825a79e3dfa8640d690c58c03ce9b3b9a"
+            "sha256": "729450759c69161afa404f6d5b51bc1eabca850c3c13c9e45797658b89171cfa"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_IPC_SERVER",
             "source_path": "src/ipc/server.py",
             "packaged_path": "Python/src/ipc/server.py",
-            "sha256": "7cf4172008260baba566bdff29a00b16d1c60616a5d0de644d32c32f05db0800"
+            "sha256": "f3cfcd95457facd9fea59c4b8614580f0caf7faadc1966596844380923051542"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_IPC_SPATIAL_AUTH",
+            "source_path": "src/ipc/spatial_auth.py",
+            "packaged_path": "Python/src/ipc/spatial_auth.py",
+            "sha256": "34b9fe81c98db2eaf9900e9e33a83156eded4e4f21efeb289b114f146f775cf7"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_INIT",
@@ -57,7 +75,25 @@
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_ADAPTERS_DECOMPILE",
             "source_path": "src/kotormcp/adapters_decompile.py",
             "packaged_path": "Python/src/kotormcp/adapters_decompile.py",
-            "sha256": "1046face1a201b412543f308448d87b0781b6f323afe282f6d980caf3165235a"
+            "sha256": "a3668c732bbfdfc84611d4d4a833322ae84ce8391bdcac2e066f92af3a5ab2ee"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_GAME_DINPUT_HOOK",
+            "source_path": "src/kotormcp/game_dinput_hook.py",
+            "packaged_path": "Python/src/kotormcp/game_dinput_hook.py",
+            "sha256": "f93406a9c4357ecb7216ccdd438b27a9d6017ecff1ceeeac135b31116fbb6ba3"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_GAME_INPUT",
+            "source_path": "src/kotormcp/game_input.py",
+            "packaged_path": "Python/src/kotormcp/game_input.py",
+            "sha256": "1064384ecfdf812db85bd0a3e507eb33f8858dc0e76a021f1b1783be8ad412e0"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_GAME_PROCESS_LOG",
+            "source_path": "src/kotormcp/game_process_log.py",
+            "packaged_path": "Python/src/kotormcp/game_process_log.py",
+            "sha256": "acdc18036f7810fc648a8e4fd112f6bf397fdbbd7c4c3886b6da3a5fcc82a79e"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_MCP_RESOURCES",
@@ -75,7 +111,7 @@
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_SCHEMAS_INIT",
             "source_path": "src/kotormcp/schemas/__init__.py",
             "packaged_path": "Python/src/kotormcp/schemas/__init__.py",
-            "sha256": "0345a46050278305716cee9dd80dfd03d63d1f223971babfa7490069c754963d"
+            "sha256": "71aed26c63eba71eec12680d15a8af4feb78f2b89994de7247c71a58b5a341e5"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_SERVER",
@@ -93,7 +129,7 @@
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_INIT",
             "source_path": "src/kotormcp/tools/__init__.py",
             "packaged_path": "Python/src/kotormcp/tools/__init__.py",
-            "sha256": "a0b378d493559d30d7efafbb2d237826b023c9f1d3a285280f4aeb9c7c295a45"
+            "sha256": "8642d3f8f2df6a9a2c79478cadab059ea9bf097a5a13b8bfd663672b111d667c"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_ARCHIVES",
@@ -126,6 +162,12 @@
             "sha256": "6e40e3efd76ca6c43c4354efca35edb8681b116efa455cab5563efce9600d4a7"
         },
         {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_GAME_TEST",
+            "source_path": "src/kotormcp/tools/game_test.py",
+            "packaged_path": "Python/src/kotormcp/tools/game_test.py",
+            "sha256": "712d45c700f49cb024c19fb2c0bc1e5b7e0978a1a48d9506712569038bab5aaf"
+        },
+        {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_GAMEDATA",
             "source_path": "src/kotormcp/tools/gamedata.py",
             "packaged_path": "Python/src/kotormcp/tools/gamedata.py",
@@ -135,13 +177,13 @@
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_GFFDATA",
             "source_path": "src/kotormcp/tools/gffdata.py",
             "packaged_path": "Python/src/kotormcp/tools/gffdata.py",
-            "sha256": "459e0f10878d8676408362e07dc195ddef66306217fc26c27f7a8efcec033e9b"
+            "sha256": "041f4332e5eff2399fbd36f7ddf13fc823aa94e24deded6c3d8cfbdb87e58f54"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_GHOSTRIGGER",
             "source_path": "src/kotormcp/tools/ghostrigger.py",
             "packaged_path": "Python/src/kotormcp/tools/ghostrigger.py",
-            "sha256": "c0b164852876b18bdfab60f4424aaf3085875d3713ec1ed99aa4c11067680752"
+            "sha256": "4637eded5b73b857c9edb51504d654cdb81177fb967232f1b3a2ba0fca8968f6"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_GHOSTRIGGER_TOOLS",
@@ -154,6 +196,30 @@
             "source_path": "src/kotormcp/tools/installation.py",
             "packaged_path": "Python/src/kotormcp/tools/installation.py",
             "sha256": "cbc5403d284b2a29ca546d182e79ed03f7eef884a1c5454e17fba925007edf83"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_KOTOR_DINPUT_HOOK",
+            "source_path": "src/kotormcp/tools/kotor_dinput_hook.py",
+            "packaged_path": "Python/src/kotormcp/tools/kotor_dinput_hook.py",
+            "sha256": "f59eb0b9993a96c2dfee6d7c699b86230982fad77f4e3de5301eca760c5cc6bf"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_KOTOR_INPUT",
+            "source_path": "src/kotormcp/tools/kotor_input.py",
+            "packaged_path": "Python/src/kotormcp/tools/kotor_input.py",
+            "sha256": "4deec47cfb731ccd097553726b9b810f835034b975239d8092dd353bf17e26b4"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_KOTOR_LIVE_LOG",
+            "source_path": "src/kotormcp/tools/kotor_live_log.py",
+            "packaged_path": "Python/src/kotormcp/tools/kotor_live_log.py",
+            "sha256": "8875263c0f77693cabddd90a9c55c34c7594e1f4ad2dbd89bcdcdf737013e957"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_LEGACY_GHOSTSCRIPTER",
+            "source_path": "src/kotormcp/tools/legacy_ghostscripter.py",
+            "packaged_path": "Python/src/kotormcp/tools/legacy_ghostscripter.py",
+            "sha256": "e690f7f1d6dceff5efc79502b5a44b12de7efea091b7cac3e8ba6647dad8a827"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_KOTORMCP_TOOLS_MODULES",

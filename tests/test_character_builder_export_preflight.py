@@ -28,7 +28,10 @@ from src.core.characters.character_validation_report import (
     build_character_game_test_evidence,
     character_game_test_evidence_passed,
 )
-from src.core.characters.native_skeleton import native_skeleton_fingerprint
+from src.core.characters.native_skeleton import (
+    CHARACTER_BUILDER_ROOT_IDENTITY_KEY,
+    native_skeleton_fingerprint,
+)
 from src.core.geometry.model_data import (
     BoneWeight,
     KotorModel,
@@ -374,6 +377,43 @@ def _rigged_character(template: KotorModel | None = None, *, game: str = "K1") -
             scale_mode="manual",
         )
     )
+
+
+def _rename_character_resource_root(result: dict, target_root: str = "grbody01") -> None:
+    model = result["model"]
+    source_root = str(model.root_node.name)
+    model.name = target_root
+    model.root_node.name = target_root
+    model.metadata = dict(getattr(model, "metadata", {}) or {})
+    model.metadata[CHARACTER_BUILDER_ROOT_IDENTITY_KEY] = {
+        "status": "resource_root_renamed",
+        "source_root": source_root,
+        "target_root": target_root,
+    }
+
+
+def _fallback_weight_rigged_character(monkeypatch) -> dict:
+    """Build a deterministic fallback-weight fixture without game lookup.
+
+    Production Character Builder now reloads the selected vanilla model when
+    a skeleton-only template has no usable donor skin.  On a machine with a
+    KOTOR installation that correctly upgrades ``_rigged_character()`` to
+    donor-transfer weights, so tests of the fallback warning/report contract
+    must explicitly disable that optional donor-resource lookup.
+    """
+
+    # Keep the synthetic template's source game/resref facts intact because
+    # those are independently required by export preflight.  Disable only the
+    # optional donor reload boundary, which is the dependency this fixture is
+    # meant to exercise without.
+    import src.core.characters.character_builder as character_builder
+
+    monkeypatch.setattr(
+        character_builder,
+        "load_game_skeleton_source",
+        lambda *_args, **_kwargs: None,
+    )
+    return _rigged_character()
 
 
 def _donor_weight_rigged_character() -> dict:
@@ -1026,8 +1066,8 @@ def test_character_export_preflight_accepts_small_source_without_toe_guides() ->
     assert preflight.export_allowed is True
 
 
-def test_character_export_preflight_warns_on_fallback_skin_binding() -> None:
-    result = _rigged_character()
+def test_character_export_preflight_warns_on_fallback_skin_binding(monkeypatch) -> None:
+    result = _fallback_weight_rigged_character(monkeypatch)
 
     preflight = preflight_character_mdl_export(
         result["model"],
@@ -1522,6 +1562,61 @@ def test_character_export_preflight_skips_recommended_socket_absent_from_native_
     )
 
     assert "character.export.recommended_socket_missing" not in _codes(preflight)
+
+
+def test_character_export_preflight_accepts_explicit_resource_root_identity() -> None:
+    result = _rigged_character()
+    _rename_character_resource_root(result)
+
+    preflight = preflight_character_mdl_export(
+        result["model"],
+        native_snapshot=result["native_skeleton_snapshot"],
+        options=CharacterExportPreflightOptions(recommended_socket_categories=()),
+    )
+
+    codes = _codes(preflight)
+    assert "character.export.node_path_changed" not in codes
+    assert "character.export.node_path_missing" not in codes
+    assert "character.export.required_socket_missing" not in codes
+    assert "character.export.non_native_skeleton_node" not in codes
+    assert "character.export.missing_native_render_replacement_evidence" not in codes
+    assert preflight.report.has_blocking is False
+
+
+def test_character_export_preflight_rejects_unrecorded_resource_root_rename() -> None:
+    result = _rigged_character()
+    result["model"].name = "grbody01"
+    result["model"].root_node.name = "grbody01"
+
+    preflight = preflight_character_mdl_export(
+        result["model"],
+        native_snapshot=result["native_skeleton_snapshot"],
+        options=CharacterExportPreflightOptions(recommended_socket_categories=()),
+    )
+
+    codes = _codes(preflight)
+    assert "character.export.node_path_changed" in codes
+    assert "character.export.non_native_skeleton_node" in codes
+    assert preflight.report.has_blocking is True
+
+
+def test_character_export_preflight_still_rejects_child_move_with_root_identity() -> None:
+    result = _rigged_character()
+    _rename_character_resource_root(result)
+    torso_upr = result["model"].find_node("torsoUpr_g")
+    assert torso_upr is not None and torso_upr.parent is not None
+    torso_upr.parent.children.remove(torso_upr)
+    torso_upr.parent = result["model"].root_node
+    result["model"].root_node.children.append(torso_upr)
+
+    preflight = preflight_character_mdl_export(
+        result["model"],
+        native_snapshot=result["native_skeleton_snapshot"],
+        options=CharacterExportPreflightOptions(recommended_socket_categories=()),
+    )
+
+    assert "character.export.node_path_changed" in _codes(preflight)
+    assert preflight.report.has_blocking is True
 
 
 def test_character_export_preflight_detects_exact_node_case_changes() -> None:
@@ -2629,9 +2724,9 @@ class _FakeCharacterWriter:
         path.with_suffix(".mdx").write_bytes(b"mdx")
 
 
-def test_character_export_transaction_stages_verifies_and_writes_reports(tmp_path) -> None:
+def test_character_export_transaction_stages_verifies_and_writes_reports(tmp_path, monkeypatch) -> None:
     _FakeCharacterWriter.calls = []
-    result = _rigged_character()
+    result = _fallback_weight_rigged_character(monkeypatch)
     result["model"].metadata["kotor_fit_report"] = _valid_fit_report()
     result["model"].metadata["kotor_normalization"] = {
         "fit_policy": "bone_landmark_basis",
@@ -2797,7 +2892,9 @@ def test_character_export_transaction_stages_verifies_and_writes_reports(tmp_pat
     assert reload_payload["details"]["payloads"][0]["vertices"] == 3
     assert reload_payload["details"]["payloads"][0]["skin_rows"] == 3
     reload_summary = reload_issues["character.export.reload_verified"]["details"]["reloaded_model"]
-    assert reload_summary["model_name"] == "grbody"
+    # The selected native KOTOR DAG owns the exported model identity; the
+    # imported model name remains recorded separately as payload provenance.
+    assert reload_summary["model_name"] == "PMBAM"
     assert reload_summary["supermodel"] == "S_KPMF0200"
     assert reload_summary["node_count"] >= result["native_skeleton_snapshot"].node_count
     assert reload_summary["skin_node_count"] >= 1
@@ -2814,7 +2911,7 @@ def test_character_export_transaction_stages_verifies_and_writes_reports(tmp_pat
     assert "Rig state: native_template_final" in text
     assert "Auto-fit policy: bone_landmark_basis" in text
     assert "Animation library: 267 clip(s)" in text
-    assert "reloaded_model={model_name: grbody" in text
+    assert "reloaded_model={model_name: PMBAM" in text
     assert "Manual in-game checklist" in text
     assert "12. Loading in both KOTOR 1 and KOTOR 2" in text
 
@@ -2882,6 +2979,32 @@ def test_character_export_transaction_reload_verifies_without_workflow_markers(t
     assert "character.export.reload_verified" in {
         issue.code for issue in tx.export_job_result.validation_report.issues
     }
+
+
+def test_character_export_transaction_reload_verifies_resource_root_identity(tmp_path) -> None:
+    _FakeCharacterWriter.calls = []
+    result = _rigged_character()
+    _rename_character_resource_root(result)
+    reloaded_model = copy.deepcopy(result["model"])
+    reloaded_model.metadata.pop(CHARACTER_BUILDER_ROOT_IDENTITY_KEY, None)
+    output = tmp_path / "grbody01.mdl"
+
+    tx = export_character_mdl_mdx_transaction(
+        CharacterBuilderExportTransactionRequest(
+            model=result["model"],
+            output_mdl_path=output,
+            native_snapshot=result["native_skeleton_snapshot"],
+            writer_cls=_FakeCharacterWriter,
+            loader=lambda _mdl, _mdx: reloaded_model,
+        )
+    )
+
+    assert tx.succeeded is True
+    assert output.exists()
+    assert output.with_suffix(".mdx").exists()
+    codes = {issue.code for issue in tx.export_job_result.validation_report.issues}
+    assert "character.export.reload_native_dag_verified" in codes
+    assert "character.export.reload_verified" in codes
 
 
 def test_character_export_transaction_blocks_reloaded_native_dag_loss(tmp_path) -> None:

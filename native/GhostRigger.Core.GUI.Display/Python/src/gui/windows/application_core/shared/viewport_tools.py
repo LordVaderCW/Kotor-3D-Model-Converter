@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import math
+import os
 from pathlib import Path
+import re
+from types import SimpleNamespace
 from typing import Optional
 
 try:
@@ -14,6 +19,7 @@ except ImportError as exc:  # pragma: no cover - import gate for Qt runtime
 from src.gui.qt_lib.dialogs.qt_lightmap_baker_dialog import QtLightmapBakerDialog
 from src.gui.qt_lib.dialogs.qt_render_frame_dialog import QtRenderFrameDialog
 from src.gui.viewports.viewport_core.widget_scaffold import create_custom_viewport_widget
+from src.core.rendering.viewport_navigation import DEFAULT_VIEWPORT_NAVIGATION_PROFILE
 from src.systems.bas.model_recipe import BAS_SLOT_ORDER
 
 log = logging.getLogger(__name__)
@@ -163,7 +169,11 @@ class ViewportToolsMixin:
         default_game = str(self.settings_data.get("default_game") or "K1").upper()
         return GameVersion.K2 if default_game == "K2" else GameVersion.K1
     def _get_tex_cache_for_export(self):
-        return None
+        viewport = getattr(self, "viewport", None)
+        if viewport is None:
+            return None
+        tex_cache = getattr(viewport, "tex_cache", None)
+        return tex_cache() if callable(tex_cache) else tex_cache
     def _open_lightmap_baker(self) -> None:
         if self._current_model is None:
             QtWidgets.QMessageBox.information(self, "Lightmap Baker", "Load a model or module before baking lightmaps.")
@@ -558,6 +568,214 @@ class ViewportToolsMixin:
             "resources": self._ipc_resource_state_snapshot() if hasattr(self, "_ipc_resource_state_snapshot") else {},
             "docks": dock_visibility,
         }
+    def _ipc_spatial_snapshot(self, payload: object = None) -> dict:
+        """Return semantic scene truth plus the currently observed viewport."""
+
+        from src.core.scene.spatial_snapshot import build_scene_spatial_snapshot
+        from src.math.gpu_math import _mat4_lookat, _mat4_perspective
+
+        options = dict(payload) if isinstance(payload, dict) else {}
+        scene_manager = getattr(self, "scene_manager", None)
+        scene = getattr(scene_manager, "active_scene", None)
+        if scene is None:
+            scene = SimpleNamespace(
+                id="ghoststudio-empty-scene",
+                units={"system_unit": "cm", "display_unit": "cm"},
+                objects=[],
+            )
+
+        viewport_widget = getattr(self, "viewport", None)
+        canvas = getattr(viewport_widget, "canvas", None)
+        camera = getattr(viewport_widget, "camera", None)
+        viewport_payload = None
+        if canvas is not None and camera is not None:
+            width = max(1, int(canvas.width()))
+            height = max(1, int(canvas.height()))
+            eye = tuple(float(v) for v in camera.eye()[:3])
+            target = tuple(float(v) for v in tuple(camera.target)[:3])
+            near_clip = max(
+                0.001,
+                float(getattr(camera, "_near", 0.01) or 0.01),
+            )
+            far_clip = max(
+                near_clip + 1.0,
+                float(getattr(camera, "_far", 1000.0) or 1000.0),
+            )
+            field_of_view = max(
+                0.01,
+                min(179.0, float(getattr(camera, "fov", 45.0) or 45.0)),
+            )
+            view_matrix = _mat4_lookat(
+                eye,
+                target,
+                (0.0, 0.0, 1.0),
+            )
+            projection_matrix = _mat4_perspective(
+                math.radians(field_of_view),
+                float(width) / float(height),
+                near_clip,
+                far_clip,
+            )
+            camera_manager = getattr(viewport_widget, "camera_manager", None)
+            active_camera = (
+                camera_manager.get_active_camera()
+                if camera_manager is not None
+                and callable(getattr(camera_manager, "get_active_camera", None))
+                else None
+            )
+            viewport_payload = {
+                "id": "ghoststudio-main-viewport",
+                "rectangle": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "width": float(width),
+                    "height": float(height),
+                },
+                "pixelOrigin": "top-left",
+                "devicePixelRatio": float(canvas.devicePixelRatioF()),
+                "cameraStableId": (
+                    str(getattr(active_camera, "id", "") or "") or None
+                ),
+                # The current "ortho" UI deliberately simulates orthographic
+                # viewing by narrowing a perspective FOV. Report the matrix
+                # that is actually used rather than upgrading UI intent to fact.
+                "projection": "perspective",
+                "viewMatrix": view_matrix.tolist(),
+                "projectionMatrix": projection_matrix.tolist(),
+                "nearClip": near_clip,
+                "farClip": far_clip,
+            }
+
+        settings = getattr(viewport_widget, "measurement_settings", None)
+        grid_payload = None
+        if settings is not None:
+            minor_spacing = max(
+                1e-6,
+                float(getattr(settings, "minor_grid_spacing", 10.0) or 10.0),
+            )
+            major_spacing = max(
+                minor_spacing,
+                float(getattr(settings, "major_grid_spacing", 100.0) or 100.0),
+            )
+            display_options = getattr(viewport_widget, "display_options", None)
+            grid_payload = {
+                "origin": [0.0, 0.0, 0.0],
+                "spacing": [
+                    minor_spacing,
+                    minor_spacing,
+                    minor_spacing,
+                ],
+                "subdivisions": max(1, int(round(major_spacing / minor_spacing))),
+                "visible": bool(
+                    getattr(display_options, "show_grid", True)
+                ),
+                "snapEnabled": bool(
+                    getattr(settings, "snap_enabled", False)
+                ),
+            }
+
+        snapshot = build_scene_spatial_snapshot(
+            scene,
+            application_version="2.8",
+            viewport=viewport_payload,
+            grid=grid_payload,
+        )
+        if bool(getattr(viewport_widget, "_ortho_mode", False)):
+            snapshot["evidence"].append({
+                "kind": "semantic-api",
+                "claim": (
+                    "The viewport UI reports orthographic mode, but the active "
+                    "renderer uses a narrowed perspective projection."
+                ),
+                "epistemicStatus": "observed",
+                "confidence": 1.0,
+            })
+        if options.get("includeSelection") is False:
+            snapshot["selection"] = {"mode": "object", "stableIds": []}
+        if options.get("includeBounds") is False:
+            for entity in snapshot["entities"]:
+                entity.pop("bounds", None)
+        return snapshot
+    def _ipc_capture_spatial_evidence(self, payload: object = None) -> dict:
+        """Capture one PNG and bind it to exact semantic/viewport revisions."""
+
+        from src.ipc.spatial_auth import (
+            prepare_private_spatial_directory,
+            write_private_spatial_artifact,
+        )
+
+        data = dict(payload) if isinstance(payload, dict) else {}
+        capture_id = str(data.get("captureId") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", capture_id):
+            raise ValueError("captureId must be a 16-128 character safe token")
+        snapshot = self._ipc_spatial_snapshot({})
+        root_text = str(
+            os.environ.get("GHOSTSTUDIO_SPATIAL_CAPTURE_ROOT")
+            or (
+                Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+                / "GhostMCPStudio"
+                / "captures"
+            )
+        )
+        capture_root = prepare_private_spatial_directory(
+            Path(root_text).expanduser()
+        )
+        target = capture_root / f"{capture_id}.png"
+        if target.parent != capture_root:
+            raise ValueError("captureId resolved outside the private capture root")
+
+        viewport_widget = getattr(self, "viewport", None)
+        canvas = getattr(viewport_widget, "canvas", None)
+        if canvas is None:
+            raise RuntimeError("Ghost Studio viewport is unavailable")
+        pixmap = canvas.grab()
+        byte_array = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(byte_array)
+        if not buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly):
+            raise RuntimeError("Could not open the in-memory PNG buffer")
+        try:
+            if not pixmap.save(buffer, "PNG"):
+                raise RuntimeError("Ghost Studio viewport PNG encoding failed")
+        finally:
+            buffer.close()
+        png_bytes = bytes(byte_array)
+        write_private_spatial_artifact(target, png_bytes)
+
+        viewport_rows = snapshot.get("viewports") or []
+        viewport_revision = (
+            str(viewport_rows[0].get("revision") or "")
+            if viewport_rows
+            else None
+        )
+        capture = {
+            "path": str(target),
+            "sha256": hashlib.sha256(png_bytes).hexdigest(),
+            "width": int(pixmap.width()),
+            "height": int(pixmap.height()),
+            "sceneRevision": snapshot["sceneRevision"],
+            "viewportRevision": viewport_revision,
+        }
+        snapshot["capture"] = dict(capture)
+        snapshot["evidence"].append({
+            "kind": "screenshot",
+            "claim": (
+                "The PNG records the visible viewport at the attached scene "
+                "and viewport revisions; it does not by itself prove a GUI action."
+            ),
+            "epistemicStatus": "observed",
+            "confidence": 1.0,
+            "sourcePath": str(target),
+            "sourceSha256": capture["sha256"],
+        })
+        return {
+            "schema": "ghoststudio-spatial-capture/v1",
+            "capture": capture,
+            "snapshot": snapshot,
+        }
+    def _ipc_spatial_evidence_gaps(self, _payload: object = None) -> dict:
+        from src.core.scene.spatial_snapshot import spatial_evidence_gaps
+
+        return spatial_evidence_gaps(self._ipc_spatial_snapshot({}))
     def _clear_model(self):
         if not self._prompt_save_dirty_scene():
             return
@@ -812,6 +1030,118 @@ class ViewportToolsMixin:
         window.show()
         window.raise_()
         window.activateWindow()
+    def _open_placeable_builder_window(self):
+        """Lazily open the dedicated reusable-placeable authoring workbench."""
+
+        window = getattr(self, "placeable_builder_window", None)
+        app_root = Path(getattr(self, "app_root", Path.cwd()))
+        library_root = app_root / "Saved" / "PlaceableLibrary"
+        manager = getattr(self, "_resource_manager", None)
+        if manager is None:
+            get_manager = getattr(self, "_get_resource_manager", None)
+            if callable(get_manager):
+                try:
+                    manager = get_manager()
+                except Exception:
+                    manager = None
+        provider = None
+        if manager is not None:
+            try:
+                from src.core.resources.game_resource_provider import ResourceManagerGameResourceProvider
+
+                provider = ResourceManagerGameResourceProvider(manager)
+            except Exception:
+                provider = None
+        if window is None:
+            from src.gui.qt_lib.windows.qt_placeable_builder import QtPlaceableBuilderWindow
+            from src.gui.qt_lib.windows.qt_placeable_builder_controller import QtPlaceableBuilderController
+
+            window = QtPlaceableBuilderWindow(self)
+            self.placeable_builder_window = window
+            controller = QtPlaceableBuilderController(
+                window,
+                library_root=library_root,
+                provider=provider,
+                resource_manager=manager,
+                parent=window,
+            )
+            self.placeable_builder_controller = controller
+            window.libraryChanged.connect(self._on_placeable_library_changed)
+        else:
+            controller = getattr(self, "placeable_builder_controller", None)
+            if controller is not None:
+                controller.set_library_root(library_root)
+                controller.set_provider(provider, resource_manager=manager)
+            else:
+                window.set_library_root(library_root)
+        set_renderer_settings = getattr(window, "set_renderer_settings", None)
+        if callable(set_renderer_settings):
+            set_renderer_settings(getattr(self, "settings_data", {}) or {})
+        set_navigation_profile = getattr(window, "set_navigation_profile", None)
+        if callable(set_navigation_profile):
+            profile = (getattr(self, "settings_data", {}) or {}).get(
+                "viewport_navigation_profile", DEFAULT_VIEWPORT_NAVIGATION_PROFILE
+            )
+            set_navigation_profile(profile)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _open_particle_editor_window(self):
+        """Lazily open the emitter particle editing workspace."""
+
+        window = getattr(self, "particle_editor_window", None)
+        manager = getattr(self, "_resource_manager", None)
+        if manager is None:
+            get_manager = getattr(self, "_get_resource_manager", None)
+            if callable(get_manager):
+                try:
+                    manager = get_manager()
+                except Exception:
+                    manager = None
+        if window is None:
+            from src.gui.qt_lib.windows.qt_particle_editor import QtParticleEditorWindow
+
+            window = QtParticleEditorWindow(
+                self,
+                resource_manager=manager,
+                settings_data=getattr(self, "settings_data", {}) or {},
+                app_root=Path(getattr(self, "app_root", Path.cwd())),
+            )
+            self.particle_editor_window = window
+            theme_manager = getattr(self, "theme_manager", None)
+            current_theme = getattr(theme_manager, "current_theme", None)
+            if current_theme is not None:
+                try:
+                    window.apply_ghost_theme(current_theme)
+                except Exception:
+                    pass
+        elif manager is not None:
+            window.set_resource_manager(manager)
+        set_renderer_settings = getattr(window, "set_renderer_settings", None)
+        if callable(set_renderer_settings):
+            set_renderer_settings(getattr(self, "settings_data", {}) or {})
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _on_placeable_library_changed(self, root: str) -> None:
+        """Refresh both the workbench and any open Map Studio after a save."""
+
+        controller = getattr(self, "placeable_builder_controller", None)
+        if controller is not None:
+            controller.refresh_library()
+        map_window = getattr(self, "module_editor_window", None)
+        if map_window is not None:
+            set_root = getattr(map_window, "set_placeable_library_root", None)
+            if callable(set_root):
+                set_root(root)
+            refresh = getattr(map_window, "refresh_placeable_library", None)
+            if callable(refresh):
+                refresh()
+        log = getattr(self, "_log", None)
+        if callable(log):
+            log("Placeable Library refreshed in Placeable Builder and Map Studio.", "success")
     def _quick_autorig(self):
         model = self._require_model("Auto-Rig")
         if model is None:

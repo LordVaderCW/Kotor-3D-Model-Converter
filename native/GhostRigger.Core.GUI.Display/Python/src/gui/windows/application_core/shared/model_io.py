@@ -13,12 +13,498 @@ except ImportError as exc:  # pragma: no cover - import gate for Qt runtime
     raise RuntimeError("PySide6 is required for the Qt shell") from exc
 
 from src.gui.qt_lib.dialogs.qt_settings_dialog import save_settings
+from src.gui.dialogs.error_report import report_from_exception, show_error_report, show_exception
+from src.gui.windows.application_core.application_core_lib.shared.workers import BackgroundIOWorker
 
 log = logging.getLogger(__name__)
+
+FBX_EXPORT_FILTERS = (
+    "Standard FBX (*.fbx);;"
+    "Unity-Compatible FBX (*.fbx);;"
+    "Unreal Engine-Compatible FBX (*.fbx);;"
+    "3ds Max-Compatible FBX (*.fbx);;"
+    "All files (*.*)"
+)
+
+
+def _fbx_compatibility_profile_from_filter(selected_filter: str) -> str:
+    label = str(selected_filter or "").strip().lower()
+    if "unity" in label:
+        return "unity"
+    if "unreal" in label:
+        return "unreal"
+    if "3ds max" in label or "3dsmax" in label:
+        return "3ds_max"
+    return "standard"
+
+
+# ---------------------------------------------------------------------------
+# Plain "work" functions that perform the actual blocking I/O.
+#
+# These intentionally take only primitive / picklable-ish arguments (paths,
+# model objects, resolved config dicts) and never touch ``self`` or any Qt
+# object, so they are safe to run on a background ``QThread`` via
+# :class:`BackgroundIOWorker`. Each may declare the optional ``progress_callback``
+# and ``is_cancelled`` keyword hooks; the worker injects them automatically.
+# ---------------------------------------------------------------------------
+
+
+def _work_import_obj(path: str, *, game_version, progress_callback=None, is_cancelled=None):
+    from src.converters.mesh_converter import OBJImporter
+
+    if progress_callback:
+        progress_callback("Reading OBJ file\u2026", 20)
+    model = OBJImporter().import_file(path, game_version=game_version)
+    if progress_callback:
+        progress_callback("Finalizing OBJ mesh\u2026", 90)
+    return model
+
+
+def _work_import_gltf(path: str, *, game_version, progress_callback=None, is_cancelled=None):
+    from src.converters.mesh_converter import GLTFImporter
+
+    if progress_callback:
+        progress_callback("Reading GLB/GLTF file\u2026", 20)
+    model = GLTFImporter().import_file(path, game_version=game_version)
+    if model is None:
+        raise RuntimeError("GLTF import failed. Install pygltflib or trimesh.")
+    if progress_callback:
+        progress_callback("Finalizing GLB/GLTF mesh\u2026", 90)
+    return model
+
+
+def _work_import_fbx_sdk(path: str, *, game_version, fbx_sdk_settings, progress_callback=None, is_cancelled=None):
+    from src.io.fbx.fbx_importer import import_fbx
+
+    if progress_callback:
+        progress_callback("Importing FBX via Autodesk SDK\u2026", 30)
+    return import_fbx(path, {"game_version": game_version, "fbx_sdk": fbx_sdk_settings})
+
+
+def _work_import_fbx_blender(path: str, *, game_version, progress_callback=None, is_cancelled=None):
+    from src.converters.mesh_converter import FBXImporter
+
+    if progress_callback:
+        progress_callback("Importing FBX via Blender bridge\u2026", 30)
+    return FBXImporter().import_file(path, game_version=game_version)
+
+
+def _work_export_obj(model, path: str, *, tex_cache, progress_callback=None, is_cancelled=None):
+    from src.converters.mesh_converter import OBJExporter, _export_rigging_data
+    from pathlib import Path as _Path
+
+    if progress_callback:
+        progress_callback("Writing OBJ geometry…", 15)
+    # Phase 1: geometry only (fast)
+    OBJExporter().export(model, path, tex_cache=tex_cache, export_rigging=False)
+
+    if progress_callback:
+        progress_callback("Exporting skeleton and skin weights…", 50)
+    # Phase 2: rigging data (potentially slow — animations)
+    out_dir = _Path(path).parent
+    try:
+        rig_count = _export_rigging_data(model, out_dir)
+    except Exception:
+        rig_count = 0
+
+    if progress_callback:
+        progress_callback("OBJ export complete", 100)
+    return path
+
+
+def _work_export_gltf(model, path: str, *, tex_cache, progress_callback=None, is_cancelled=None):
+    from src.converters.mesh_converter import GLTFExporter
+
+    binary = path.lower().endswith(".glb")
+    if progress_callback:
+        progress_callback("Writing GLB/GLTF file\u2026", 40)
+    ok = GLTFExporter().export(model, path, binary=binary, tex_cache=tex_cache, export_rigging=True)
+    if not ok:
+        raise RuntimeError("GLTF export failed. Install pygltflib or check the log.")
+    if progress_callback:
+        progress_callback("GLB/GLTF export complete", 100)
+    return path
+
+
+def _work_export_mdl_binary(model, path: str, *, game_version, progress_callback=None, is_cancelled=None):
+    from src.core.mdl.mdl_writer import MDLBinaryWriter
+    from src.core.geometry.model_data import GameVersion
+
+    mdl = copy.deepcopy(model)
+    mdl.game_version = GameVersion.K2 if game_version == "K2" else GameVersion.K1
+    mdx_path = str(Path(path).with_suffix(".mdx"))
+    if progress_callback:
+        progress_callback("Writing binary MDL/MDX\u2026", 50)
+    mdl_bytes, mdx_bytes = MDLBinaryWriter().write(mdl)
+    Path(path).write_bytes(mdl_bytes)
+    Path(mdx_path).write_bytes(mdx_bytes)
+    if progress_callback:
+        progress_callback("Binary MDL export complete", 100)
+    return path, mdx_path
+
+
+def _work_export_fbx(
+    model,
+    path: str,
+    *,
+    tex_cache=None,
+    base_skeleton_model=None,
+    compatibility_profile="standard",
+    selected_animation_names=None,
+    animation_resource_manager=None,
+    animation_game="",
+    supplemental_animation_models=(),
+    progress_callback=None,
+    is_cancelled=None,
+):
+    from src.converters.mesh_converter import FBXExporter
+
+    try:
+        has_bas_layers = any(
+            bool(getattr(node, "_gr_bas_attachment_layer", False))
+            for node in model.all_nodes()
+        )
+    except Exception:
+        has_bas_layers = False
+    if has_bas_layers:
+        from src.systems.bas.preview_composer import prepare_bas_composed_export_model
+
+        model, _report = prepare_bas_composed_export_model(
+            model,
+            require_unique_body_names=True,
+        )
+
+    # Animation inheritance is a workflow concern, not an FBX writer concern.
+    # Materialize the exact selected local/head/supermodel takes before the IO
+    # layer serializes ``model.animations``.  ``None`` preserves the legacy
+    # local-list behavior; an empty tuple deliberately exports mesh + rig only.
+    if selected_animation_names is not None:
+        if progress_callback:
+            progress_callback("Resolving selected animation sets\u2026", 20)
+        from src.core.animation.fbx_animation_selection import (
+            prepare_fbx_animation_export_model,
+        )
+
+        model = prepare_fbx_animation_export_model(
+            model,
+            tuple(selected_animation_names),
+            game=animation_game,
+            resource_manager=animation_resource_manager,
+            base_skeleton_model=base_skeleton_model,
+            supplemental_models=tuple(supplemental_animation_models or ()),
+            require_all=True,
+        )
+
+    if progress_callback:
+        progress_callback("Writing FBX geometry and rigging\u2026", 40)
+    ok = FBXExporter().export(
+        model,
+        path,
+        tex_cache=tex_cache,
+        export_rigging=True,
+        base_skeleton_model=base_skeleton_model,
+        compatibility_profile=compatibility_profile,
+    )
+    if not ok:
+        raise RuntimeError("FBX export failed. Check the export log for details.")
+    if progress_callback:
+        progress_callback("FBX export complete", 100)
+    return path
+
+
+def _work_run_mdlops(cmd, cwd, *, progress_callback=None, is_cancelled=None):
+    if progress_callback:
+        progress_callback("Running MDLOps\u2026", 30)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(cwd))
+
+
+class _IoGuiCallbackBridge(QtCore.QObject):
+    """Receive background I/O signals on the GUI thread."""
+
+    def __init__(
+        self,
+        owner,
+        description: str,
+        worker: BackgroundIOWorker,
+        thread: QtCore.QThread,
+        progress_dialog: QtWidgets.QProgressDialog,
+        on_complete,
+        on_error,
+        error_category: str,
+    ):
+        super().__init__(owner)
+        self._owner = owner
+        self._description = description
+        self._worker = worker
+        self._thread = thread
+        self._progress_dialog = progress_dialog
+        self._on_complete = on_complete
+        self._on_error = on_error
+        self._error_category = error_category
+        self._done = False
+
+    def _cleanup(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        try:
+            self._progress_dialog.reset()
+            self._progress_dialog.close()
+            self._progress_dialog.deleteLater()
+        except RuntimeError:
+            pass
+        try:
+            self._worker.deleteLater()
+        except RuntimeError:
+            pass
+        try:
+            self._thread.quit()
+        except RuntimeError:
+            pass
+        self._owner._io_worker = None
+        self._owner._io_thread = None
+        self._owner._io_progress_dialog = None
+        self._owner._io_callback_bridge = None
+        self.deleteLater()
+
+    @QtCore.Slot(str, int)
+    def on_progress(self, message, percent):
+        try:
+            self._progress_dialog.setLabelText(message or self._description)
+            self._progress_dialog.setValue(max(0, min(100, int(percent))))
+        except RuntimeError:
+            pass
+
+    @QtCore.Slot(object)
+    def on_finished(self, result):
+        cancelled = self._worker.is_cancelled()
+        self._cleanup()
+        try:
+            if self._on_complete is not None:
+                self._on_complete(result, cancelled=cancelled)
+        except Exception as exc:  # noqa: BLE001 - post-processing must not crash UI
+            log.error("Post-processing error after %s", self._description, exc_info=True)
+            show_exception(self._owner, "io_error", exc, context=f"Finishing {self._description}")
+
+    @QtCore.Slot(str, str, object)
+    def on_error(self, message, tb, exc):
+        self._cleanup()
+        self._owner._log(f"{self._description} failed:\n{tb}", "error")
+        handled = False
+        if self._on_error is not None:
+            try:
+                handled = bool(self._on_error(exc))
+            except Exception:  # noqa: BLE001 - error handler must not crash UI
+                log.error("on_error handler failed", exc_info=True)
+        if not handled:
+            show_exception(self._owner, self._error_category, exc, context=self._description)
+
+    @QtCore.Slot()
+    def on_canceled(self):
+        try:
+            QtCore.QMetaObject.invokeMethod(
+                self._worker,
+                "request_cancel",
+                QtCore.Qt.QueuedConnection,
+            )
+        except RuntimeError:
+            pass
 
 
 class ModelIoMixin:
     """Model import, export, FBX SDK, MDLOps, and module-file command helpers."""
+
+    def _fbx_resource_context_for_export(self, model):
+        """Return the headless resource manager and strict K1/K2 game tag."""
+        manager = None
+        get_manager = getattr(self, "_get_resource_manager", None)
+        if callable(get_manager):
+            try:
+                manager = get_manager()
+            except Exception:
+                log.debug("Could not obtain the resource manager for FBX export", exc_info=True)
+        if manager is None:
+            manager = getattr(self, "_resource_manager", None) or getattr(self, "resource_manager", None)
+        game = str(
+            getattr(self, "_current_game", "")
+            or (self._infer_game_from_model(model) if hasattr(self, "_infer_game_from_model") else "")
+            or "K1"
+        ).upper()
+        return manager, game
+
+    def _fbx_base_skeleton_for_export(self, model):
+        """Resolve the model's supermodel for complete FBX bind matrices."""
+        supermodel = str(getattr(model, "supermodel", "") or "").strip()
+        if not supermodel or supermodel.lower() in {"null", "none", "****"}:
+            return None
+        manager, game = self._fbx_resource_context_for_export(model)
+        if manager is None:
+            return None
+        try:
+            # The Animation Browser commonly resolved this same supermodel
+            # while populating its inherited catalog. Reuse that strict-game
+            # cache instead of reparsing a large model immediately before the
+            # FBX selector opens. A cold lookup still uses the manager's strict
+            # loader through SuperModelResolver.
+            from src.core.animation.animation_engine import SuperModelResolver
+
+            SuperModelResolver.configure(manager)
+            return SuperModelResolver.load_supermodel(supermodel, game)
+        except Exception:
+            log.warning("Could not resolve FBX base skeleton %s (%s)", supermodel, game, exc_info=True)
+            return None
+
+    def _fbx_supplemental_animation_models(self, model):
+        """Return attached source models whose facial/accessory tracks are usable."""
+        result = []
+        seen = set()
+        try:
+            nodes = model.all_nodes()
+        except Exception:
+            nodes = []
+        for node in nodes:
+            source = getattr(node, "_gr_bas_attachment_source_model_ref", None)
+            if source is None or id(source) in seen:
+                continue
+            seen.add(id(source))
+            result.append(source)
+        return tuple(result)
+
+    def _choose_fbx_animation_sets(
+        self,
+        model,
+        compatibility_profile: str,
+        *,
+        base_skeleton_model=None,
+        supplemental_models=(),
+    ):
+        """Show the shared take selector; return tuple, or ``None`` on cancel."""
+        manager, game = self._fbx_resource_context_for_export(model)
+        try:
+            from src.core.animation.fbx_animation_selection import list_fbx_animation_sets
+            from src.gui.qt_lib.dialogs.qt_fbx_animation_selection_dialog import (
+                QtFbxAnimationSelectionDialog,
+            )
+
+            rows = list_fbx_animation_sets(
+                model,
+                game=game,
+                resource_manager=manager,
+                base_skeleton_model=base_skeleton_model,
+                supplemental_models=tuple(supplemental_models or ()),
+            )
+        except Exception as exc:
+            log.exception("Could not enumerate FBX animation sets")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Export FBX",
+                f"Animation sets could not be enumerated:\n{exc}",
+            )
+            return None
+
+        initial = [
+            str(getattr(anim, "name", "") or "")
+            for anim in list(getattr(model, "animations", []) or [])
+            if str(getattr(anim, "name", "") or "")
+        ]
+        current_name = ""
+        panel = getattr(self, "animations_panel", None)
+        selected_getter = getattr(panel, "selected_animation", None)
+        if callable(selected_getter):
+            try:
+                current_name = str(selected_getter() or "")
+            except Exception:
+                current_name = ""
+        if current_name and current_name.lower() not in {name.lower() for name in initial}:
+            initial.append(current_name)
+
+        dialog = QtFbxAnimationSelectionDialog(
+            rows,
+            self,
+            profile=compatibility_profile,
+            initial_selected_names=tuple(initial),
+            current_animation_name=current_name,
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        return tuple(dialog.selected_animation_names())
+
+    # ------------------------------------------------------------------
+    # Async I/O routing helpers
+    # ------------------------------------------------------------------
+
+    def _io_worker_is_running(self) -> bool:
+        thread = getattr(self, "_io_thread", None)
+        if thread is None:
+            return False
+        try:
+            return thread.isRunning()
+        except RuntimeError:
+            self._io_thread = None
+            self._io_worker = None
+            return False
+
+    def _run_io_async(
+        self,
+        description: str,
+        fn,
+        *args,
+        on_complete=None,
+        on_error=None,
+        error_category: str = "io_error",
+        **kwargs,
+    ):
+        """Run a blocking callable on a background ``QThread``.
+
+        Shows a window-modal :class:`QProgressDialog` (with a Cancel button)
+        while the work runs off the GUI thread. ``on_complete(result,
+        cancelled=False)`` and ``on_error(exc) -> bool`` callbacks run on the GUI
+        thread. If ``on_error`` returns True the failure is considered handled
+        and no generic :class:`ErrorReport` dialog is shown.
+
+        Returns the :class:`BackgroundIOWorker`, or ``None`` if another
+        background I/O job is already running.
+        """
+
+        if self._io_worker_is_running():
+            self._log("Another background operation is already running.", "warning")
+            return None
+
+        worker = BackgroundIOWorker(fn, args=args, kwargs=kwargs)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        self._io_worker = worker
+        self._io_thread = thread
+
+        progress_dialog = QtWidgets.QProgressDialog(description, "Cancel", 0, 100, self)
+        progress_dialog.setWindowTitle(description)
+        progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setAutoClose(True)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.setValue(0)
+        progress_dialog.setMinimumWidth(360)
+        self._io_progress_dialog = progress_dialog
+        bridge = _IoGuiCallbackBridge(
+            self,
+            description,
+            worker,
+            thread,
+            progress_dialog,
+            on_complete,
+            on_error,
+            error_category,
+        )
+        self._io_callback_bridge = bridge
+
+        thread.started.connect(worker.run)
+        thread.finished.connect(thread.deleteLater)
+        worker.progress.connect(bridge.on_progress, QtCore.Qt.QueuedConnection)
+        worker.error.connect(bridge.on_error, QtCore.Qt.QueuedConnection)
+        worker.finished.connect(bridge.on_finished, QtCore.Qt.QueuedConnection)
+        progress_dialog.canceled.connect(bridge.on_canceled)
+        thread.start()
+        return worker
 
     def _import_obj(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -30,16 +516,24 @@ class ModelIoMixin:
         if path:
             self._import_obj_from_path(path)
     def _import_obj_from_path(self, path: str):
-        try:
-            from src.converters.mesh_converter import OBJImporter
+        game_version = self._game_version()
 
-            model = OBJImporter().import_file(path, game_version=self._game_version())
+        def _on_complete(model, cancelled=False):
+            if cancelled or model is None:
+                return
             self._texture_dir = str(Path(path).parent)
             self._set_model_internal(model, path)
             self._log(f"Imported OBJ: {Path(path).name}", "success")
-        except Exception as exc:
-            self._log(f"OBJ import error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "OBJ Import Error", str(exc))
+
+        self._run_io_async(
+            f"Importing OBJ \u2014 {Path(path).name}",
+            _work_import_obj,
+            path,
+            game_version=game_version,
+            on_complete=_on_complete,
+            error_category="import_error",
+        )
+
     def _import_fbx(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
@@ -52,18 +546,33 @@ class ModelIoMixin:
         backend = self._choose_fbx_import_backend(path)
         if backend is None:
             return
-        try:
-            model = self._import_fbx_model(path, backend=backend)
-            if model is None:
+
+        def _on_complete(model, cancelled=False):
+            if cancelled or model is None:
                 return
             self._texture_dir = str(Path(path).parent)
             self._set_model_internal(model, path)
             summary = getattr(model, "fbx_import_summary", None)
             suffix = f" ({summary.log_line()})" if summary is not None else ""
             self._log(f"Imported FBX: {Path(path).name}{suffix}", "success")
-        except Exception as exc:
-            self._log(f"FBX import error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "FBX Import Error", str(exc))
+
+        def _on_error(exc):
+            try:
+                from src.io.fbx.fbx_importer import FbxSdkUnavailableError
+            except Exception:
+                return False
+            if isinstance(exc, FbxSdkUnavailableError):
+                self._show_missing_fbx_sdk_dialog(str(exc))
+                return True
+            return False
+
+        self._import_fbx_model(
+            path,
+            backend=backend,
+            on_complete=_on_complete,
+            on_error=_on_error,
+        )
+
     def _auto_detect_fbx_import_backend(self, path: str) -> tuple[str | None, str]:
         """Choose the best FBX import backend before import begins."""
 
@@ -118,28 +627,65 @@ class ModelIoMixin:
         if clicked is blender_btn:
             return "blender"
         return None
-    def _import_fbx_model(self, path: str, *, backend: str):
-        """Import FBX through the explicitly selected backend."""
+    def _import_fbx_model(self, path: str, *, backend: str, on_complete=None, on_error=None):
+        """Import FBX through the explicitly selected backend.
+
+        When ``on_complete`` is provided the import runs asynchronously on a
+        background thread via :meth:`_run_io_async`; ``on_complete(model,
+        cancelled=False)`` is invoked on the GUI thread. When ``on_complete`` is
+        ``None`` (the synchronous fallback) the model is returned directly with a
+        wait cursor shown, preserving backward compatibility.
+        """
 
         fbx_settings = self.settings_data.get("fbx_sdk") or {}
+        game_version = self._game_version()
+
         if backend == "autodesk_sdk":
             if not self._ensure_fbx_sdk_available_for_action("Import FBX"):
+                if on_complete is not None:
+                    on_complete(None, cancelled=False)
                 return None
             self._configure_fbx_sdk_paths(refresh=True)
-            from src.io.fbx.fbx_importer import FbxSdkUnavailableError, import_fbx
+            work = _work_import_fbx_sdk
+            work_kwargs = {"game_version": game_version, "fbx_sdk_settings": fbx_settings}
+        elif backend == "blender":
+            work = _work_import_fbx_blender
+            work_kwargs = {"game_version": game_version}
+        else:
+            raise ValueError(f"Unknown FBX import backend: {backend}")
 
+        if on_complete is None:
+            # Synchronous fallback with a wait cursor.
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             try:
-                return import_fbx(path, {"game_version": self._game_version(), "fbx_sdk": fbx_settings})
-            except FbxSdkUnavailableError as exc:
-                self._show_missing_fbx_sdk_dialog(str(exc))
-                return None
+                try:
+                    return work(path, **work_kwargs)
+                except Exception as exc:
+                    if on_error is not None and on_error(exc):
+                        return None
+                    if backend == "autodesk_sdk":
+                        try:
+                            from src.io.fbx.fbx_importer import FbxSdkUnavailableError
+                        except Exception:
+                            FbxSdkUnavailableError = ()  # type: ignore
+                        if isinstance(exc, FbxSdkUnavailableError):
+                            self._show_missing_fbx_sdk_dialog(str(exc))
+                            return None
+                    raise
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
 
-        if backend == "blender":
-            from src.converters.mesh_converter import FBXImporter
-
-            return FBXImporter().import_file(path, game_version=self._game_version())
-
-        raise ValueError(f"Unknown FBX import backend: {backend}")
+        # Asynchronous path.
+        self._run_io_async(
+            f"Importing FBX \u2014 {Path(path).name}",
+            work,
+            path,
+            on_complete=on_complete,
+            on_error=on_error,
+            error_category="import_error",
+            **work_kwargs,
+        )
+        return None
     def _import_gltf(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
@@ -149,18 +695,23 @@ class ModelIoMixin:
         )
         if not path:
             return
-        try:
-            from src.converters.mesh_converter import GLTFImporter
+        game_version = self._game_version()
 
-            model = GLTFImporter().import_file(path, game_version=self._game_version())
-            if model is None:
-                raise RuntimeError("GLTF import failed. Install pygltflib or trimesh.")
+        def _on_complete(model, cancelled=False):
+            if cancelled or model is None:
+                return
             self._texture_dir = str(Path(path).parent)
             self._set_model_internal(model, path)
             self._log(f"Imported GLB/GLTF: {Path(path).name}", "success")
-        except Exception as exc:
-            self._log(f"GLTF import error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "GLTF Import Error", str(exc))
+
+        self._run_io_async(
+            f"Importing GLB/GLTF \u2014 {Path(path).name}",
+            _work_import_gltf,
+            path,
+            game_version=game_version,
+            on_complete=_on_complete,
+            error_category="import_error",
+        )
     def _save_ascii_mdl(self):
         model = self._require_model("Save ASCII MDL")
         if model is None:
@@ -186,7 +737,7 @@ class ModelIoMixin:
             self._log(f"Saved ASCII MDL ({chosen_gv}) -> {Path(path).name}", "success")
         except Exception as exc:
             self._log(f"Save error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Save Error", str(exc))
+            show_exception(self, "save_error", exc, context="Saving ASCII MDL")
     def _export_mdl_binary(self):
         model = self._require_model("Export Binary MDL")
         if model is None:
@@ -202,23 +753,25 @@ class ModelIoMixin:
         )
         if not path:
             return
-        try:
-            from src.core.mdl.mdl_writer import MDLBinaryWriter
-            from src.core.geometry.model_data import GameVersion
 
-            mdl = copy.deepcopy(model)
-            mdl.game_version = GameVersion.K2 if chosen_gv == "K2" else GameVersion.K1
-            mdx_path = str(Path(path).with_suffix(".mdx"))
-            mdl_bytes, mdx_bytes = MDLBinaryWriter().write(mdl)
-            Path(path).write_bytes(mdl_bytes)
-            Path(mdx_path).write_bytes(mdx_bytes)
+        def _on_complete(result, cancelled=False):
+            if cancelled or result is None:
+                return
+            _path, mdx_path = result
             self._log(
-                f"Exported binary MDL ({chosen_gv}) -> {Path(path).name} (+ {Path(mdx_path).name})",
+                f"Exported binary MDL ({chosen_gv}) -> {Path(_path).name} (+ {Path(mdx_path).name})",
                 "success",
             )
-        except Exception as exc:
-            self._log(f"Binary MDL export error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
+
+        self._run_io_async(
+            f"Exporting binary MDL \u2014 {Path(path).name}",
+            _work_export_mdl_binary,
+            model,
+            path,
+            game_version=chosen_gv,
+            on_complete=_on_complete,
+            error_category="export_error",
+        )
     def _export_obj(self):
         model = self._require_model("Export OBJ")
         if model is None:
@@ -231,53 +784,150 @@ class ModelIoMixin:
         )
         if not path:
             return
-        try:
-            from src.converters.mesh_converter import OBJExporter
+        tex_cache = self._get_tex_cache_for_export()
 
-            OBJExporter().export(model, path, tex_cache=self._get_tex_cache_for_export(), export_rigging=True)
-            self._log(f"Exported OBJ -> {Path(path).name}", "success")
-        except Exception as exc:
-            self._log(f"OBJ export error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
+        def _on_complete(result, cancelled=False):
+            if cancelled or result is None:
+                return
+            self._log(f"Exported OBJ -> {Path(result).name}", "success")
+
+        self._run_io_async(
+            f"Exporting OBJ \u2014 {Path(path).name}",
+            _work_export_obj,
+            model,
+            path,
+            tex_cache=tex_cache,
+            on_complete=_on_complete,
+            error_category="export_error",
+        )
     def _export_fbx(self):
-        if not self._ensure_fbx_sdk_available_for_action("Export FBX"):
-            return
         model = self._require_model("Export FBX")
         if model is None:
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export FBX",
             f"{getattr(model, 'name', 'model')}.fbx",
-            "FBX files (*.fbx);;All files (*.*)",
+            FBX_EXPORT_FILTERS,
         )
         if not path:
             return
-        try:
-            from src.io.fbx.fbx_exporter import FbxSdkUnavailableError, export_fbx
-
-            export_fbx(model, path, {"fbx_sdk": self.settings_data.get("fbx_sdk")})
-            self._log(f"Exported FBX -> {Path(path).name}", "success")
-        except FbxSdkUnavailableError as exc:
-            self._show_missing_fbx_sdk_dialog(str(exc))
-        except Exception as exc:
-            self._log(f"FBX export error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
-    def _export_selected_fbx(self):
-        if not self._ensure_fbx_sdk_available_for_action("Export Selected FBX"):
+        tex_cache = self._get_tex_cache_for_export()
+        compatibility_profile = _fbx_compatibility_profile_from_filter(selected_filter)
+        base_skeleton_model = self._fbx_base_skeleton_for_export(model)
+        supplemental_models = self._fbx_supplemental_animation_models(model)
+        selected_animation_names = self._choose_fbx_animation_sets(
+            model,
+            compatibility_profile,
+            base_skeleton_model=base_skeleton_model,
+            supplemental_models=supplemental_models,
+        )
+        if selected_animation_names is None:
+            self._log("FBX export cancelled before animation selection.", "info")
             return
+        animation_resource_manager, animation_game = self._fbx_resource_context_for_export(model)
+
+        def _on_complete(result, cancelled=False):
+            if cancelled or result is None:
+                return
+            self._log(f"Exported FBX -> {Path(result).name}", "success")
+
+        def _on_error(exc):
+            try:
+                from src.io.fbx.fbx_exporter import FbxSdkUnavailableError
+            except Exception:
+                return False
+            if isinstance(exc, FbxSdkUnavailableError):
+                self._show_missing_fbx_sdk_dialog(str(exc))
+                return True
+            return False
+
+        self._run_io_async(
+            f"Exporting FBX \u2014 {Path(path).name}",
+            _work_export_fbx,
+            model,
+            path,
+            tex_cache=tex_cache,
+            base_skeleton_model=base_skeleton_model,
+            compatibility_profile=compatibility_profile,
+            selected_animation_names=selected_animation_names,
+            animation_resource_manager=animation_resource_manager,
+            animation_game=animation_game,
+            supplemental_animation_models=supplemental_models,
+            on_complete=_on_complete,
+            on_error=_on_error,
+            error_category="export_error",
+        )
+    def _export_selected_fbx(self):
         selected = self.scene_manager.get_selected_objects()
         if not selected:
             QtWidgets.QMessageBox.information(self, "Export Selected FBX", "Select a scene object first.")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export Selected FBX",
             f"{selected[0].name if len(selected) == 1 else 'selection'}.fbx",
-            "FBX files (*.fbx);;All files (*.*)",
+            FBX_EXPORT_FILTERS,
         )
         if not path:
             return
+        compatibility_profile = _fbx_compatibility_profile_from_filter(selected_filter)
+        if len(selected) != 1 and compatibility_profile != "standard":
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Selected FBX",
+                "Unity-, Unreal-, and 3ds Max-compatible FBX export requires one runtime model. "
+                "For a body with attached layers, use Body Attachment System > "
+                "Export Composed Model… so the rig can be normalized as one asset.",
+            )
+            return
+        if len(selected) == 1:
+            model_getter = getattr(self, "_runtime_model_for_scene_object", None)
+            model = model_getter(selected[0]) if callable(model_getter) else (getattr(selected[0], "metadata", {}) or {}).get("_runtime_model")
+            if model is not None:
+                tex_cache = self._get_tex_cache_for_export()
+                base_skeleton_model = self._fbx_base_skeleton_for_export(model)
+                supplemental_models = self._fbx_supplemental_animation_models(model)
+                selected_animation_names = self._choose_fbx_animation_sets(
+                    model,
+                    compatibility_profile,
+                    base_skeleton_model=base_skeleton_model,
+                    supplemental_models=supplemental_models,
+                )
+                if selected_animation_names is None:
+                    self._log("Selected FBX export cancelled before animation selection.", "info")
+                    return
+                animation_resource_manager, animation_game = self._fbx_resource_context_for_export(model)
+
+                def _on_complete(result, cancelled=False):
+                    if cancelled or result is None:
+                        return
+                    self._log(f"Exported selected FBX -> {Path(result).name}", "success")
+
+                self._run_io_async(
+                    f"Exporting selected FBX \u2014 {Path(path).name}",
+                    _work_export_fbx,
+                    model,
+                    path,
+                    tex_cache=tex_cache,
+                    base_skeleton_model=base_skeleton_model,
+                    compatibility_profile=compatibility_profile,
+                    selected_animation_names=selected_animation_names,
+                    animation_resource_manager=animation_resource_manager,
+                    animation_game=animation_game,
+                    supplemental_animation_models=supplemental_models,
+                    on_complete=_on_complete,
+                    error_category="export_error",
+                )
+                return
+            if compatibility_profile != "standard":
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Export Selected FBX",
+                    "The selected scene object has no runtime model to send through "
+                    "the Unity, Unreal Engine, or 3ds Max compatibility exporter.",
+                )
+                return
         try:
             from src.io.fbx.fbx_exporter import FbxSdkUnavailableError, export_fbx
 
@@ -287,7 +937,7 @@ class ModelIoMixin:
             self._show_missing_fbx_sdk_dialog(str(exc))
         except Exception as exc:
             self._log(f"Selected FBX export error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Export Selected FBX", str(exc))
+            show_exception(self, "export_error", exc, context="Exporting selected mesh to FBX")
     def _show_missing_fbx_sdk_dialog(self, details: str = "") -> None:
         message = (
             "Autodesk FBX Python SDK is not installed or not available to this Python environment. "
@@ -352,7 +1002,7 @@ class ModelIoMixin:
             dialog.exec()
         except Exception as exc:
             self._log(f"FBX SDK setup error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "FBX SDK Setup", str(exc))
+            show_exception(self, "fbx_sdk_error", exc, context="FBX SDK setup")
     def _save_fbx_sdk_settings(self, fbx_settings: dict) -> None:
         self.settings_data["fbx_sdk"] = dict(fbx_settings or {})
         self._configure_fbx_sdk_paths(refresh=True)
@@ -380,23 +1030,23 @@ class ModelIoMixin:
         )
         if not path:
             return
-        try:
-            from src.converters.mesh_converter import GLTFExporter
+        tex_cache = self._get_tex_cache_for_export()
+        binary = path.lower().endswith(".glb")
 
-            binary = path.lower().endswith(".glb")
-            ok = GLTFExporter().export(
-                model,
-                path,
-                binary=binary,
-                tex_cache=self._get_tex_cache_for_export(),
-                export_rigging=True,
-            )
-            if not ok:
-                raise RuntimeError("GLTF export failed. Install pygltflib or check the log.")
-            self._log(f"Exported {'GLB' if binary else 'GLTF'} -> {Path(path).name}", "success")
-        except Exception as exc:
-            self._log(f"GLTF export error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
+        def _on_complete(result, cancelled=False):
+            if cancelled or result is None:
+                return
+            self._log(f"Exported {'GLB' if binary else 'GLTF'} -> {Path(result).name}", "success")
+
+        self._run_io_async(
+            f"Exporting {'GLB' if binary else 'GLTF'} \u2014 {Path(path).name}",
+            _work_export_gltf,
+            model,
+            path,
+            tex_cache=tex_cache,
+            on_complete=_on_complete,
+            error_category="export_error",
+        )
     def _export_humanoid_template(self):
         chosen_gv = self._pick_export_game_version()
         if not chosen_gv:
@@ -432,7 +1082,7 @@ class ModelIoMixin:
                 self._set_model_internal(model, path)
         except Exception as exc:
             self._log(f"Template export error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
+            show_exception(self, "export_error", exc, context="Exporting humanoid template")
     def _find_mdlops(self) -> str:
         configured = str(self.settings_data.get("mdlops_path") or "")
         guesses = [
@@ -512,8 +1162,10 @@ class ModelIoMixin:
         self._run_mdlops(cmd, Path(path).parent)
     def _run_mdlops(self, cmd: list[str], cwd: Path):
         self._log(f"Running MDLOps: {' '.join(cmd)}")
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(cwd))
+
+        def _on_complete(result, cancelled=False):
+            if cancelled or result is None:
+                return
             if result.stdout:
                 self._log(result.stdout.strip())
             if result.stderr:
@@ -522,12 +1174,30 @@ class ModelIoMixin:
                 self._log("MDLOps operation complete.", "success")
             else:
                 self._log(f"MDLOps exited with code {result.returncode}", "warning")
-        except FileNotFoundError:
-            self._log("'perl' was not found. Install Perl or use the Windows MDLOps exe.", "error")
-        except subprocess.TimeoutExpired:
-            self._log("MDLOps timed out.", "error")
-        except Exception as exc:
-            self._log(f"MDLOps error: {exc}", "error")
+
+        def _on_error(exc):
+            # FileNotFoundError / TimeoutExpired are expected, user-fixable
+            # failures; log them and suppress the generic error dialog.
+            if isinstance(exc, FileNotFoundError):
+                self._log(
+                    "'perl' was not found. Install Perl or use the Windows MDLOps exe.",
+                    "error",
+                )
+                return True
+            if isinstance(exc, subprocess.TimeoutExpired):
+                self._log("MDLOps timed out.", "error")
+                return True
+            return False
+
+        self._run_io_async(
+            "Running MDLOps",
+            _work_run_mdlops,
+            cmd,
+            cwd,
+            on_complete=_on_complete,
+            on_error=_on_error,
+            error_category="mdlops_error",
+        )
     def _port_current_model(self):
         model = self._require_model("Port Current Model")
         if model is None:
@@ -548,7 +1218,7 @@ class ModelIoMixin:
             self._log(f"Ported current model to {target}.", "success")
         except Exception as exc:
             self._log(f"Port error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Port Error", str(exc))
+            show_exception(self, "port_error", exc, context="Porting current model")
     def _generate_module_files(self):
         out_dir = QtWidgets.QFileDialog.getExistingDirectory(
             self,
@@ -586,7 +1256,7 @@ class ModelIoMixin:
             self._log(f"Generated starter module files for {mod} in {output}", "success")
         except Exception as exc:
             self._log(f"Module generation error: {exc}", "error")
-            QtWidgets.QMessageBox.critical(self, "Module Generation Error", str(exc))
+            show_exception(self, "module_generation_error", exc, context="Generating starter module files")
     def _handle_module_action(self, action: str):
         if action in {"Generate Module Files", "Validate Module", "Open Output"}:
             if action == "Generate Module Files":

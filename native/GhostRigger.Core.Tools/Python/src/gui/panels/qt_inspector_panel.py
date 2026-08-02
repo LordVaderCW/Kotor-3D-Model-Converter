@@ -82,6 +82,14 @@ _PAGE_TITLES: Dict[int, str] = {
     _STEP_EXPORT_MDL: "5. Export MDL",
 }
 
+_HEAD_PAGE_TITLES: Dict[int, str] = {
+    _STEP_LOAD: "1. Import Custom Head Art",
+    _STEP_ASSIGN_SKELETON: "2. Select Native Donor",
+    _STEP_ASSIGN_ANIMATIONS: "3. Align + Transfer Skin",
+    _STEP_PREVIEW: "4. Preview Head",
+    _STEP_EXPORT_MDL: "5. Validate + Export",
+}
+
 
 class QtInspectorPanel(QtWidgets.QWidget):
     """Contextual inspector: a QStackedWidget keyed by step number.
@@ -124,6 +132,7 @@ class QtInspectorPanel(QtWidgets.QWidget):
     skeletonTemplateSelected  = QtCore.Signal(str)        # (option_key,)
     browseSkeletonTemplateRequested = QtCore.Signal()
     applySkeletonTemplateRequested = QtCore.Signal()
+    splitMeshNodesRequested = QtCore.Signal()
     # M5 / T504 — Hand-rig step.
     placeHandGuidesRequested  = QtCore.Signal()
     handMaskChanged           = QtCore.Signal(str, bool)  # (bone, masked?)
@@ -171,6 +180,7 @@ class QtInspectorPanel(QtWidgets.QWidget):
         # M12 / T1202 — AccuRig-style skeleton picker on the body-rig HUD.
         self._skeleton_template_combo: Optional[QtWidgets.QComboBox] = None
         self._skeleton_template_status: Optional[QtWidgets.QLabel] = None
+        self._node_splitter_status: Optional[QtWidgets.QLabel] = None
         self._skeleton_template_status_labels: List[QtWidgets.QLabel] = []
         self._skeleton_template_completer: Optional[QtWidgets.QCompleter] = None
         self._apply_skeleton_template_btn: Optional[QtWidgets.QPushButton] = None
@@ -197,6 +207,27 @@ class QtInspectorPanel(QtWidgets.QWidget):
         self._preview_attachment_path: str = ""
         self._preview_attachment_status: Optional[QtWidgets.QLabel] = None
         self._rom_test_btn: Optional[QtWidgets.QPushButton] = None
+        # Slice 1 custom-head presentation surfaces.  These references keep
+        # body-only controls out of HEAD mode without rebuilding the widget
+        # tree or giving the GUI ownership of donor/transplant behavior.
+        self._load_guidance: Optional[QtWidgets.QLabel] = None
+        self._load_button: Optional[QtWidgets.QPushButton] = None
+        self._skeleton_template_group: Optional[QtWidgets.QGroupBox] = None
+        self._import_fit_group: Optional[QtWidgets.QGroupBox] = None
+        self._assign_skeleton_guidance: Optional[QtWidgets.QLabel] = None
+        self._build_skeleton_group: Optional[QtWidgets.QGroupBox] = None
+        self._head_donor_stage_group: Optional[QtWidgets.QGroupBox] = None
+        self._check_model_guidance: Optional[QtWidgets.QLabel] = None
+        self._check_model_button: Optional[QtWidgets.QPushButton] = None
+        self._body_motion_content: Optional[QtWidgets.QWidget] = None
+        self._head_transfer_stage_group: Optional[QtWidgets.QGroupBox] = None
+        self._preview_guidance: Optional[QtWidgets.QLabel] = None
+        self._preview_attachment_group: Optional[QtWidgets.QGroupBox] = None
+        self._body_attachment_group: Optional[QtWidgets.QGroupBox] = None
+        self._head_preview_status: Optional[QtWidgets.QLabel] = None
+        self._body_preview_content: Optional[QtWidgets.QWidget] = None
+        self._validate_guidance: Optional[QtWidgets.QLabel] = None
+        self._validate_button: Optional[QtWidgets.QPushButton] = None
         self._build()
 
     # ── UI construction ──────────────────────────────────────────────────
@@ -249,13 +280,22 @@ class QtInspectorPanel(QtWidgets.QWidget):
             if page_layout is not None:
                 page_layout.setSpacing(layout.spacing_value("groupboxSpacing", 4))
 
-    def _page_layout(self) -> QtWidgets.QWidget:
+    def _page_layout(self) -> QtWidgets.QScrollArea:
+        scroll = QtWidgets.QScrollArea()
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustIgnored)
+
         page = QtWidgets.QWidget()
+        page.setObjectName("CharacterBuilderInspectorPageContents")
         layout = QtWidgets.QVBoxLayout(page)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
-        page._gr_layout = layout                            # type: ignore[attr-defined]
-        return page
+        layout.setSizeConstraint(QtWidgets.QLayout.SetMinimumSize)
+        scroll.setWidget(page)
+        scroll._gr_layout = layout                          # type: ignore[attr-defined]
+        return scroll
 
     def _build_page_for_step(self, step: int) -> QtWidgets.QWidget:
         page = self._page_layout()
@@ -280,21 +320,40 @@ class QtInspectorPanel(QtWidgets.QWidget):
     # ── Step-specific page builders ──────────────────────────────────────
 
     def _populate_load_page(self, layout: QtWidgets.QVBoxLayout) -> None:
-        layout.addWidget(QtWidgets.QLabel(
+        guidance = QtWidgets.QLabel(
             "Choose the KOTOR base model/skeleton first, then load the\n"
             "custom MDL / FBX / OBJ mesh that should fit that rig."
-        ))
+        )
+        guidance.setObjectName("CharacterBuilderLoadGuidanceLabel")
+        guidance.setWordWrap(True)
+        self._load_guidance = guidance
+        layout.addWidget(guidance)
         self._add_skeleton_template_picker(layout)
         btn = QtWidgets.QPushButton("Load Custom Mesh…")
+        btn.setObjectName("CharacterBuilderLoadButton")
         btn.setProperty("accent", True)
         btn.clicked.connect(self.loadRequested.emit)
+        self._load_button = btn
         layout.addWidget(btn)
 
         fit_group = QtWidgets.QGroupBox("Import Fit")
-        fit_layout = QtWidgets.QGridLayout(fit_group)
+        fit_group.setObjectName("CharacterBuilderImportFitGroup")
+        self._import_fit_group = fit_group
+        fit_layout = QtWidgets.QFormLayout(fit_group)
         fit_layout.setContentsMargins(8, 8, 8, 8)
         fit_layout.setHorizontalSpacing(6)
         fit_layout.setVerticalSpacing(4)
+        fit_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        fit_layout.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+
+        def add_fit_row(
+            text: str,
+            widget: QtWidgets.QWidget,
+            object_name: str,
+        ) -> None:
+            label = QtWidgets.QLabel(text)
+            label.setObjectName(object_name)
+            fit_layout.addRow(label, widget)
 
         self._fit_scale_spin = QtWidgets.QDoubleSpinBox()
         self._fit_scale_spin.setRange(1.0, 1000.0)
@@ -304,8 +363,7 @@ class QtInspectorPanel(QtWidgets.QWidget):
         self._fit_scale_spin.setAccelerated(True)
         self._fit_scale_spin.setSuffix("%")
         self._fit_scale_spin.setToolTip("Manual scale after auto-fit. Use the arrow keys or type an exact percentage.")
-        fit_layout.addWidget(QtWidgets.QLabel("Scale"), 0, 0)
-        fit_layout.addWidget(self._fit_scale_spin, 0, 1, 1, 3)
+        add_fit_row("Scale", self._fit_scale_spin, "CharacterBuilderFitScaleLabel")
 
         pos_specs = [
             ("Pos X", "_fit_pos_x_spin"),
@@ -320,8 +378,7 @@ class QtInspectorPanel(QtWidgets.QWidget):
             spin.setAccelerated(True)
             spin.setToolTip("Manual translation after auto-fit, in KOTOR world units.")
             setattr(self, attr, spin)
-            fit_layout.addWidget(QtWidgets.QLabel(label), row, 0)
-            fit_layout.addWidget(spin, row, 1, 1, 3)
+            add_fit_row(label, spin, f"CharacterBuilderFit{label.replace(' ', '')}Label")
 
         spin_specs = [
             ("Rot X", "_fit_rot_x_spin"),
@@ -336,37 +393,65 @@ class QtInspectorPanel(QtWidgets.QWidget):
             spin.setSuffix(" deg")
             spin.setToolTip("Manual orientation after auto-fit. Viewport rotation drags snap to 10 deg while Shift is held.")
             setattr(self, attr, spin)
-            fit_layout.addWidget(QtWidgets.QLabel(label), row, 0)
-            fit_layout.addWidget(spin, row, 1, 1, 3)
+            add_fit_row(label, spin, f"CharacterBuilderFit{label.replace(' ', '')}Label")
 
         axis_options = ["Auto", "+X", "-X", "+Y", "-Y", "+Z", "-Z"]
         self._fit_source_forward_combo = QtWidgets.QComboBox()
         self._fit_source_forward_combo.addItems(axis_options)
+        self._fit_source_forward_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._fit_source_forward_combo.setMinimumContentsLength(8)
         self._fit_source_forward_combo.setToolTip("Override the imported mesh's forward axis before re-fit.")
-        fit_layout.addWidget(QtWidgets.QLabel("Source Forward"), 7, 0)
-        fit_layout.addWidget(self._fit_source_forward_combo, 7, 1)
+        add_fit_row(
+            "Source Forward",
+            self._fit_source_forward_combo,
+            "CharacterBuilderFitSourceForwardLabel",
+        )
 
         self._fit_source_up_combo = QtWidgets.QComboBox()
         self._fit_source_up_combo.addItems(axis_options)
+        self._fit_source_up_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._fit_source_up_combo.setMinimumContentsLength(8)
         self._fit_source_up_combo.setToolTip("Override the imported mesh's up axis before re-fit.")
-        fit_layout.addWidget(QtWidgets.QLabel("Source Up"), 7, 2)
-        fit_layout.addWidget(self._fit_source_up_combo, 7, 3)
+        add_fit_row(
+            "Source Up",
+            self._fit_source_up_combo,
+            "CharacterBuilderFitSourceUpLabel",
+        )
 
         self._fit_height_source_combo = QtWidgets.QComboBox()
         self._fit_height_source_combo.addItems(["Auto", "Landmarks", "Bounds"])
+        self._fit_height_source_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._fit_height_source_combo.setMinimumContentsLength(8)
         self._fit_height_source_combo.setToolTip("Choose whether re-fit height comes from detected landmarks or mesh bounds.")
-        fit_layout.addWidget(QtWidgets.QLabel("Height"), 8, 0)
-        fit_layout.addWidget(self._fit_height_source_combo, 8, 1)
+        add_fit_row(
+            "Height",
+            self._fit_height_source_combo,
+            "CharacterBuilderFitHeightLabel",
+        )
 
         self._fit_ground_basis_combo = QtWidgets.QComboBox()
         self._fit_ground_basis_combo.addItems(["Auto", "Feet", "Hips", "Bounds Bottom"])
+        self._fit_ground_basis_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._fit_ground_basis_combo.setMinimumContentsLength(8)
         self._fit_ground_basis_combo.setToolTip("Choose the origin used to snap the imported mesh to the KOTOR base.")
-        fit_layout.addWidget(QtWidgets.QLabel("Ground"), 8, 2)
-        fit_layout.addWidget(self._fit_ground_basis_combo, 8, 3)
+        add_fit_row(
+            "Ground",
+            self._fit_ground_basis_combo,
+            "CharacterBuilderFitGroundLabel",
+        )
 
         reset_btn = QtWidgets.QPushButton("Reset Fit")
+        reset_btn.setObjectName("CharacterBuilderResetFitButton")
         reset_btn.clicked.connect(self.fitAdjustmentResetRequested.emit)
-        fit_layout.addWidget(reset_btn, 9, 0, 1, 2)
+        fit_layout.addRow(reset_btn)
 
         refit_btn = QtWidgets.QPushButton("Re-fit to Selected Base")
         refit_btn.setObjectName("CharacterBuilderRefitToSelectedBaseButton")
@@ -375,14 +460,15 @@ class QtInspectorPanel(QtWidgets.QWidget):
             "the currently selected KOTOR base skeleton."
         )
         refit_btn.clicked.connect(self.refitToSelectedBaseRequested.emit)
-        fit_layout.addWidget(refit_btn, 9, 2, 1, 2)
+        fit_layout.addRow(refit_btn)
 
         self._fit_adjust_status = QtWidgets.QLabel("Auto-fit can be fine-tuned after import.")
+        self._fit_adjust_status.setObjectName("CharacterBuilderFitAdjustmentStatusLabel")
         self._fit_adjust_status.setWordWrap(True)
         self._fit_adjust_status.setStyleSheet(
             f"color:{C.get('text2', '#888')}; font-size:8pt;"
         )
-        fit_layout.addWidget(self._fit_adjust_status, 10, 0, 1, 4)
+        fit_layout.addRow(self._fit_adjust_status)
 
         self._fit_report_label = QtWidgets.QLabel(
             "Auto-fit report will appear after loading a custom mesh."
@@ -392,7 +478,7 @@ class QtInspectorPanel(QtWidgets.QWidget):
         self._fit_report_label.setStyleSheet(
             f"color:{C.get('text2', '#888')}; font-size:8pt;"
         )
-        fit_layout.addWidget(self._fit_report_label, 11, 0, 1, 4)
+        fit_layout.addRow(self._fit_report_label)
 
         for spin in (
             self._fit_scale_spin,
@@ -409,7 +495,11 @@ class QtInspectorPanel(QtWidgets.QWidget):
 
     def _add_skeleton_template_picker(self, layout: QtWidgets.QVBoxLayout) -> None:
         """AccuRig-style base-skeleton picker shown before custom import."""
+        # P5-min (T2514): one selection now serves two roles — skeleton
+        # reference AND anatomical-split weight donor (T2512).
         template_group = QtWidgets.QGroupBox("KOTOR Base Skeleton")
+        template_group.setObjectName("CharacterBuilderSkeletonTemplateGroup")
+        self._skeleton_template_group = template_group
         template_layout = QtWidgets.QVBoxLayout(template_group)
         template_layout.setSpacing(4)
 
@@ -420,6 +510,10 @@ class QtInspectorPanel(QtWidgets.QWidget):
         self._skeleton_template_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self._skeleton_template_combo.setMaxVisibleItems(18)
         self._skeleton_template_combo.setMinimumWidth(160)
+        self._skeleton_template_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._skeleton_template_combo.setMinimumContentsLength(12)
         self._configure_skeleton_template_search()
         self._skeleton_template_combo.setToolTip(
             "Pick the shipped KOTOR body/creature model that the imported mesh "
@@ -452,7 +546,8 @@ class QtInspectorPanel(QtWidgets.QWidget):
         template_layout.addWidget(browse_btn)
 
         picker_status = QtWidgets.QLabel(
-            "Pick a KOTOR base first. Align the imported mesh to this skeleton in the viewport."
+            "Pick a KOTOR base first; it is also the weight donor. "
+            "Align the imported mesh to this skeleton in the viewport."
         )
         picker_status.setStyleSheet(
             f"color:{C.get('text2', '#888')}; font-size:8pt;"
@@ -464,12 +559,32 @@ class QtInspectorPanel(QtWidgets.QWidget):
 
     def _populate_assign_skeleton_page(self, layout: QtWidgets.QVBoxLayout) -> None:
         """Step 2 — commit the adjusted KOTOR skeleton to the imported mesh."""
-        layout.addWidget(QtWidgets.QLabel(
+        guidance = QtWidgets.QLabel(
             "Confirm the adjusted KOTOR skeleton and replace any armature that came\n"
             "from the imported FBX/OBJ source."
-        ))
+        )
+        guidance.setObjectName("CharacterBuilderAssignSkeletonGuidanceLabel")
+        guidance.setWordWrap(True)
+        self._assign_skeleton_guidance = guidance
+        layout.addWidget(guidance)
+
+        head_donor_group = QtWidgets.QGroupBox("Native Head Donor")
+        head_donor_group.setObjectName("CharacterBuilderHeadDonorStageGroup")
+        head_donor_layout = QtWidgets.QVBoxLayout(head_donor_group)
+        head_donor_status = QtWidgets.QLabel(
+            "Native donor discovery and immutable contract snapshots are not "
+            "available in this build yet. You can load an existing native head "
+            "MDL in Import and run Check Head Contract without modifying its DAG."
+        )
+        head_donor_status.setWordWrap(True)
+        head_donor_layout.addWidget(head_donor_status)
+        head_donor_group.setVisible(False)
+        self._head_donor_stage_group = head_donor_group
+        layout.addWidget(head_donor_group)
 
         build_group = QtWidgets.QGroupBox("Build Skeleton")
+        build_group.setObjectName("CharacterBuilderBuildSkeletonGroup")
+        self._build_skeleton_group = build_group
         build_layout = QtWidgets.QVBoxLayout(build_group)
         build_layout.setContentsMargins(8, 8, 8, 8)
         build_layout.setSpacing(6)
@@ -483,6 +598,23 @@ class QtInspectorPanel(QtWidgets.QWidget):
             self.applySkeletonTemplateRequested.emit
         )
         build_layout.addWidget(self._apply_skeleton_template_btn)
+
+        self._split_mesh_nodes_btn = QtWidgets.QPushButton("Node Splitter")
+        self._split_mesh_nodes_btn.setToolTip(
+            "Split the imported mesh into connected render nodes before building the KOTOR skeleton."
+        )
+        self._split_mesh_nodes_btn.clicked.connect(self.splitMeshNodesRequested.emit)
+        build_layout.addWidget(self._split_mesh_nodes_btn)
+
+        splitter_status = QtWidgets.QLabel(
+            "Optional: split disconnected mesh islands before binding."
+        )
+        splitter_status.setStyleSheet(
+            f"color:{C.get('text2', '#888')}; font-size:8pt;"
+        )
+        splitter_status.setWordWrap(True)
+        self._node_splitter_status = splitter_status
+        build_layout.addWidget(splitter_status)
 
         build_status = QtWidgets.QLabel(
             "No skeleton has been built for this mesh yet."
@@ -500,11 +632,17 @@ class QtInspectorPanel(QtWidgets.QWidget):
 
     def _populate_preview_page(self, layout: QtWidgets.QVBoxLayout) -> None:
         """Step 4 — preview sockets, equipment, and animations."""
-        layout.addWidget(QtWidgets.QLabel(
+        guidance = QtWidgets.QLabel(
             "Preview the built character with KOTOR sockets, equipment, and animations."
-        ))
+        )
+        guidance.setObjectName("CharacterBuilderPreviewGuidanceLabel")
+        guidance.setWordWrap(True)
+        self._preview_guidance = guidance
+        layout.addWidget(guidance)
 
         attach_group = QtWidgets.QGroupBox("Attachment Preview")
+        attach_group.setObjectName("CharacterBuilderAttachmentPreviewGroup")
+        self._preview_attachment_group = attach_group
         attach_layout = QtWidgets.QGridLayout(attach_group)
         attach_layout.setContentsMargins(8, 8, 8, 8)
         attach_layout.setHorizontalSpacing(6)
@@ -565,8 +703,34 @@ class QtInspectorPanel(QtWidgets.QWidget):
         attach_layout.addWidget(status, 3, 0, 1, 2)
         layout.addWidget(attach_group)
 
+        # The shared Body Attachment System panel: the same slot grid, game
+        # item catalog, and lightsaber color selector as the main viewport.
+        from src.gui.qt_lib.panels.qt_body_attachment_panel import QtBodyAttachmentPanel
+
+        bas_group = QtWidgets.QGroupBox("Body Attachment System")
+        bas_group.setObjectName("characterBuilderBodyAttachmentGroup")
+        self._body_attachment_group = bas_group
+        bas_layout = QtWidgets.QVBoxLayout(bas_group)
+        bas_layout.setContentsMargins(4, 4, 4, 4)
+        self.body_attachment_panel = QtBodyAttachmentPanel(self)
+        # The Character Builder exports through its own workflow strip.
+        self.body_attachment_panel.save_build_button.setVisible(False)
+        bas_layout.addWidget(self.body_attachment_panel)
+        layout.addWidget(bas_group)
+
         # Head/facial preview panels remain HEAD-mode only, but now live under
         # the broader Preview step instead of the old Face Rig page.
+        head_preview_status = QtWidgets.QLabel(
+            "Inspect the modular head in headhook-local space. Facial controls "
+            "below operate on the current head; body attachment and copied "
+            "body-animation controls stay outside the modular-head resource."
+        )
+        head_preview_status.setObjectName("CharacterBuilderHeadPreviewStatusLabel")
+        head_preview_status.setWordWrap(True)
+        head_preview_status.setVisible(False)
+        self._head_preview_status = head_preview_status
+        layout.addWidget(head_preview_status)
+
         head_palette = self._build_head_facial_palette()
         layout.addWidget(head_palette)
         head_palette.setVisible(False)
@@ -592,14 +756,20 @@ class QtInspectorPanel(QtWidgets.QWidget):
         The table is sortable by severity / code / slot / node so the
         user can triage validator findings without leaving the panel.
         """
-        layout.addWidget(QtWidgets.QLabel(
+        guidance = QtWidgets.QLabel(
             "Verify T-pose, scale, hooks, bones, and skin weights.  All\n"
             "issues from the validation service appear in the table below\n"
             "(and a banner summary in the bottom strip)."
-        ))
+        )
+        guidance.setObjectName("CharacterBuilderCheckModelGuidanceLabel")
+        guidance.setWordWrap(True)
+        self._check_model_guidance = guidance
+        layout.addWidget(guidance)
         btn = QtWidgets.QPushButton("Check Model")
+        btn.setObjectName("CharacterBuilderCheckModelButton")
         btn.setProperty("accent", True)
         btn.clicked.connect(self.checkModelRequested.emit)
+        self._check_model_button = btn
         layout.addWidget(btn)
 
         # Tally label — updated by ``set_check_model_result``.
@@ -1090,6 +1260,21 @@ class QtInspectorPanel(QtWidgets.QWidget):
                 kind="warning",
             )
 
+    def set_node_splitter_status(self, message: str, *, kind: str = "info") -> None:
+        """Update the Step 2 Node Splitter result label."""
+
+        label = getattr(self, "_node_splitter_status", None)
+        if label is None:
+            return
+        colour = {
+            "ok": C.get("green", "#00ff66"),
+            "warning": C.get("yellow", "#ffcc33"),
+            "error": C.get("red", "#ff3366"),
+            "info": C.get("text2", "#888"),
+        }.get(str(kind or "info").lower(), C.get("text2", "#888"))
+        label.setText(str(message or ""))
+        label.setStyleSheet(f"color:{colour}; font-size:8pt;")
+
     def selected_skeleton_template_key(self) -> str:
         combo = getattr(self, "_skeleton_template_combo", None)
         if combo is None:
@@ -1169,6 +1354,14 @@ class QtInspectorPanel(QtWidgets.QWidget):
         on the body model, and dispatches Play / Stop to the M4 viewport
         via ``viewport.set_animation_pose``.
         """
+        page_layout = layout
+        body_content = QtWidgets.QWidget()
+        body_content.setObjectName("CharacterBuilderBodyPreviewContent")
+        layout = QtWidgets.QVBoxLayout(body_content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self._body_preview_content = body_content
+
         layout.addWidget(QtWidgets.QLabel(
             "Preview a standard animation on the rigged body to QC the\n"
             "skeleton + weights.  Missing clips are greyed out."
@@ -1236,6 +1429,7 @@ class QtInspectorPanel(QtWidgets.QWidget):
         )
         self._preview_status.setWordWrap(True)
         layout.addWidget(self._preview_status)
+        page_layout.addWidget(body_content)
 
     def set_preview_animations(
         self,
@@ -1295,6 +1489,14 @@ class QtInspectorPanel(QtWidgets.QWidget):
 
     def _populate_motions_page(self, layout: QtWidgets.QVBoxLayout) -> None:
         """M12 / T1204 — assign KOTOR motion source for export."""
+        page_layout = layout
+        body_content = QtWidgets.QWidget()
+        body_content.setObjectName("CharacterBuilderBodyMotionContent")
+        layout = QtWidgets.QVBoxLayout(body_content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self._body_motion_content = body_content
+
         layout.addWidget(QtWidgets.QLabel(
             "Choose how this character gets KOTOR animation clips."
         ))
@@ -1421,6 +1623,26 @@ class QtInspectorPanel(QtWidgets.QWidget):
         )
         library_layout.addWidget(self._animation_library_status)
         layout.addWidget(library_group)
+        page_layout.addWidget(body_content)
+
+        head_transfer_group = QtWidgets.QGroupBox("Donor-Preserving Transplant")
+        head_transfer_group.setObjectName("CharacterBuilderHeadTransferStageGroup")
+        head_transfer_layout = QtWidgets.QVBoxLayout(head_transfer_group)
+        head_transfer_status = QtWidgets.QLabel(
+            "Alignment, donor-surface weight transfer, and structural DAG diffing "
+            "are not available in this build yet. The modular head must preserve "
+            "its donor palette and inherited-animation contract; body clips are "
+            "never copied into the head resource."
+        )
+        head_transfer_status.setWordWrap(True)
+        head_transfer_layout.addWidget(head_transfer_status)
+        check_btn = QtWidgets.QPushButton("Check Current Head Contract")
+        check_btn.setObjectName("CharacterBuilderHeadTransferCheckButton")
+        check_btn.clicked.connect(self.checkModelRequested.emit)
+        head_transfer_layout.addWidget(check_btn)
+        head_transfer_group.setVisible(False)
+        self._head_transfer_stage_group = head_transfer_group
+        page_layout.addWidget(head_transfer_group)
 
     def selected_motion_source(self) -> str:
         combo = getattr(self, "_motion_source_combo", None)
@@ -1539,11 +1761,15 @@ class QtInspectorPanel(QtWidgets.QWidget):
              window slot wires the dialog's accept signal to
              ``headless_body_workflow.export_scene``.
         """
-        layout.addWidget(QtWidgets.QLabel(
+        guidance = QtWidgets.QLabel(
             "Run final validation, then export the rigged body to one\n"
             "or more formats (KOTOR / FBX / glTF / OBJ) plus a\n"
             ".ghostrig.json scene-definition sidecar."
-        ))
+        )
+        guidance.setObjectName("CharacterBuilderValidateGuidanceLabel")
+        guidance.setWordWrap(True)
+        self._validate_guidance = guidance
+        layout.addWidget(guidance)
 
         # ── Validation tally label ──────────────────────────────────
         self._validate_tally = QtWidgets.QLabel(
@@ -1558,11 +1784,13 @@ class QtInspectorPanel(QtWidgets.QWidget):
         # ── Validate / Export button row ────────────────────────────
         btn_row = QtWidgets.QHBoxLayout()
         validate_btn = QtWidgets.QPushButton("Validate Scene")
+        validate_btn.setObjectName("CharacterBuilderValidateButton")
         validate_btn.setToolTip(
             "Run ValidationService with strict=True; surfaces any\n"
             "blocker codes that would prevent export."
         )
         validate_btn.clicked.connect(self.validateRequested.emit)
+        self._validate_button = validate_btn
         btn_row.addWidget(validate_btn)
 
         self._export_btn = QtWidgets.QPushButton("Export…")
@@ -2156,16 +2384,27 @@ class QtInspectorPanel(QtWidgets.QWidget):
         Returns True when the step has a registered page, False
         otherwise (the stack is left unchanged in that case).
         """
-        idx = self._step_to_index.get(int(step_number))
+        step_number = int(step_number)
+        idx = self._step_to_index.get(step_number)
         if idx is None:
             return False
-        if self._stack.currentIndex() != idx:
+        changed = self._stack.currentIndex() != idx
+        if changed:
             self._stack.setCurrentIndex(idx)
-            self._title_label.setText(_PAGE_TITLES.get(
-                int(step_number), f"Step {step_number}"
-            ))
-            self.stepChanged.emit(int(step_number))
+        self._title_label.setText(self._page_title(step_number))
+        if changed:
+            self.stepChanged.emit(step_number)
         return True
+
+    def _page_title(self, step_number: int) -> str:
+        """Return the mode-correct title for a canonical inspector page."""
+        mode_value = (
+            getattr(self._active_mode, "value", None)
+            or getattr(self._active_mode, "name", "")
+            or str(self._active_mode or "")
+        ).lower()
+        titles = _HEAD_PAGE_TITLES if mode_value == "head" else _PAGE_TITLES
+        return titles.get(int(step_number), f"Step {step_number}")
 
     def current_step(self) -> int:
         """Return the step number currently displayed."""
@@ -2455,20 +2694,18 @@ class QtInspectorPanel(QtWidgets.QWidget):
     # ── M6 / T602 — mode-aware page composition ──────────────────────────
 
     def set_active_mode(self, mode) -> None:
-        """Swap the Face-Rig page between legacy and Head-Palette layouts.
+        """Apply mode-specific labels and controls without rebuilding pages.
 
         Parameters
         ----------
-        mode : :class:`CharacterMode` (or ``None``).  When the value is
-               ``CharacterMode.HEAD`` the legacy mask / midpoint controls
-               are hidden and the Head Facial Palette becomes visible;
-               every other value (including ``None``) restores the
-               legacy layout.
+        mode : :class:`CharacterMode` (or ``None``). ``CharacterMode.HEAD``
+               exposes the modular-head path and hides body-only skeleton,
+               motion, and attachment controls. Every other value restores
+               the body-like launch workflow.
 
-        This is the M5-invariant #4 (Inspector page rewrite retires
-        legacy stubs) applied to the Face-Rig page for HEAD mode.  The
-        widget tree is built once in ``_build`` ; this method only
-        toggles visibility so re-applying the same mode is cheap.
+        The widget tree is built once in ``_build``; this method only changes
+        presentation state, so re-applying the same mode is cheap and never
+        mutates or replaces the active scene.
         """
         self._active_mode = mode
 
@@ -2481,6 +2718,78 @@ class QtInspectorPanel(QtWidgets.QWidget):
                       or getattr(mode, "name", "")
                       or str(mode or "")).lower()
         is_head = mode_value == "head"
+
+        # Step 1: a modular head imports art first. Native donor discovery is
+        # a separate workflow command, not the body skeleton picker.
+        if self._load_guidance is not None:
+            self._load_guidance.setText(
+                "Load custom head art from MDL, FBX, OBJ, glTF/GLB, PLY, or STL.\n"
+                "The imported geometry stays separate from its native KOTOR donor."
+                if is_head else
+                "Choose the KOTOR base model/skeleton first, then load the\n"
+                "custom MDL / FBX / OBJ mesh that should fit that rig."
+            )
+        if self._load_button is not None:
+            self._load_button.setText(
+                "Load Custom Head Art…" if is_head else "Load Custom Mesh…"
+            )
+        for widget in (self._skeleton_template_group, self._import_fit_group):
+            if widget is not None:
+                widget.setVisible(not is_head)
+
+        # Step 2: donor contract inspection is valid; body skeleton creation is
+        # not. The donor picker itself arrives with the repository/catalog slice.
+        if self._assign_skeleton_guidance is not None:
+            self._assign_skeleton_guidance.setText(
+                "Select a native KOTOR head donor and preserve its DAG, node order, "
+                "skin palette, bounds, hooks, and inherited-animation contract."
+                if is_head else
+                "Confirm the adjusted KOTOR skeleton and replace any armature that "
+                "came from the imported FBX/OBJ source."
+            )
+        if self._head_donor_stage_group is not None:
+            self._head_donor_stage_group.setVisible(is_head)
+        if self._build_skeleton_group is not None:
+            self._build_skeleton_group.setVisible(not is_head)
+        if self._check_model_guidance is not None:
+            self._check_model_guidance.setText(
+                "Inspect the current head's root/link, node DAG, hooks, facial "
+                "palette, skin weights, bounds, and supermodel contract."
+                if is_head else
+                "Verify T-pose, scale, hooks, bones, and skin weights. All issues "
+                "from the validation service appear below and in the bottom banner."
+            )
+        if self._check_model_button is not None:
+            self._check_model_button.setText(
+                "Check Head Contract" if is_head else "Check Model"
+            )
+
+        # Step 3: modular heads inherit animation and use a donor-preserving
+        # transplant. Never expose body animation assignment in HEAD mode.
+        if self._body_motion_content is not None:
+            self._body_motion_content.setVisible(not is_head)
+        if self._head_transfer_stage_group is not None:
+            self._head_transfer_stage_group.setVisible(is_head)
+
+        # Step 4: head-local facial preview replaces body equipment and copied
+        # body-animation controls.
+        if self._preview_guidance is not None:
+            self._preview_guidance.setText(
+                "Preview facial controls and validate the modular head without "
+                "materializing inherited body animation clips."
+                if is_head else
+                "Preview the built character with KOTOR sockets, equipment, and "
+                "animations."
+            )
+        for widget in (
+            self._preview_attachment_group,
+            self._body_attachment_group,
+            self._body_preview_content,
+        ):
+            if widget is not None:
+                widget.setVisible(not is_head)
+        if self._head_preview_status is not None:
+            self._head_preview_status.setVisible(is_head)
 
         # Toggle the legacy stubs.
         for widget in self._face_legacy_widgets:
@@ -2498,6 +2807,27 @@ class QtInspectorPanel(QtWidgets.QWidget):
         if self._head_phoneme_panel is not None:
             self._head_phoneme_panel.setVisible(is_head)
 
+        # Step 5: both paths use the same semantic signals, while the window
+        # dispatches to the active workflow service and surfaces pending binary
+        # support as a blocked state.
+        if self._validate_guidance is not None:
+            self._validate_guidance.setText(
+                "Run strict modular-head validation, then choose an export target. "
+                "Native KOTOR MDL/MDX remains blocked until the donor-preserving "
+                "writer and readback gate are available."
+                if is_head else
+                "Run final validation, then export the rigged body to one or more "
+                "formats (KOTOR / FBX / glTF / OBJ) plus a .ghostrig.json sidecar."
+            )
+        if self._validate_button is not None:
+            self._validate_button.setText(
+                "Validate Head" if is_head else "Validate Scene"
+            )
+        if self._export_btn is not None:
+            self._export_btn.setText(
+                "Export Head…" if is_head else "Export…"
+            )
+
         if self._rom_test_btn is not None:
             labels = {
                 "headless_body": "Run Body ROM",
@@ -2506,6 +2836,9 @@ class QtInspectorPanel(QtWidgets.QWidget):
                 "creature": "Run Creature ROM",
             }
             self._rom_test_btn.setText(labels.get(mode_value, "Run ROM"))
+
+        # Refresh the title even when the current page index did not change.
+        self._title_label.setText(self._page_title(self.current_step()))
 
     def active_mode(self):
         """Return the most recently applied :class:`CharacterMode` (or ``None``)."""

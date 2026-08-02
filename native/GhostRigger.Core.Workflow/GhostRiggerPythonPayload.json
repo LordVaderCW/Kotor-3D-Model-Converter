@@ -2,9 +2,21 @@
     "schema": "ghostrigger_python_payload.v1",
     "phase": "P1.5 embedded python payload",
     "project": "GhostRigger.Core.Workflow",
-    "file_count": 116,
+    "file_count": 153,
     "originals_remain_in_src": true,
     "files": [
+        {
+            "resource_name": "PYTHON_PAYLOAD_ADAPTERS_FACIAL_INIT",
+            "source_path": "src/adapters/facial/__init__.py",
+            "packaged_path": "Python/src/adapters/facial/__init__.py",
+            "sha256": "e85f1bb8a62306a3e28e2857fd57dcbf154a408f45b6a4de027187005764ad86"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_ADAPTERS_FACIAL_ARKIT_PERFORMANCE",
+            "source_path": "src/adapters/facial/arkit_performance.py",
+            "packaged_path": "Python/src/adapters/facial/arkit_performance.py",
+            "sha256": "52c1ec70dbba42a6c3ca1bd967b63b26dbf3b3cb1789e695425a4caad37367e1"
+        },
         {
             "resource_name": "PYTHON_PAYLOAD_AUTORIG_INIT",
             "source_path": "src/autorig/__init__.py",
@@ -51,19 +63,31 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_ANIMATION_ANIMATION_ENGINE",
             "source_path": "src/core/animation/animation_engine.py",
             "packaged_path": "Python/src/core/animation/animation_engine.py",
-            "sha256": "4079defb18633f12299d2227a11526416f77d44a6d6139679cc94c880336b5cb"
+            "sha256": "fe5bbbe53c44ae8211b33ab979b0e394caea102eb0a645e1a28af378e3bec94a"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_ANIMATION_ANIMATION_LIBRARY",
             "source_path": "src/core/animation/animation_library.py",
             "packaged_path": "Python/src/core/animation/animation_library.py",
-            "sha256": "c0b8428cc0c641d507af3865933a8ac62ee3e229c8cb5dff34076311e56cbe23"
+            "sha256": "e07b0ac29b2492143dc35d853ced7dfab3a093fe88be7600b6b911e07838fc94"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_ANIMATION_FACIAL_PERFORMANCE",
+            "source_path": "src/core/animation/facial_performance.py",
+            "packaged_path": "Python/src/core/animation/facial_performance.py",
+            "sha256": "cd6b6b58d5779f859389c0efe60aef05a2b369c7eed2bb555aa3e7e672886de1"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_ANIMATION_FBX_ANIMATION_SELECTION",
+            "source_path": "src/core/animation/fbx_animation_selection.py",
+            "packaged_path": "Python/src/core/animation/fbx_animation_selection.py",
+            "sha256": "544ae6cb536cc6f5e4e5158cec7595c4d01338a5053484f6370e53584caa33f3"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_ANIMATION_GPU_SKINNING",
             "source_path": "src/core/animation/gpu_skinning.py",
             "packaged_path": "Python/src/core/animation/gpu_skinning.py",
-            "sha256": "2edb30fc4f700d34633cc2b1bcd164a922650d70048213c248dd4ed91e204a2c"
+            "sha256": "0f7153cb35ad2e9e81edb561a25547df3a061b3142aef4fa26343659397512c8"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_ANIMATION_SKINNING_PROFILES_INIT",
@@ -336,6 +360,12 @@
             "sha256": "ff138053bab9fee263434ab4f7d8e4506323306c87c04c86bc5bf20929d6be5b"
         },
         {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_ANIMATION_DEFORMATION_VALIDATOR",
+            "source_path": "src/core/characters/animation_deformation_validator.py",
+            "packaged_path": "Python/src/core/characters/animation_deformation_validator.py",
+            "sha256": "8f07fdcece85ee50db242c8c03868a09b93f37c09491e8e9e227d49d7efaacf1"
+        },
+        {
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CHARACTER_AUTOFIT_REPORT",
             "source_path": "src/core/characters/character_autofit_report.py",
             "packaged_path": "Python/src/core/characters/character_autofit_report.py",
@@ -345,19 +375,19 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CHARACTER_BUILDER",
             "source_path": "src/core/characters/character_builder.py",
             "packaged_path": "Python/src/core/characters/character_builder.py",
-            "sha256": "9c2ccfb3829a3ae8eef04a69f18ff855565e7a87b00452581466a9e12c8cfa14"
+            "sha256": "0dacf89bba5b9acde815f1e62299fdbd9d3b9260537012490f4181ae69999c31"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CHARACTER_EXPORT_PREFLIGHT",
             "source_path": "src/core/characters/character_export_preflight.py",
             "packaged_path": "Python/src/core/characters/character_export_preflight.py",
-            "sha256": "91c437fadb7c7c2d7a360c802157aef61099e896c5d44455c6f62ff6589c122e"
+            "sha256": "f37091ee435d60c0815f2d64bf123eea14b8e4e0f05b49b847c169afb66eb72c"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CHARACTER_EXPORT_TRANSACTION",
             "source_path": "src/core/characters/character_export_transaction.py",
             "packaged_path": "Python/src/core/characters/character_export_transaction.py",
-            "sha256": "c86448672d4d3836b65d724de8a9d3ed35181b1939d29fe5065da28602b1e62e"
+            "sha256": "8dd770ff77191104d90bb9920caea068147de300a4baadf0b845d6d4885337a6"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CHARACTER_OVERRIDE_PACKAGE",
@@ -384,16 +414,106 @@
             "sha256": "8137d103959ff1b2a704dfe41d2d312640ebf103cf316c537680d5531608ea27"
         },
         {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CREATURE_PACKAGE_BUILDER",
+            "source_path": "src/core/characters/creature_package_builder.py",
+            "packaged_path": "Python/src/core/characters/creature_package_builder.py",
+            "sha256": "84b55985b3c79021ec6a06cfcfd37f7c564abd5357af85f0bfe525e0f7b19f94"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CUSTOM_RIGGED_CHARACTER_BEHAVIOR_SERVICE",
+            "source_path": "src/core/characters/custom_rigged_character_behavior_service.py",
+            "packaged_path": "Python/src/core/characters/custom_rigged_character_behavior_service.py",
+            "sha256": "827451391f7040269c84c8707f62e82a66d95e474f93a0cf988a7e214bd1ff10"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CUSTOM_RIGGED_CHARACTER_BUILD_SERVICE",
+            "source_path": "src/core/characters/custom_rigged_character_build_service.py",
+            "packaged_path": "Python/src/core/characters/custom_rigged_character_build_service.py",
+            "sha256": "a7e5d9dd89d40902caee0c8547b9f094d66dbe1b816611e5025f92f41604462e"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CUSTOM_RIGGED_CHARACTER_IMPORT_SERVICE",
+            "source_path": "src/core/characters/custom_rigged_character_import_service.py",
+            "packaged_path": "Python/src/core/characters/custom_rigged_character_import_service.py",
+            "sha256": "8df4a5d1863b06054ca2dc9ce1e87605af7c15cb5d46d931cf054046e71a215a"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_CUSTOM_RIGGED_CHARACTER_PACKAGING_SERVICE",
+            "source_path": "src/core/characters/custom_rigged_character_packaging_service.py",
+            "packaged_path": "Python/src/core/characters/custom_rigged_character_packaging_service.py",
+            "sha256": "4630c1495f91f367f686b0e79393ac55af927aef03d04021bfffb5552ffa105a"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_FACIAL_RIG_QA",
+            "source_path": "src/core/characters/facial_rig_qa.py",
+            "packaged_path": "Python/src/core/characters/facial_rig_qa.py",
+            "sha256": "956a4533a7a4050c5d475cd744d8fe230fbc0e0e227edd13cf8d68f47dbacb5e"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_ART_ANATOMY",
+            "source_path": "src/core/characters/head_art_anatomy.py",
+            "packaged_path": "Python/src/core/characters/head_art_anatomy.py",
+            "sha256": "3111edab07f2e357d37eb73551e7c83a21394debd762c33312f64153916c3088"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_ATTACHMENT_PREVIEW",
+            "source_path": "src/core/characters/head_attachment_preview.py",
+            "packaged_path": "Python/src/core/characters/head_attachment_preview.py",
+            "sha256": "97dcff51d5c7666112fb32afd01ed1c56bae43fab1bd2730e70f24e5633fb8f7"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_BUILDER_PROJECT",
+            "source_path": "src/core/characters/head_builder_project.py",
+            "packaged_path": "Python/src/core/characters/head_builder_project.py",
+            "sha256": "347076e92abe14f42aac44712b732b9a55ba08117ffd772e79b49558abaeec0d"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_BUILDER_SERVICE",
+            "source_path": "src/core/characters/head_builder_service.py",
+            "packaged_path": "Python/src/core/characters/head_builder_service.py",
+            "sha256": "ff0bd0fb1d128bf1bd2a1a59827f0b0bb0b770e148533007d0ee5e16579ba481"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_COMPONENT_CATALOG",
+            "source_path": "src/core/characters/head_component_catalog.py",
+            "packaged_path": "Python/src/core/characters/head_component_catalog.py",
+            "sha256": "bdd050c036519c406ee29baf4b7333d233ab0af29fbf3766f36a44a0865ebf51"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_DONOR_SNAPSHOT",
+            "source_path": "src/core/characters/head_donor_snapshot.py",
+            "packaged_path": "Python/src/core/characters/head_donor_snapshot.py",
+            "sha256": "f18920e7a92bb958b235330fc5a79e38cf464e63a6702902a39b2af3ecc10b94"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_FACIAL_TRANSPLANT",
+            "source_path": "src/core/characters/head_facial_transplant.py",
+            "packaged_path": "Python/src/core/characters/head_facial_transplant.py",
+            "sha256": "196adc8051e6a65cd8d71b85d8c16bc02345c0b88f58b7fb99e8e5acd317cedc"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_GEOMETRY_TRANSPLANT",
+            "source_path": "src/core/characters/head_geometry_transplant.py",
+            "packaged_path": "Python/src/core/characters/head_geometry_transplant.py",
+            "sha256": "79c84a63c945eb6afd20114260faf46d9a5cd7ba2f8860660c8be7651240e649"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_TEXTURE_MATERIALS",
+            "source_path": "src/core/characters/head_texture_materials.py",
+            "packaged_path": "Python/src/core/characters/head_texture_materials.py",
+            "sha256": "e9cad33d4922a4169ff88e88fa1a777d66ef9bdb6573eea8e28309e673469b7a"
+        },
+        {
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEAD_WORKFLOW",
             "source_path": "src/core/characters/head_workflow.py",
             "packaged_path": "Python/src/core/characters/head_workflow.py",
-            "sha256": "fb4d3a7bcad822cadcfaa790403b33fd472e099bed848d7bafc3e719ed278a5c"
+            "sha256": "6ca9c5219a3e280dcf18fb2606cec41021448380c907cec8d666392474eb8701"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_HEADLESS_BODY_WORKFLOW",
             "source_path": "src/core/characters/headless_body_workflow.py",
             "packaged_path": "Python/src/core/characters/headless_body_workflow.py",
-            "sha256": "5b6e45b7d052eb5ecc3d07d12604aa3275045121d665be404109c6c20a0e7fe5"
+            "sha256": "4eafb23cc71c1db31abd3ce63df8133aa37c9b09228ddd285700d96b3c01b548"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_KOTOR_CONSTANTS",
@@ -405,7 +525,13 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_NATIVE_SKELETON",
             "source_path": "src/core/characters/native_skeleton.py",
             "packaged_path": "Python/src/core/characters/native_skeleton.py",
-            "sha256": "32e706bec41e99e3e17d4bb3fa4d93ee7201108f2c90671defc74c733edc8a8b"
+            "sha256": "cd55a16f7dbd6622bc30d3e3121c614d03c96c2b99766bca91b38311cbffaba9"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_CHARACTERS_RIG_SESSION",
+            "source_path": "src/core/characters/rig_session.py",
+            "packaged_path": "Python/src/core/characters/rig_session.py",
+            "sha256": "edf8d66de5847dd97fe2900fe2522ee4c2a959d03ac115596004ac96bc83b3f9"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_INIT",
@@ -429,7 +555,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_AURORA_ANIMATION_WRITER",
             "source_path": "src/core/retargeting/aurora_animation_writer.py",
             "packaged_path": "Python/src/core/retargeting/aurora_animation_writer.py",
-            "sha256": "0d57449158d1e427d0d2437c2d749cfb1168cf34a473cc78d1102031c83ee585"
+            "sha256": "01b39a443bdb7446e858b6b86088c87300f4107ee5b0abd797984439aa1c2376"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_BAKER",
@@ -441,7 +567,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_BLENDER_ANIMATION_INJECTION",
             "source_path": "src/core/retargeting/blender_animation_injection.py",
             "packaged_path": "Python/src/core/retargeting/blender_animation_injection.py",
-            "sha256": "c173db8a065ff23bfb36231be0087815841cde3193264c5dd90fd4e7e7bee3c4"
+            "sha256": "17502926294c1cf8c1bef42834c77d3f5a992745068f8d53839e0a253b4c442e"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_COORDINATE",
@@ -465,13 +591,13 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_FBX_BACKEND",
             "source_path": "src/core/retargeting/fbx_backend.py",
             "packaged_path": "Python/src/core/retargeting/fbx_backend.py",
-            "sha256": "1d19b7da6de7c57c4567388ffdcc7d36d61810e0ba5ebfafc6e519244033feae"
+            "sha256": "b93e2c1b5771e91662683798e0a9c2509134b4ea7780f7965b3559a9ec711a42"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_FBX_EXPORTER",
             "source_path": "src/core/retargeting/fbx_exporter.py",
             "packaged_path": "Python/src/core/retargeting/fbx_exporter.py",
-            "sha256": "81ef9e95970d9ba3add5d24d10e4f956aa6fb0da24dee68bbd397cfa396a9e4f"
+            "sha256": "ce8005d7161e9b1fff83e957a94cbed80d90ae06ef4959f5b5a1dbb18b3136fc"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_FBX_IMPORTER",
@@ -561,7 +687,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_RETARGET_MODES",
             "source_path": "src/core/retargeting/retarget_modes.py",
             "packaged_path": "Python/src/core/retargeting/retarget_modes.py",
-            "sha256": "e78eac27bce8fa1537214d770c3abd01124cb243bb50a7f9ca42cfc1f651e2cd"
+            "sha256": "5dc4db351a5566f425cf26e0246a6b968bab3c6839abfc033dfa616b9400e325"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_RETARGET_OUTPUT_NAMING",
@@ -579,7 +705,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_RETARGET_PREVIEW_EXPORT",
             "source_path": "src/core/retargeting/retarget_preview_export.py",
             "packaged_path": "Python/src/core/retargeting/retarget_preview_export.py",
-            "sha256": "11f17ce866178069bad99be35b7d0020ca4bc5e2d2d7503b005e2ee80b7a9fa8"
+            "sha256": "1c0f8c43e71c8a39932a26a5ec0f392d2ab53c0698da42a274b4dca2a46248de"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_RETARGET_PROFILE",
@@ -597,19 +723,19 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_RETARGET_SOLVER",
             "source_path": "src/core/retargeting/retarget_solver.py",
             "packaged_path": "Python/src/core/retargeting/retarget_solver.py",
-            "sha256": "a67a76dbb3d928d742e8ed0fbe74de8f55f54c5448334019a0f59d0b531c677f"
+            "sha256": "4ae1b423f80a39a5bfd0c43c92fef767e090f2855db14c685b9f8b721cdf967d"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_RETARGET_WORKBENCH_READINESS",
             "source_path": "src/core/retargeting/retarget_workbench_readiness.py",
             "packaged_path": "Python/src/core/retargeting/retarget_workbench_readiness.py",
-            "sha256": "5b6f3c23e138a04116f3e0c9f08b4cb6d7436c51bab417f1e0684feccac559db"
+            "sha256": "6c0bfed3453368242631473c8ffee570ebb9604e002b926b73654540ddbf8643"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_REVERSE_RENAMER",
             "source_path": "src/core/retargeting/reverse_renamer.py",
             "packaged_path": "Python/src/core/retargeting/reverse_renamer.py",
-            "sha256": "91e3bc1070b17f8368f2cb629a8e0fb882938bf2e52a96eda38acc0448c6814f"
+            "sha256": "6257706f25dd8956470a9d3c18ed7157358d4196a70cee6b299a73fccc87e5de"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_ROOT_MOTION",
@@ -633,7 +759,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_SKELETON_RENAMER",
             "source_path": "src/core/retargeting/skeleton_renamer.py",
             "packaged_path": "Python/src/core/retargeting/skeleton_renamer.py",
-            "sha256": "49258a9053dc260a2750dbf3f3f4adc1b4e5144773d596e23e9c49f54be9a3aa"
+            "sha256": "c4a15c70d7ea93f422ca7304409854e03be57642c84bca6061554e559658f2ad"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_SOURCE_ANIMATION",
@@ -669,7 +795,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_UE5_TO_AURORA_R3B_PREVIEW",
             "source_path": "src/core/retargeting/ue5_to_aurora_r3b_preview.py",
             "packaged_path": "Python/src/core/retargeting/ue5_to_aurora_r3b_preview.py",
-            "sha256": "80d6f4eadfcd52d960ff537ce88b57556470897e4f28d59a7dbe0325edd853af"
+            "sha256": "b77be4c737ea0089a1edffd465e89fc642121fe67d138c72f699154025c6fa63"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RETARGETING_UE_FBX_EXPORTER",
@@ -684,10 +810,70 @@
             "sha256": "cfad7db5cc441228b49de8a40717d9040cf10382ec6970a11adb21810896d863"
         },
         {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_INIT",
+            "source_path": "src/core/scripting/__init__.py",
+            "packaged_path": "Python/src/core/scripting/__init__.py",
+            "sha256": "5ee4b660964b4e0c4fca07c626833ac683d7a6993aff7e2fe2357fe32181f529"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_BLUEPRINT_AUTHORING",
+            "source_path": "src/core/scripting/blueprint_authoring.py",
+            "packaged_path": "Python/src/core/scripting/blueprint_authoring.py",
+            "sha256": "aa791a21b8855a882b361c024136557f06e26011183100eb2af84df17ac0ee33"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_DATA_AUTHORING",
+            "source_path": "src/core/scripting/data_authoring.py",
+            "packaged_path": "Python/src/core/scripting/data_authoring.py",
+            "sha256": "02f07e100418af89f9e0d829aa083211422ecc23bb93373a1abf7808110f291a"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_DIALOGUE_CONTRACT",
+            "source_path": "src/core/scripting/dialogue_contract.py",
+            "packaged_path": "Python/src/core/scripting/dialogue_contract.py",
+            "sha256": "696ad06811dd9128ef26aeae55c930dadec8c73a92178097fbdd0b97d68dba8b"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_DIALOGUE_PARTICIPANTS",
+            "source_path": "src/core/scripting/dialogue_participants.py",
+            "packaged_path": "Python/src/core/scripting/dialogue_participants.py",
+            "sha256": "628f06dda2cff3529d3bc8959920e2b7c906d60ff32734aa6a539296c956d4b5"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_PACKAGING",
+            "source_path": "src/core/scripting/packaging.py",
+            "packaged_path": "Python/src/core/scripting/packaging.py",
+            "sha256": "22fcd363ee7f2f15b1658316f1cff46fd414bbbf47a83c6202adcc53e682ace3"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_PROJECT",
+            "source_path": "src/core/scripting/project.py",
+            "packaged_path": "Python/src/core/scripting/project.py",
+            "sha256": "b02888c86ec6be42242a7803d144a5778ea78ec7c465d8937a65aa820ee30127"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_QUEST",
+            "source_path": "src/core/scripting/quest.py",
+            "packaged_path": "Python/src/core/scripting/quest.py",
+            "sha256": "2ec350c76475249435c85923f2fc1bd3d1a9ce65c5a9bfc1db4b1fc93209c515"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_REFERENCE",
+            "source_path": "src/core/scripting/reference.py",
+            "packaged_path": "Python/src/core/scripting/reference.py",
+            "sha256": "a06416823871b4dcdc31285270e158c9185937d22f2ba6374be765976197a297"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_SCRIPTING_STUDIO",
+            "source_path": "src/core/scripting/studio.py",
+            "packaged_path": "Python/src/core/scripting/studio.py",
+            "sha256": "bb93a5f9cd6114203273b0a6b98386d8372b23af59f64ff82a26f65da87734e5"
+        },
+        {
             "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_INIT",
             "source_path": "src/core/workflow/__init__.py",
             "packaged_path": "Python/src/core/workflow/__init__.py",
-            "sha256": "205bb145f562f93f1cc8e1edce79a67ccaa94f21562cdc75a0b53e9d4860d557"
+            "sha256": "e81f1d634dc3c5cc9c82c4f6975626834780d340658a5abc471efedcf7a7616f"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_WORKFLOW_BASE",
@@ -699,7 +885,43 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_COMPOSITE_WORKFLOW",
             "source_path": "src/core/workflow/composite_workflow.py",
             "packaged_path": "Python/src/core/workflow/composite_workflow.py",
-            "sha256": "e5a2afb2383233eb69e52ba9b4402462856b26c402c542e296838b63bf538399"
+            "sha256": "92a955da2308fc3a01d95f3b33bcdd30612cbc6a518dfed8cdaae3fef3bf91c0"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_LEGACY_MODULE_REPAIR",
+            "source_path": "src/core/workflow/legacy_module_repair.py",
+            "packaged_path": "Python/src/core/workflow/legacy_module_repair.py",
+            "sha256": "5881eda9db1698d7dd2a96c337e06393607b67d7ba4222615f073287b9acc673"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_LEGACY_TEXTURE_PORT",
+            "source_path": "src/core/workflow/legacy_texture_port.py",
+            "packaged_path": "Python/src/core/workflow/legacy_texture_port.py",
+            "sha256": "6582b0abb649fbbd3ccea3b05e7097f83fa411e401dd236773d25b19036b14a5"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_MAP_STUDIO_LIGHTMAP_APPLY",
+            "source_path": "src/core/workflow/map_studio_lightmap_apply.py",
+            "packaged_path": "Python/src/core/workflow/map_studio_lightmap_apply.py",
+            "sha256": "4de914165a4ef51145b3b9af26d3eb48a3ab35bf07ff41a87efd81c329fcfa49"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_PARTICLE_PLACEABLE_EXPORT",
+            "source_path": "src/core/workflow/particle_placeable_export.py",
+            "packaged_path": "Python/src/core/workflow/particle_placeable_export.py",
+            "sha256": "66e07163790cabf5cfe0e80acd1aa917ece9be120418adf2c29cb1d9daa56116"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_PLACEABLE_BUILDER_SERVICE",
+            "source_path": "src/core/workflow/placeable_builder_service.py",
+            "packaged_path": "Python/src/core/workflow/placeable_builder_service.py",
+            "sha256": "5372075e44ff9eeb04a880b9a7db0b6eb2452123f4997a97933e2f49fc3daa35"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_WORKFLOW_PLCAA_MANUAL_PROOF_KIT",
+            "source_path": "src/core/workflow/plcaa_manual_proof_kit.py",
+            "packaged_path": "Python/src/core/workflow/plcaa_manual_proof_kit.py",
+            "sha256": "4ac7f128be2d7b7b429fde687c8c96a97ad7bdbeaba786eb6801f6e3738db5b2"
         }
     ]
 }

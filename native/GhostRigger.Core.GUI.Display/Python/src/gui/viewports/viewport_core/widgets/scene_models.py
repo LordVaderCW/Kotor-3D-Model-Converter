@@ -11,6 +11,8 @@ try:
 except Exception:  # pragma: no cover - compatibility for direct package execution
     from core.scene.node_identity import classify_scene_model, classify_scene_node  # type: ignore
 
+from src.systems.bas.preview_composer import bas_runtime_source_copy_memo
+
 
 class ViewportSceneModelMixin:
     def load_model(
@@ -20,9 +22,22 @@ class ViewportSceneModelMixin:
         extra_texture_dirs: Optional[list[str]] = None,
         texture_cache: Optional[dict[str, bytes]] = None,
     ) -> None:
+        authored_texture_cache = dict(texture_cache or {})
+        clear_published = getattr(
+            self._renderer.tex_cache,
+            "clear_published_images",
+            None,
+        )
+        if callable(clear_published):
+            clear_published()
         old_model = self.model
         if old_model is not None and old_model is not model:
             clear_prebuilt_static_gpu_model_data(old_model)
+        if model is not None and model is not old_model:
+            # Authored candidates are commonly deep copies of an already
+            # rendered donor. Never accept copied GPU geometry snapshots as
+            # truth for a newly loaded model.
+            clear_prebuilt_static_gpu_model_data(model)
         self.model = model
         self._hovered_mesh_node = None
         self._hovered_mesh_face_bounds = None
@@ -59,7 +74,7 @@ class ViewportSceneModelMixin:
             self.renderer_button.setChecked(True)
             self.renderer_button.setToolTip("GPU renderer")
             self.canvas.setPixmap(QtGui.QPixmap())
-            self.canvas.setText("Empty Scene")
+            self.canvas.setText("" if self._map_studio_should_hide_empty_scene_label() else "Empty Scene")
             self._update_uv_viewer_model()
             self.camera_manager.set_model(None)
             self._refresh_camera_view_combo()
@@ -87,6 +102,15 @@ class ViewportSceneModelMixin:
                 search_dirs.append(directory)
         if search_dirs:
             self._renderer.tex_cache.set_search_dirs(search_dirs)
+        for texture_name, texture_bytes in authored_texture_cache.items():
+            if not self._renderer.tex_cache.publish_bytes(
+                str(texture_name),
+                bytes(texture_bytes),
+            ):
+                log.warning(
+                    "Viewport could not decode authored texture preview %s",
+                    texture_name,
+                )
 
         if not getattr(model, "_gr_bounds_prepared", False):
             self._compute_bb(model)
@@ -196,6 +220,10 @@ class ViewportSceneModelMixin:
             pass
         self._renderer.set_model(composite)
         self.camera_manager.set_model(composite)
+        self._gpu_tex_preload_model_id = 0
+        self._gpu_texture_snapshot_key = None
+        self._gpu_texture_snapshot_cache = {}
+        self._prewarm_textures(composite)
         self.modelChanged.emit(composite)
         self.select_scene_object(str(getattr(instance, "id", "") or ""))
         self._request_render(fast=True, reason="scene object appended", scene=True, overlay=True, resources=True)
@@ -214,6 +242,7 @@ class ViewportSceneModelMixin:
         setattr(root, "_gr_scene_composite_root", True)
         composite = KotorModel(name=scene_name or "Untitled Scene", root_node=root)
         first_model = None
+        prebuilt_mesh_count = 0
         for instance in visible:
             object_type = str(getattr(instance, "object_type", "") or "").lower()
             if object_type == "camera":
@@ -231,8 +260,9 @@ class ViewportSceneModelMixin:
             animation_source_model = instance_metadata.get("_runtime_bas_body_model") or runtime_model
             scene_identity = classify_scene_model(runtime_model, getattr(instance, "source_ref", None))
             first_model = first_model or runtime_model
+            prebuilt_mesh_count += int(getattr(runtime_model, "_gr_gpu_prebuilt_mesh_count", 0) or 0)
             try:
-                node = copy.deepcopy(model_root)
+                node = copy.deepcopy(model_root, bas_runtime_source_copy_memo(model_root))
             except Exception:
                 node = model_root.clone_shallow()
                 node.children = []
@@ -283,6 +313,7 @@ class ViewportSceneModelMixin:
             composite.game_version = getattr(first_model, "game_version", composite.game_version)
             composite.classification = "scene"
             composite.model_type = getattr(first_model, "model_type", composite.model_type)
+            setattr(composite, "_gr_gpu_prebuilt_mesh_count", prebuilt_mesh_count)
         try:
             composite.compute_bounds()
             setattr(composite, "_gr_bounds_prepared", True)
@@ -618,6 +649,7 @@ class ViewportSceneModelMixin:
         """Display Map Studio authored placement marker geometry."""
 
         self._map_studio_marker_geometry = geometry
+        self._clear_map_studio_shared_debug_labels()
         self._request_render(fast=True, reason="map studio marker geometry changed", overlay=True)
 
     def clear_map_studio_marker_geometry(self) -> None:
@@ -625,10 +657,35 @@ class ViewportSceneModelMixin:
 
         self.set_map_studio_marker_geometry(None)
 
+    def set_live_surface_overlay_suppressed(self, suppressed: bool) -> None:
+        """Keep runtime animation off the QWidget overlay above native WGPU.
+
+        Windows does not reliably alpha-compose a Qt sibling over the native
+        child surface used by pygfx/WGPU.  The overlay remains correct for
+        static authoring feedback, but continuously replacing it can cover the
+        renderer for alternating frames.  Runtime-style modes call this once
+        on entry and render their moving content in the retained 3D scene.
+        """
+
+        wanted = bool(suppressed)
+        if wanted == bool(getattr(self, "_live_surface_overlay_suppressed", False)):
+            return
+        self._live_surface_overlay_suppressed = wanted
+        if wanted and self.canvas.is_live_surface():
+            self.canvas.clear_overlay()
+            self._pixmap = None
+        self._request_render(
+            fast=True,
+            reason="native live overlay suppressed" if wanted else "native live overlay restored",
+            scene=True,
+            camera=True,
+        )
+
     def set_map_studio_room_outline_geometry(self, geometry: object | None) -> None:
         """Display Map Studio authored room outline geometry."""
 
         self._map_studio_room_outline_geometry = geometry
+        self._clear_map_studio_shared_debug_labels()
         self._request_render(fast=True, reason="map studio room outline geometry changed", overlay=True)
 
     def clear_map_studio_room_outline_geometry(self) -> None:
@@ -658,10 +715,51 @@ class ViewportSceneModelMixin:
 
         self.set_map_studio_room_outline_edge_highlight(None)
 
+    def set_map_studio_building_preview(self, preview: object | None) -> None:
+        """Display the transient direct-wall path on the shared overlay layer."""
+
+        self._map_studio_building_preview = preview if isinstance(preview, dict) else None
+        self._clear_map_studio_shared_debug_labels()
+        self._request_render(fast=True, reason="map studio building preview changed", overlay=True)
+
+    def clear_map_studio_building_preview(self) -> None:
+        self.set_map_studio_building_preview(None)
+
+    def set_map_studio_level_presentation(self, presentation: object | None) -> None:
+        """Display level filtering/spacing without changing authored geometry."""
+
+        self._map_studio_level_presentation = dict(presentation) if isinstance(presentation, dict) else {}
+        self._request_render(fast=True, reason="map studio level presentation changed", overlay=True)
+
+    def set_map_studio_universal_transform_overlay(self, overlay: object | None) -> None:
+        """Display Map Studio Universal Manipulator bounds and dimensions."""
+
+        self._map_studio_universal_transform_overlay = overlay
+        self._clear_map_studio_shared_debug_labels()
+        self._request_render(fast=True, reason="map studio universal transform changed", overlay=True)
+
+    def clear_map_studio_universal_transform_overlay(self) -> None:
+        """Remove Map Studio Universal Manipulator bounds and dimensions."""
+
+        self.set_map_studio_universal_transform_overlay(None)
+
+    def set_map_studio_modeling_points_overlay(self, overlay: object | None) -> None:
+        """Display non-mutating point/polyline feedback for a modeling tool."""
+
+        self._map_studio_modeling_points_overlay = overlay if isinstance(overlay, dict) else None
+        self._clear_map_studio_shared_debug_labels()
+        self._request_render(fast=True, reason="map studio modeling points changed", overlay=True)
+
+    def clear_map_studio_modeling_points_overlay(self) -> None:
+        """Remove the active modeling tool's point/polyline feedback."""
+
+        self.set_map_studio_modeling_points_overlay(None)
+
     def set_map_studio_terrain_walkability_overlay(self, overlay: object | None) -> None:
         """Display Map Studio terrain WOK walkability classification."""
 
         self._map_studio_terrain_walkability_overlay = overlay
+        self._clear_map_studio_shared_debug_labels()
         self._request_render(fast=True, reason="map studio terrain walkability changed", overlay=True)
 
     def clear_map_studio_terrain_walkability_overlay(self) -> None:
@@ -673,12 +771,112 @@ class ViewportSceneModelMixin:
         """Display the live Map Studio terrain sculpt brush cursor."""
 
         self._map_studio_terrain_brush_cursor = cursor if isinstance(cursor, dict) else None
+        self._clear_map_studio_shared_debug_labels()
         self._request_render(fast=True, reason="map studio terrain brush cursor changed", overlay=True)
 
     def clear_map_studio_terrain_brush_cursor(self) -> None:
         """Remove the live Map Studio terrain sculpt brush cursor."""
 
         self.set_map_studio_terrain_brush_cursor(None)
+
+    def set_map_studio_texture_paint_cursor(self, cursor: object | None) -> None:
+        """Display a UV-aware size/hardness cursor for live texture paint."""
+
+        self._map_studio_texture_paint_cursor = cursor if isinstance(cursor, dict) else None
+        self._clear_map_studio_shared_debug_labels()
+        self._request_render(fast=True, reason="map studio texture paint cursor changed", overlay=True)
+
+    def clear_map_studio_texture_paint_cursor(self) -> None:
+        """Remove the live Map Studio texture-paint cursor."""
+
+        self.set_map_studio_texture_paint_cursor(None)
+
+    def set_map_studio_hover_highlight(self, payload: object | None) -> None:
+        """Display the read-only Map Studio hover-picker highlight."""
+
+        self._map_studio_hover_highlight = payload if isinstance(payload, dict) else None
+        self._request_render(fast=True, reason="map studio hover highlight changed", overlay=True)
+
+    def set_map_studio_component_selection(self, payload: object | None) -> None:
+        """Display the Maya-style yellow component selection set."""
+
+        self._map_studio_component_selection = list(payload) if isinstance(payload, (list, tuple)) else []
+        self._request_render(fast=True, reason="map studio component selection changed", overlay=True)
+
+    def set_map_studio_room_primitive_selection(self, payload: object | None) -> None:
+        """Display the Maya-style multi-object selection in Map Studio."""
+
+        self._map_studio_room_primitive_selection = list(payload) if isinstance(payload, (list, tuple)) else []
+        self._request_render(fast=True, reason="map studio primitive selection changed", overlay=True)
+
+    def set_map_studio_component_extrude(self, payload: object | None) -> None:
+        """Display the interactive extrude gizmo (anchor/axis arrow + distance)."""
+
+        self._map_studio_component_extrude = payload if isinstance(payload, dict) else None
+        self._request_render(fast=True, reason="map studio extrude gizmo changed", overlay=True)
+
+    def clear_map_studio_hover_highlight(self) -> None:
+        """Remove the Map Studio hover-picker highlight."""
+
+        self.set_map_studio_hover_highlight(None)
+
+    def set_map_studio_viewport_presentation(self, presentation: object | None) -> None:
+        """Apply Map Studio-specific clean viewport display preferences."""
+
+        self._map_studio_viewport_presentation = dict(presentation) if isinstance(presentation, dict) else {}
+        self._clear_map_studio_shared_debug_labels()
+        self._request_render(fast=True, reason="map studio viewport presentation changed", overlay=True, hud=True)
+
+    def clear_map_studio_viewport_presentation(self) -> None:
+        """Restore the shared viewport's default overlay presentation."""
+
+        self.set_map_studio_viewport_presentation(None)
+
+    def _map_studio_should_hide_empty_scene_label(self) -> bool:
+        """Return True when Map Studio owns authored viewport content despite no loaded model."""
+
+        if bool(self.property("_gr_map_studio_clean_viewport")):
+            return True
+        for name in (
+            "_map_studio_room_outline_geometry",
+            "_map_studio_marker_geometry",
+            "_map_studio_terrain_walkability_overlay",
+            "_map_studio_universal_transform_overlay",
+            "_map_studio_terrain_brush_cursor",
+            "_map_studio_texture_paint_cursor",
+            "_map_studio_modeling_points_overlay",
+            "_map_studio_building_preview",
+        ):
+            if getattr(self, name, None) is not None:
+                return True
+        return False
+
+    def _clear_map_studio_shared_debug_labels(self) -> None:
+        if not self._map_studio_should_hide_empty_scene_label():
+            return
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return
+        clear_diagnostics = getattr(canvas, "clear_diagnostics_text", None)
+        if callable(clear_diagnostics):
+            clear_diagnostics()
+        surface_getter = getattr(canvas, "current_surface", None)
+        surface = surface_getter() if callable(surface_getter) else None
+        if isinstance(surface, QtWidgets.QLabel):
+            # RendererSurfaceHost.setText() deliberately switches a retained
+            # QLabel from pixmap mode to text mode. Map Studio publishes
+            # transient marker geometry while PIE moves, so calling it with an
+            # empty string here discarded the current world frame every time
+            # the runtime overlay changed. A populated pixmap already hides
+            # the shared empty-scene label; only clear fallback text when no
+            # retained frame exists.
+            pixmap = surface.pixmap()
+            if (pixmap is None or pixmap.isNull()) and surface.text():
+                surface.setText("")
+            return
+        set_text = getattr(canvas, "setText", None)
+        if callable(set_text):
+            set_text("")
 
     def _fit_external_skeleton_overlay(self, skeleton) -> None:
         """Fit a KOTOR template skeleton preview to the active source mesh."""
@@ -779,6 +977,9 @@ class ViewportSceneModelMixin:
                 throttle_diagnostics=bool(getattr(settings, "throttle_diagnostics", True)),
                 diagnostics_hz=float(getattr(settings, "diagnostics_hz", 2.0) or 2.0),
                 overlay_dirty_rendering=bool(getattr(settings, "overlay_dirty_rendering", True)),
+                bloom_enabled=bool(getattr(settings, "bloom_enabled", True)),
+                bloom_threshold=float(getattr(settings, "bloom_threshold", 0.82)),
+                bloom_strength=float(getattr(settings, "bloom_strength", 0.18)),
             )
         else:
             new_settings = RendererSettings.from_settings(settings or {})
@@ -809,6 +1010,24 @@ class ViewportSceneModelMixin:
 
     def set_resource_manager(self, manager, game_tag: str = "K1") -> None:
         self._renderer.tex_cache.set_resource_manager(manager, game_tag)
+        model = getattr(self, "model", None)
+        if model is not None:
+            try:
+                self._gpu_tex_preload_model_id = 0
+                self._gpu_texture_snapshot_key = None
+                self._gpu_texture_snapshot_cache = {}
+                self._prewarm_textures(model)
+            except Exception:
+                log.debug("Viewport texture rewarm after resource manager change failed", exc_info=True)
+            request_render = getattr(self, "_request_render", None)
+            if callable(request_render):
+                request_render(
+                    reason="resource manager changed",
+                    resources=True,
+                    scene=True,
+                    overlay=True,
+                    hud=True,
+                )
 
     @property
     def tex_cache(self):

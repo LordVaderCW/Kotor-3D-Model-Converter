@@ -67,19 +67,21 @@ from .import_normalisation import apply_known_skin_bone_map_normalisations
 #            that LBS and texture-pipeline code can locate them via is_mesh.
 #            is_dummy stays False because HEADER|MESH|SKIN (0x61) ≠ 0x01.
 #            Viewport code uses 'if n.is_skin: skip' paths separately.
-#   TRIMESH→ NodeFlags.MESH only (0x20), matching the old bridge.
+#   TRIMESH→ NodeFlags.HEADER|MESH (0x21), matching the raw binary MDL flags
+#            used by stock KOTOR models.  Reloaded models must preserve this
+#            header bit so a write-after-read does not emit bare 0x20 helpers.
 _TYPE_FLAGS: Dict[int, int] = {
     int(MDLNodeType.DUMMY):      int(NodeFlags.HEADER),
-    int(MDLNodeType.TRIMESH):    int(NodeFlags.MESH),
-    int(MDLNodeType.DANGLYMESH): int(NodeFlags.MESH) | int(NodeFlags.DANGLY),
-    int(MDLNodeType.LIGHT):      int(NodeFlags.LIGHT),
-    int(MDLNodeType.EMITTER):    int(NodeFlags.EMITTER),
-    int(MDLNodeType.REFERENCE):  int(NodeFlags.REFERENCE),
-    int(MDLNodeType.AABB):       int(NodeFlags.AABB),
+    int(MDLNodeType.TRIMESH):    int(NodeFlags.HEADER) | int(NodeFlags.MESH),
+    int(MDLNodeType.DANGLYMESH): int(NodeFlags.HEADER) | int(NodeFlags.MESH) | int(NodeFlags.DANGLY),
+    int(MDLNodeType.LIGHT):      int(NodeFlags.HEADER) | int(NodeFlags.LIGHT),
+    int(MDLNodeType.EMITTER):    int(NodeFlags.HEADER) | int(NodeFlags.EMITTER),
+    int(MDLNodeType.REFERENCE):  int(NodeFlags.HEADER) | int(NodeFlags.REFERENCE),
+    int(MDLNodeType.AABB):       int(NodeFlags.HEADER) | int(NodeFlags.AABB),
     int(MDLNodeType.SKIN):       int(NodeFlags.HEADER) | int(NodeFlags.MESH) | int(NodeFlags.SKIN),
-    int(MDLNodeType.SABER):      int(NodeFlags.SABER) | int(NodeFlags.MESH),
+    int(MDLNodeType.SABER):      int(NodeFlags.HEADER) | int(NodeFlags.SABER) | int(NodeFlags.MESH),
     int(MDLNodeType.CAMERA):     int(NodeFlags.HEADER),
-    int(MDLNodeType.PATCH):      int(NodeFlags.MESH),
+    int(MDLNodeType.PATCH):      int(NodeFlags.HEADER) | int(NodeFlags.MESH),
     int(MDLNodeType.BINARY):     int(NodeFlags.HEADER),
 }
 
@@ -143,6 +145,9 @@ def load_model_from_bytes(
     try:
         pk_mdl = pk_read_mdl(patched_bytes, source_ext=mdx_bytes if mdx_bytes else None)
         model  = _mdl_to_kotormodel(pk_mdl, detected_version)
+        _apply_raw_supernode_numbers(model, mdl_bytes)
+        _apply_raw_super_root_link(model, mdl_bytes)
+        _apply_raw_mesh_header_counts(model, mdl_bytes, mdx_bytes)
         # Override classification from raw byte if known
         if raw_cls_byte is not None:
             model.classification = _CLS_MAP_BYTES.get(raw_cls_byte, 'character')
@@ -182,6 +187,7 @@ def load_model_from_file(
 
     # Detect game version from function pointer before passing to PyKotor
     mdl_bytes_raw = p.read_bytes()
+    mdx_bytes_raw = mdx_p.read_bytes() if mdx_p is not None else b''
     detected_version = game_version or _detect_version_from_bytes(mdl_bytes_raw)
 
     _CLS_MAP_FILE: Dict[int, str] = {
@@ -195,6 +201,9 @@ def load_model_from_file(
     try:
         pk_mdl = pk_read_mdl(p, source_ext=mdx_p)
         model  = _mdl_to_kotormodel(pk_mdl, detected_version)
+        _apply_raw_supernode_numbers(model, mdl_bytes_raw)
+        _apply_raw_super_root_link(model, mdl_bytes_raw)
+        _apply_raw_mesh_header_counts(model, mdl_bytes_raw, mdx_bytes_raw)
         # Override classification from raw byte for accuracy
         if raw_cls_byte_f is not None:
             model.classification = _CLS_MAP_FILE.get(raw_cls_byte_f, 'character')
@@ -208,6 +217,292 @@ def load_model_from_file(
     except Exception as exc:
         log.error("load_model_from_file: '%s' — %s", mdl_path, exc, exc_info=True)
         return None
+
+
+def _apply_raw_supernode_numbers(
+    model: Optional[KotorModel],
+    mdl_bytes: bytes,
+) -> None:
+    """Recover node-header +2 identities that PyKotor does not expose.
+
+    The field is a sparse supermodel-node identity, not a DFS array index.
+    Character animation matching and modular-head attachment compare it
+    directly. PyKotor preserves the +4 name-table index as ``node_id`` but
+    drops +2, so retain the latter in ``ModelNode.number`` for round-tripping.
+    """
+
+    if model is None or len(mdl_bytes) < 92:
+        return
+    base = 12
+    try:
+        root_rel = struct.unpack_from("<I", mdl_bytes, base + 40)[0]
+        geometry_node_count = struct.unpack_from(
+            "<I", mdl_bytes, base + 44
+        )[0]
+    except struct.error:
+        return
+    # Preserve the raw field rather than replacing it with the number of
+    # locally traversed records. Supermodel-derived characters use a
+    # cumulative inheritance-chain span here (PFHA04: 564 declared / 38
+    # local), which retail needs when it follows a modular neck_g link.
+    model.geometry_node_count = int(geometry_node_count)
+    if root_rel <= 0:
+        return
+
+    number_by_name_index: Dict[int, int] = {}
+    queue = [int(root_rel)]
+    seen: set[int] = set()
+    while queue:
+        node_rel = queue.pop(0)
+        if node_rel in seen:
+            continue
+        seen.add(node_rel)
+        node_abs = base + node_rel
+        if node_abs < base or node_abs + 80 > len(mdl_bytes):
+            continue
+        try:
+            supernode_number = struct.unpack_from("<H", mdl_bytes, node_abs + 2)[0]
+            name_index = struct.unpack_from("<H", mdl_bytes, node_abs + 4)[0]
+            child_array_rel = struct.unpack_from("<I", mdl_bytes, node_abs + 44)[0]
+            child_count = struct.unpack_from("<I", mdl_bytes, node_abs + 48)[0]
+        except struct.error:
+            continue
+        number_by_name_index[int(name_index)] = int(supernode_number)
+        child_array_abs = base + int(child_array_rel)
+        if (
+            child_array_rel <= 0
+            or child_count <= 0
+            or child_count > 0x10000
+            or child_array_abs + int(child_count) * 4 > len(mdl_bytes)
+        ):
+            continue
+        for child_index in range(int(child_count)):
+            child_rel = struct.unpack_from(
+                "<I", mdl_bytes, child_array_abs + child_index * 4
+            )[0]
+            if child_rel > 0:
+                queue.append(int(child_rel))
+
+    if not number_by_name_index:
+        return
+    for node in model.all_nodes():
+        name_index = int(getattr(node, "index", -1) or 0)
+        if name_index in number_by_name_index:
+            node.number = number_by_name_index[name_index]
+    for animation in list(getattr(model, "animations", []) or []):
+        for node in list(getattr(animation, "nodes", []) or []):
+            name_index = int(getattr(node, "index", -1) or 0)
+            if name_index in number_by_name_index:
+                node.number = number_by_name_index[name_index]
+    setattr(model, "_gr_native_supernode_numbers", dict(number_by_name_index))
+    # A complete, collision-free binary identity map is safe to round-trip
+    # through the full writer.  Without this opt-in the writer intentionally
+    # falls back to dense DFS numbering, which breaks stock modular heads such
+    # as PFHA04 even though their sparse +2 identities were read correctly.
+    geometry_nodes = list(model.all_nodes())
+    geometry_numbers = [
+        int(getattr(node, "number", -1))
+        for node in geometry_nodes
+    ]
+    model.preserve_native_supernode_numbers = bool(
+        geometry_nodes
+        and len(number_by_name_index) == len(geometry_nodes)
+        and all(0 <= value <= 0xFFFF for value in geometry_numbers)
+        and len(set(geometry_numbers)) == len(geometry_numbers)
+    )
+
+
+def _apply_raw_super_root_link(
+    model: Optional[KotorModel],
+    mdl_bytes: bytes,
+) -> None:
+    """Preserve a non-root model-header attachment link.
+
+    The geometry header and model header normally point at the same root node.
+    Stock modular player heads deliberately differ: the geometry root remains
+    the AuroraBase, while ``offset_to_super_root`` points at ``neck_g``. This is
+    the binary contract historically restored by VarsityPuppet's HeadFixer.
+    PyKotor does not expose the second pointer, so recover its target by raw
+    node offset for lossless Ghost Studio read/write behavior.
+    """
+
+    if model is None or len(mdl_bytes) < 12 + 196:
+        return
+    base = 12
+    try:
+        geometry_root_rel = int(
+            struct.unpack_from("<I", mdl_bytes, base + 40)[0]
+        )
+        super_root_rel = int(
+            struct.unpack_from("<I", mdl_bytes, base + 80 + 88)[0]
+        )
+    except struct.error:
+        return
+    if (
+        geometry_root_rel <= 0
+        or super_root_rel <= 0
+        or super_root_rel == geometry_root_rel
+    ):
+        model.super_root_node_name = ""
+        return
+
+    target_abs = base + super_root_rel
+    if target_abs < base or target_abs + 80 > len(mdl_bytes):
+        log.warning(
+            "MDL offset_to_super_root 0x%X lies outside the geometry data",
+            super_root_rel,
+        )
+        return
+    try:
+        name_index = int(struct.unpack_from("<H", mdl_bytes, target_abs + 4)[0])
+        name_table_rel = int(
+            struct.unpack_from("<I", mdl_bytes, base + 80 + 104)[0]
+        )
+        name_count = int(
+            struct.unpack_from("<I", mdl_bytes, base + 80 + 108)[0]
+        )
+        if not 0 <= name_index < name_count:
+            return
+        name_offset_rel = int(
+            struct.unpack_from(
+                "<I",
+                mdl_bytes,
+                base + name_table_rel + name_index * 4,
+            )[0]
+        )
+        name_start = base + name_offset_rel
+        name_end = mdl_bytes.find(b"\0", name_start)
+        if name_start < base or name_end < name_start:
+            return
+        target_name = mdl_bytes[name_start:name_end].decode(
+            "ascii", errors="replace"
+        )
+    except (struct.error, ValueError):
+        return
+
+    matches = [
+        node
+        for node in model.all_nodes()
+        if str(getattr(node, "name", "") or "").casefold()
+        == target_name.casefold()
+    ]
+    if len(matches) != 1:
+        log.warning(
+            "MDL offset_to_super_root target %r matched %d converted nodes",
+            target_name,
+            len(matches),
+        )
+        return
+    model.super_root_node_name = str(matches[0].name)
+    setattr(
+        model,
+        "_gr_raw_super_root_link",
+        {
+            "geometry_root_offset": geometry_root_rel,
+            "super_root_offset": super_root_rel,
+            "node": str(matches[0].name),
+        },
+    )
+
+
+def _apply_raw_mesh_header_counts(
+    model: Optional[KotorModel],
+    mdl_bytes: bytes,
+    mdx_bytes: bytes = b'',
+) -> None:
+    """Preserve raw mesh header fields lost by PyKotor's object model."""
+
+    if model is None or not mdl_bytes:
+        return
+    try:
+        from ..mdl.ghostrigger_mdl_reader import GhostRiggerMDLBinaryReader
+
+        reader = GhostRiggerMDLBinaryReader(
+            mdl_bytes,
+            0,
+            len(mdl_bytes),
+            mdx_bytes or b'',
+            0,
+            len(mdx_bytes or b''),
+        )
+        reader.load()
+        raw_mesh_headers: Dict[int, Dict[str, object]] = {}
+        for _offset, bin_node in sorted((getattr(reader, "_gr_bin_nodes", None) or {}).items()):
+            header = getattr(bin_node, "header", None)
+            trimesh = getattr(bin_node, "trimesh", None)
+            if header is None or trimesh is None:
+                continue
+            try:
+                node_id = int(getattr(header, "node_id"))
+            except Exception:
+                continue
+            raw_mesh_headers.setdefault(
+                node_id,
+                {
+                    "tex_count": max(0, int(getattr(trimesh, "texture_count", 0) or 0)),
+                    "has_lightmap": bool(getattr(trimesh, "has_lightmap", False)),
+                    "rotate_texture": bool(getattr(trimesh, "rotate_texture", False)),
+                    "background_geometry": bool(getattr(trimesh, "background", False)),
+                    "has_shadow": bool(getattr(trimesh, "has_shadow", False)),
+                    "beaming": bool(getattr(trimesh, "beaming", False)),
+                    "render": bool(getattr(trimesh, "render", True)),
+                    "transparency_hint": int(getattr(trimesh, "transparency_hint", 0) or 0),
+                    "diffuse": (
+                        float(getattr(getattr(trimesh, "diffuse", None), "x", 1.0)),
+                        float(getattr(getattr(trimesh, "diffuse", None), "y", 1.0)),
+                        float(getattr(getattr(trimesh, "diffuse", None), "z", 1.0)),
+                    ),
+                    "ambient": (
+                        float(getattr(getattr(trimesh, "ambient", None), "x", 1.0)),
+                        float(getattr(getattr(trimesh, "ambient", None), "y", 1.0)),
+                        float(getattr(getattr(trimesh, "ambient", None), "z", 1.0)),
+                    ),
+                    "dirt_enabled": bool(getattr(trimesh, "dirt_enabled", False)),
+                    "dirt_texture": int(getattr(trimesh, "dirt_texture", 0) or 0),
+                    "dirt_coord_space": int(getattr(trimesh, "dirt_worldspace", 0) or 0),
+                    "hide_in_holograms": bool(getattr(trimesh, "hologram_donotdraw", False)),
+                    "mesh_indices_counts": [
+                        int(value) for value in (getattr(trimesh, "indices_counts", []) or [])
+                    ],
+                    "mesh_inverted_counters": [
+                        int(value) for value in (getattr(trimesh, "inverted_counters", []) or [])
+                    ],
+                },
+            )
+        if not raw_mesh_headers:
+            return
+        for node in model.all_nodes():
+            try:
+                node_id = int(getattr(node, "index"))
+            except Exception:
+                continue
+            raw_header = raw_mesh_headers.get(node_id)
+            if not raw_header:
+                continue
+            tex_count = int(raw_header["tex_count"])
+            node.tex_count = tex_count
+            setattr(node, "_gr_raw_tex_count", tex_count)
+            for attr in (
+                "has_lightmap",
+                "rotate_texture",
+                "background_geometry",
+                "has_shadow",
+                "beaming",
+                "render",
+                "transparency_hint",
+                "diffuse",
+                "ambient",
+                "dirt_enabled",
+                "dirt_texture",
+                "dirt_coord_space",
+                "hide_in_holograms",
+                "mesh_indices_counts",
+                "mesh_inverted_counters",
+            ):
+                setattr(node, attr, raw_header[attr])
+            setattr(node, "_gr_raw_mesh_header", dict(raw_header))
+    except Exception as exc:
+        log.debug("raw mesh header preservation failed: %s", exc, exc_info=True)
 
 
 def _game_name(game: Optional[object], model: Optional[KotorModel] = None) -> str:
@@ -514,6 +809,7 @@ def _mdl_to_kotormodel(pk_mdl, game_version: Optional[GameVersion]) -> KotorMode
     model.supermodel  = str(getattr(pk_mdl, 'supermodel', 'NULL') or 'NULL')
     model.anim_scale  = float(getattr(pk_mdl, 'animation_scale', 1.0) or 1.0)
     model.game_version = game_version or _detect_version(pk_mdl)
+    model.disable_fog = bool(getattr(pk_mdl, 'fog', False))
 
     # Classification: read raw byte from binary header (bytes BASE+80 = model_type)
     # and map using GhostRigger's ModelClassification table (differs from PyKotor's enum).
@@ -532,10 +828,16 @@ def _mdl_to_kotormodel(pk_mdl, game_version: Optional[GameVersion]) -> KotorMode
         model.classification = 'character'
         model.model_type = 4
 
+    declared_bb_min = model.bb_min
+    declared_bb_max = model.bb_max
+    declared_radius = model.radius
     try:
         model.bb_min = (float(pk_mdl.bmin.x), float(pk_mdl.bmin.y), float(pk_mdl.bmin.z))
         model.bb_max = (float(pk_mdl.bmax.x), float(pk_mdl.bmax.y), float(pk_mdl.bmax.z))
         model.radius = float(getattr(pk_mdl, 'radius', 0.0) or 0.0)
+        declared_bb_min = model.bb_min
+        declared_bb_max = model.bb_max
+        declared_radius = model.radius
     except Exception:
         pass
 
@@ -567,7 +869,19 @@ def _mdl_to_kotormodel(pk_mdl, game_version: Optional[GameVersion]) -> KotorMode
     except Exception as _vs_exc:
         log.debug("vertex_space assignment failed: %s", _vs_exc)
 
+    # Keep the binary model-header envelope source-preserving.  Retail
+    # character heads commonly declare deliberately broad culling bounds that
+    # differ from their tight rendered-geometry bounds.  The viewport still
+    # needs the latter, so compute and expose it through the established
+    # ``_gr_render_bounds`` side channel, then restore the serialized values
+    # for round-trip writing.
     model.compute_bounds()
+    setattr(model, "_gr_render_bounds", (model.bb_min, model.bb_max))
+    setattr(model, "_gr_render_radius", model.radius)
+    setattr(model, "_gr_bounds_prepared", True)
+    model.bb_min = declared_bb_min
+    model.bb_max = declared_bb_max
+    model.radius = declared_radius
     _fill_missing_normals(model)
     _apply_bind_pose(model)
     return model
@@ -686,6 +1000,15 @@ def _convert_node(pk_node, parent: Optional[ModelNode],
 
     if ntype == int(MDLNodeType.LIGHT):
         _read_light(pk_node, gr)
+
+    if ntype == int(MDLNodeType.EMITTER):
+        _read_emitter(pk_node, gr)
+
+    if ntype == int(MDLNodeType.REFERENCE):
+        reference = getattr(pk_node, 'reference', None)
+        if reference is not None:
+            gr.reference_model = str(getattr(reference, 'model', '') or '')
+            gr.reference_reattachable = bool(getattr(reference, 'reattachable', False))
 
     # Recurse children
     for child_pk in (pk_node.children or []):
@@ -862,6 +1185,11 @@ def _read_mesh(mesh, gr: ModelNode) -> None:
     # tangent data), NOT the tangent vector list.  Do NOT iterate it.
     # PyKotor does not expose pre-computed tangent vectors in this version;
     # tangents are computed on-demand in the exporter from normals+UVs.
+    # Preserve the source MDX channel contract separately so the binary writer
+    # can keep known no-tangent models (for example c_drexlf) compact while
+    # rebuilding the full B/T/N rows used by bump-mapped models such as
+    # c_rancor.
+    gr.mdx_tangent_space = bool(getattr(mesh, 'tangent_space', False))
     gr.tangents = []  # filled by exporter when needed
 
     # ── Primary UVs ──────────────────────────────────────────────────────────
@@ -920,6 +1248,21 @@ def _read_mesh(mesh, gr: ModelNode) -> None:
     try:
         gr.bb_min = (float(mesh.bb_min.x), float(mesh.bb_min.y), float(mesh.bb_min.z))
         gr.bb_max = (float(mesh.bb_max.x), float(mesh.bb_max.y), float(mesh.bb_max.z))
+        # PyKotor exposes the complete trimesh culling envelope, but the
+        # historical conversion retained only min/max. Modular-head export
+        # freezes the donor's per-node radius too, so preserve the raw mesh
+        # values explicitly for the writer and structural reload verifier.
+        gr.mesh_bb_min = gr.bb_min
+        gr.mesh_bb_max = gr.bb_max
+        gr.radius = float(getattr(mesh, "radius", 0.0) or 0.0)
+        gr.mesh_radius = gr.radius
+        average = getattr(mesh, "average", None)
+        if average is not None:
+            gr.mesh_average_point = (
+                float(average.x),
+                float(average.y),
+                float(average.z),
+            )
     except Exception:
         pass
 
@@ -1020,37 +1363,92 @@ def _read_skin_weights(skin, gr: ModelNode, id_to_pknode: Dict) -> None:
         pk_n = id_to_pknode.get(nid)
         gr.bone_map.append(pk_n.name if pk_n else '')
 
-    # Fallback: if bone_indices produced no valid entries (all were -1/0xFFFF/invalid
-    # or the array was empty), use bonemap instead.  This handles:
+    # Cross-validate the palette against the node-indexed ``bonemap`` array.
+    # ``bone_indices`` is a FIXED uint16[16] header block: unused tail slots
+    # carry padding that is sometimes 0 (which aliases the model root node)
+    # and sometimes uninitialised garbage.  Vanilla files (e.g. K2 c_drexlf
+    # tailGeo: bones = [9,8,7,6,5,4,11,12,13,10, 0,0,0,0,0,0]) would otherwise
+    # gain phantom palette entries pointing at the root.  A slot ``s`` is a
+    # real palette entry iff bonemap[node_id] == s — that is exactly how the
+    # engine associates nodes with palette slots.  Only applies when a
+    # bonemap is present; mid-array blanks are preserved (indices matter),
+    # trailing blanks are trimmed.
+    _raw_bonemap_check = list(getattr(skin, 'bonemap', None) or [])
+    if _raw_bonemap_check and any(name for name in gr.bone_map):
+        _validated = []
+        for _slot, nid_raw in enumerate(raw_bone_indices[:len(gr.bone_map)]):
+            try:
+                _nid = int(nid_raw)
+            except (TypeError, ValueError):
+                _validated.append('')
+                continue
+            try:
+                _confirmed = (
+                    0 <= _nid < len(_raw_bonemap_check)
+                    and int(_raw_bonemap_check[_nid]) == _slot
+                )
+            except (TypeError, ValueError, OverflowError):
+                _confirmed = False
+            _validated.append(gr.bone_map[_slot] if _confirmed else '')
+        if any(name for name in _validated):
+            while _validated and not _validated[-1]:
+                _validated.pop()
+            gr.bone_map = _validated
+
+    # Fallback: if bone_indices produced no valid entries (all were
+    # -1/0xFFFF/invalid or the array was empty), derive the palette from the
+    # NODE-indexed bonemap by inversion (bonemap[node_id] = palette_slot).
+    # This handles:
     #   - Synthetic mock skins (unit tests with MockMDLSkin(bone_indices=all_invalid))
     #   - Models where bone_indices is genuinely absent
     # Note: We check whether ANY non-empty name was produced, not just array length.
+    # Legacy tolerance: some synthetic/mock skins store palette-length arrays
+    # of node ids (bonemap[slot] = node_id).  When inversion yields nothing
+    # (no entry maps back to a plausible slot), fall back to that legacy read.
     _has_valid_bi = any(name for name in gr.bone_map)
     if not _has_valid_bi:
-        gr.bone_map = []
-        for raw in (getattr(skin, 'bonemap', None) or []):
+        _raw_bm = list(getattr(skin, 'bonemap', None) or [])
+        slot_to_node: Dict[int, int] = {}
+        for _node_id, _slot_raw in enumerate(_raw_bm):
             try:
-                nid = int(raw)
+                _slot = int(_slot_raw)
             except (TypeError, ValueError):
-                gr.bone_map.append('')
                 continue
-            if nid < 0 or nid == 0xFFFF:
-                gr.bone_map.append('')
-                continue
-            pk_n = id_to_pknode.get(nid)
-            gr.bone_map.append(pk_n.name if pk_n else '')
+            if 0 <= _slot < len(_raw_bm) and _slot not in slot_to_node:
+                slot_to_node[_slot] = _node_id
+        gr.bone_map = []
+        if slot_to_node and max(slot_to_node) < max(len(_raw_bm), 1):
+            for _slot in range(max(slot_to_node) + 1):
+                _nid = slot_to_node.get(_slot, -1)
+                pk_n = id_to_pknode.get(_nid) if _nid >= 0 else None
+                gr.bone_map.append(pk_n.name if pk_n else '')
+        if not any(name for name in gr.bone_map):
+            gr.bone_map = []
+            for raw in _raw_bm:
+                try:
+                    nid = int(raw)
+                except (TypeError, ValueError):
+                    gr.bone_map.append('')
+                    continue
+                if nid < 0 or nid == 0xFFFF:
+                    gr.bone_map.append('')
+                    continue
+                pk_n = id_to_pknode.get(nid)
+                gr.bone_map.append(pk_n.name if pk_n else '')
 
     apply_known_skin_bone_map_normalisations(gr, skin, id_to_pknode)
     n_bones = len(gr.bone_map)
 
     # Some shipped creature skins use vertex palette indices beyond the fixed
-    # 16-entry ``bone_indices`` header array while PyKotor still exposes a
-    # longer ``bonemap`` table with valid node ids for those overflow slots.
-    # Example: c_brith/Brith_mesh has vertices weighted to local index 16,
-    # ``bone_indices`` has slots 0..15, and ``bonemap[16]`` resolves to the
-    # model root.  Dropping those influences leaves zero-weight vertices and
-    # frozen triangles during animation.  Preserve the palette slot by extending
-    # bone_map from bonemap only for indices actually referenced by vertices.
+    # 16-entry ``bone_indices`` header array while the node-indexed ``bonemap``
+    # table still assigns those overflow palette slots to valid nodes.
+    # Example: c_brith/Brith_mesh has vertices weighted to local index 16;
+    # ``bone_indices`` has slots 0..15, and some node's bonemap entry == 16.
+    # Dropping those influences leaves zero-weight vertices and frozen
+    # triangles during animation.  Recover the overflow slot by scanning the
+    # NODE-indexed bonemap for the node whose entry equals the slot number
+    # (bonemap[node_id] = palette_slot — verified against vanilla K2
+    # c_drexlf raw bytes, T2526).
     try:
         max_vertex_idx = -1
         for bv in (getattr(skin, 'vertex_bones', None) or []):
@@ -1064,16 +1462,20 @@ def _read_skin_weights(skin, gr: ModelNode, id_to_pknode: Dict) -> None:
 
         raw_bonemap = list(getattr(skin, 'bonemap', None) or [])
         if max_vertex_idx >= n_bones and raw_bonemap:
+            slot_to_node = {}
+            for node_id, slot_raw in enumerate(raw_bonemap):
+                try:
+                    slot_val = int(slot_raw)
+                except (TypeError, ValueError):
+                    continue
+                if slot_val >= 0 and slot_val not in slot_to_node:
+                    slot_to_node[slot_val] = node_id
             for slot in range(n_bones, max_vertex_idx + 1):
                 name = ''
-                if slot < len(raw_bonemap):
-                    try:
-                        nid = int(raw_bonemap[slot])
-                    except (TypeError, ValueError):
-                        nid = -1
-                    if nid >= 0 and nid != 0xFFFF:
-                        pk_n = id_to_pknode.get(nid)
-                        name = pk_n.name if pk_n else ''
+                nid = slot_to_node.get(slot, -1)
+                if nid >= 0:
+                    pk_n = id_to_pknode.get(nid)
+                    name = pk_n.name if pk_n else ''
                 gr.bone_map.append(name)
             n_bones = len(gr.bone_map)
             log.debug(
@@ -1083,6 +1485,40 @@ def _read_skin_weights(skin, gr: ModelNode, id_to_pknode: Dict) -> None:
             )
     except Exception as _e:
         log.debug("_read_skin_weights '%s': bonemap overflow extension skipped: %s", gr.name, _e)
+
+    # Preserve the compact palette's exact DFS node ids alongside its display
+    # names. Odyssey permits duplicate node names (K2 PFBCM repeats part of
+    # the left-hand chain); names alone cannot round-trip those palettes or
+    # select the matching qBone/tBone row. The fixed bones[16] block and the
+    # node-indexed bonemap together provide the unambiguous slot -> node map.
+    _slot_to_node_id: Dict[int, int] = {}
+    for _node_id, _slot_raw in enumerate(_raw_bonemap_check):
+        try:
+            _slot = int(_slot_raw)
+        except (TypeError, ValueError):
+            continue
+        if _slot >= 0 and _slot not in _slot_to_node_id:
+            _slot_to_node_id[_slot] = _node_id
+    gr.bone_node_indices = []
+    for _slot in range(len(gr.bone_map)):
+        _node_id = -1
+        if _slot < len(raw_bone_indices):
+            try:
+                _candidate_id = int(raw_bone_indices[_slot])
+            except (TypeError, ValueError):
+                _candidate_id = -1
+            try:
+                _candidate_confirmed = (
+                    0 <= _candidate_id < len(_raw_bonemap_check)
+                    and int(_raw_bonemap_check[_candidate_id]) == _slot
+                )
+            except (TypeError, ValueError, OverflowError):
+                _candidate_confirmed = False
+            if _candidate_confirmed:
+                _node_id = _candidate_id
+        if _node_id < 0:
+            _node_id = int(_slot_to_node_id.get(_slot, -1))
+        gr.bone_node_indices.append(_node_id)
 
     # v7.1 FIX-QBONETBONE (Finding 2.5 — reone mdlmdxreader.cpp cross-ref):
     # Read qBone (quaternion) and tBone (translation) arrays from PyKotor skin object.
@@ -1232,9 +1668,48 @@ def _read_light(pk_node, gr: ModelNode) -> None:
     gr.light_shadow = bool(getattr(light, 'shadow', 0))
     gr.light_flare = bool(getattr(light, 'flare', 0))
     gr.light_fading = bool(getattr(light, 'fading_light', 0))
-    flare_radius = float(getattr(light, 'flare_radius', 0.0) or 0.0)
-    if flare_radius > 0.0 and gr.light_radius <= 0.0:
-        gr.light_radius = flare_radius
+    gr.light_flare_radius = float(getattr(light, 'flare_radius', 0.0) or 0.0)
+    gr.light_priority = int(getattr(light, 'light_priority', 0) or 0)
+    gr.light_affect_dynamic = bool(getattr(light, 'affect_dynamic', 0))
+    gr.light_flare_sizes = [float(value) for value in (getattr(light, 'flare_sizes', None) or [])]
+    gr.light_flare_positions = [float(value) for value in (getattr(light, 'flare_positions', None) or [])]
+    gr.light_flare_color_shifts = [
+        tuple(float(component) for component in value[:3])
+        for value in (getattr(light, 'flare_color_shifts', None) or [])
+    ]
+    gr.light_flare_textures = [str(value) for value in (getattr(light, 'flare_textures', None) or [])]
+
+
+def _read_emitter(pk_node, gr: ModelNode) -> None:
+    """Preserve the complete fixed emitter sub-header used by the writer."""
+
+    emitter = getattr(pk_node, 'emitter', None)
+    if emitter is None:
+        return
+    binary = getattr(emitter, '_gr_binary_emitter', None)
+    unknown1 = int(binary.get('unknown1', 0) or 0) if isinstance(binary, dict) else 0
+    gr.emitter_params = {
+        'deadspace': float(getattr(emitter, 'dead_space', 0.0) or 0.0),
+        'blastradius': float(getattr(emitter, 'blast_radius', 0.0) or 0.0),
+        'blastlength': float(getattr(emitter, 'blast_length', 0.0) or 0.0),
+        'numbranches': int(getattr(emitter, 'branch_count', 0) or 0),
+        'controlptsmoothing': int(getattr(emitter, 'control_point_smoothing', 0) or 0),
+        'xgrid': int(getattr(emitter, 'x_grid', 0) or 0),
+        'ygrid': int(getattr(emitter, 'y_grid', 0) or 0),
+        'spawntype': int(getattr(emitter, 'spawn_type', 0) or 0),
+        'update': str(getattr(emitter, 'update', '') or ''),
+        'emitter_render': str(getattr(emitter, 'render', '') or ''),
+        'blend': str(getattr(emitter, 'blend', '') or ''),
+        'texture': str(getattr(emitter, 'texture', '') or ''),
+        'chunkname': str(getattr(emitter, 'chunk_name', '') or ''),
+        'twosidedtex': int(getattr(emitter, 'two_sided_texture', 0) or 0),
+        'loop': int(getattr(emitter, 'loop', 0) or 0),
+        'renderorder': int(getattr(emitter, 'render_order', 0) or 0),
+        'frameblending': int(getattr(emitter, 'frame_blender', 0) or 0),
+        'depth_texture_name': str(getattr(emitter, 'depth_texture', '') or ''),
+        'unknown1': unknown1 & 0xFF,
+        'flags': int(getattr(emitter, 'flags', 0) or 0),
+    }
 
 
 _CT_NAMES: Dict[int, str] = {
@@ -1258,8 +1733,52 @@ _CT_COLS: Dict[int, int] = {
 def _read_controllers(pk_node, gr: ModelNode) -> None:
     """Copy controller keyframe data directly from PyKotor MDLController list.
 
-    Each controller dict has keys: type, name, times, values, columns.
+    Each controller dict has keys: type, name, times, values, columns. Binary
+    round-trip metadata is retained under ``binary_*`` keys; Bezier channels
+    keep their expanded value/in/out-tangent rows in ``binary_bezier_rows``.
     """
+    def _with_binary_metadata(ctrl, payload: Dict) -> Dict:
+        raw = getattr(ctrl, "_gr_binary_controller", None)
+        if isinstance(raw, dict):
+            if "unknown0" in raw:
+                payload["binary_unknown0"] = int(raw.get("unknown0") or 0)
+            if "column_count" in raw:
+                payload["binary_column_count"] = int(raw.get("column_count") or payload.get("columns", 1))
+            unknown1 = raw.get("unknown1")
+            if isinstance(unknown1, (list, tuple)):
+                payload["binary_unknown1"] = [int(v) & 0xFF for v in list(unknown1)[:3]]
+            words = raw.get("compressed_quaternion_words")
+            if isinstance(words, (list, tuple)):
+                payload["binary_compressed_quaternion_words"] = [int(v) & 0xFFFFFFFF for v in words]
+            binary_columns = int(raw.get("column_count") or 0)
+            if binary_columns & 0x10:
+                bezier_rows = raw.get("bezier_rows")
+                controller_rows = list(getattr(ctrl, "rows", None) or ())
+                if (
+                    not isinstance(bezier_rows, (list, tuple))
+                    or len(bezier_rows) < len(controller_rows)
+                ):
+                    bezier_rows = [
+                        list(getattr(row, "data", ()) or ())
+                        for row in controller_rows
+                    ]
+                payload["is_bezier"] = True
+                payload["binary_bezier_rows"] = [
+                    [float(value) for value in tuple(row or ())]
+                    for row in bezier_rows
+                ]
+        elif bool(getattr(ctrl, "is_bezier", False)):
+            # ASCII or third-party controller objects may expose Bezier rows
+            # without GhostRigger's raw-entry metadata.  Keep their expanded
+            # value/in/out-tangent rows in the same domain-model field; the
+            # writer will derive the 0x10 flag from the logical column count.
+            payload["is_bezier"] = True
+            payload["binary_bezier_rows"] = [
+                [float(value) for value in tuple(getattr(row, "data", ()) or ())]
+                for row in (getattr(ctrl, "rows", None) or ())
+            ]
+        return payload
+
     for ctrl in (getattr(pk_node, 'controllers', None) or []):
         ct    = int(ctrl.controller_type)
         rows  = ctrl.rows
@@ -1268,37 +1787,53 @@ def _read_controllers(pk_node, gr: ModelNode) -> None:
         first = rows[0].data
         times  = [float(r.time) for r in rows]
         values = [[float(v) for v in r.data] for r in rows]
-        name   = _CT_NAMES.get(ct, f'ctrl_{ct}')
-        cols   = _CT_COLS.get(ct, len(first) if first else 1)
+        name = _CT_NAMES.get(ct, f'ctrl_{ct}')
+        raw = getattr(ctrl, "_gr_binary_controller", None)
+        raw_columns = int(raw.get("column_count", 0) or 0) if isinstance(raw, dict) else 0
+        cols = (raw_columns & 0x0F) or _CT_COLS.get(ct, len(first) if first else 1)
+
+        # Emitter IDs overlap mesh/light IDs but use different widths and
+        # meanings.  Preserve their raw rows instead of applying the generic
+        # mesh controller table (for example emitter type 100 is one float,
+        # while mesh type 100 is a three-float self-illumination colour).
+        if gr.is_emitter:
+            gr.controllers.append(_with_binary_metadata(ctrl, {
+                'type': ct,
+                'name': name,
+                'columns': cols,
+                'times': times,
+                'values': [v[:cols] for v in values],
+            }))
+            continue
 
         if ct == _CT_POS and len(first) >= 3:
-            gr.controllers.append({'type': _CT_POS,   'name': name, 'columns': 3,
-                                   'times': times, 'values': [v[:3] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_POS,   'name': name, 'columns': 3,
+                                   'times': times, 'values': [v[:3] for v in values]}))
         elif ct == _CT_ORI and len(first) >= 4:
-            gr.controllers.append({'type': _CT_ORI,   'name': name, 'columns': 4,
-                                   'times': times, 'values': [v[:4] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_ORI,   'name': name, 'columns': 4,
+                                   'times': times, 'values': [v[:4] for v in values]}))
         elif ct == _CT_SCALE:
-            gr.controllers.append({'type': _CT_SCALE, 'name': name, 'columns': 1,
-                                   'times': times, 'values': [[v[0]] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_SCALE, 'name': name, 'columns': 1,
+                                   'times': times, 'values': [[v[0]] for v in values]}))
         elif ct == _CT_COLOR and len(first) >= 3:
-            gr.controllers.append({'type': _CT_COLOR, 'name': name, 'columns': 3,
-                                   'times': times, 'values': [v[:3] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_COLOR, 'name': name, 'columns': 3,
+                                   'times': times, 'values': [v[:3] for v in values]}))
         elif ct == _CT_RADIUS:
-            gr.controllers.append({'type': _CT_RADIUS, 'name': name, 'columns': 1,
-                                   'times': times, 'values': [[v[0]] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_RADIUS, 'name': name, 'columns': 1,
+                                   'times': times, 'values': [[v[0]] for v in values]}))
         elif ct == _CT_ALPHA:
-            gr.controllers.append({'type': _CT_ALPHA, 'name': name, 'columns': 1,
-                                   'times': times, 'values': [[v[0]] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_ALPHA, 'name': name, 'columns': 1,
+                                   'times': times, 'values': [[v[0]] for v in values]}))
         elif ct == _CT_MULT:
-            gr.controllers.append({'type': _CT_MULT, 'name': name, 'columns': 1,
-                                   'times': times, 'values': [[v[0]] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_MULT, 'name': name, 'columns': 1,
+                                   'times': times, 'values': [[v[0]] for v in values]}))
         elif ct == _CT_ILLUM and len(first) >= 3:
-            gr.controllers.append({'type': _CT_ILLUM, 'name': name, 'columns': 3,
-                                   'times': times, 'values': [v[:3] for v in values]})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': _CT_ILLUM, 'name': name, 'columns': 3,
+                                   'times': times, 'values': [v[:3] for v in values]}))
         else:
             # Preserve all other controller types with metadata
-            gr.controllers.append({'type': ct, 'name': name, 'columns': cols,
-                                   'times': times, 'values': values})
+            gr.controllers.append(_with_binary_metadata(ctrl, {'type': ct, 'name': name, 'columns': cols,
+                                   'times': times, 'values': values}))
 
 
 # ── Animations ────────────────────────────────────────────────────────────────
@@ -1309,8 +1844,10 @@ def _convert_anim(pk_anim) -> Optional[Animation]:
         anim.name            = pk_anim.name or 'default'
         anim.length          = float(getattr(pk_anim, 'length', None) or
                                      getattr(pk_anim, 'anim_length', 0) or 0.0)
-        anim.transition_time = float(getattr(pk_anim, 'transition_time', None) or
-                                     getattr(pk_anim, 'transition_length', 0.25) or 0.25)
+        transition_time = getattr(pk_anim, 'transition_time', None)
+        if transition_time is None:
+            transition_time = getattr(pk_anim, 'transition_length', None)
+        anim.transition_time = float(0.25 if transition_time is None else transition_time)
         anim.anim_root = str(getattr(pk_anim, 'root_model', '') or '')
 
         for evt in (getattr(pk_anim, 'events', None) or []):
@@ -1318,13 +1855,31 @@ def _convert_anim(pk_anim) -> Optional[Animation]:
             n = str(getattr(evt, 'name', '') or '')
             anim.events.append(AnimEvent(time=t, name=n))
 
-        # Animation nodes — PyKotor provides all_nodes() on MDLAnimation
-        for pk_anode in _walk_nodes(pk_anim):
+        # Animation nodes -- PyKotor exposes the donor animation tree through
+        # child links even though parent links are not populated on those nodes.
+        # Preserve that sparse tree so binary exports can round-trip creature
+        # animations without manufacturing full-geometry animation branches.
+        pk_nodes = list(_walk_nodes(pk_anim))
+        converted_by_id: Dict[int, ModelNode] = {}
+        for pk_anode in pk_nodes:
             an = ModelNode()
             an.name  = pk_anode.name or 'node'
             an.index = int(pk_anode.node_id)
             _read_controllers(pk_anode, an)
             anim.nodes.append(an)
+            converted_by_id[id(pk_anode)] = an
+
+        for pk_anode in pk_nodes:
+            parent = converted_by_id.get(id(pk_anode))
+            if parent is None:
+                continue
+            for pk_child in getattr(pk_anode, 'children', []) or []:
+                child = converted_by_id.get(id(pk_child))
+                if child is None or child is parent:
+                    continue
+                child.parent = parent
+                if child not in parent.children:
+                    parent.children.append(child)
 
         return anim
     except Exception as exc:
@@ -1622,3 +2177,155 @@ def reparent_head_nodes(model: KotorModel) -> int:
         log.info("reparent_head_nodes: reparented %d node(s) to root",
                  reparented)
     return reparented
+
+
+# =============================================================================
+#  build_donor_skin_data_from_model — anatomical-partition donor assembly
+# =============================================================================
+#
+# Ownership note (PR C.1 / T2508): the anatomical partitioner
+# (``src.math.anatomical_partition``) consumes a frame-consistent
+# ``DonorSkinData`` but does not build one — building it from a loaded model is a
+# resource/extraction concern, so it lives here next to ``_read_skin_weights``
+# (which already reads the same qBone/tBone skin arrays).  Core.Math stays
+# model-agnostic; this function only *reads* duck-typed model/node attributes.
+#
+# Frame correctness (the whole reason PR C.1 exists): a KotOR creature ships as
+# several skin nodes with distinct local transforms (Drexl: offsets up to ~2u,
+# ``tailGeo`` also carries a rotation).  Concatenating ``node.vertices`` raw
+# mixes node-local vertices with world-space bone pivots.  We therefore transform
+# every node's vertices by the node's full parent-chain WORLD transform before
+# accumulation, so vertices and ``bone_positions`` share one world frame.  Bone
+# pivots already come from ``node.bone_world_position()`` (world) and are left as
+# they are.
+
+def _quat_rotate_xyzw(q, v):
+    """Rotate ``v`` by quaternion ``q=[x,y,z,w]`` (matches model_data._quat_rotate)."""
+    qx, qy, qz, qw = q
+    vx, vy, vz = v
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return (
+        vx + qw * tx + (qy * tz - qz * ty),
+        vy + qw * ty + (qz * tx - qx * tz),
+        vz + qw * tz + (qx * ty - qy * tx),
+    )
+
+
+def build_donor_skin_data_from_model(model):
+    """Assemble a frame-consistent ``DonorSkinData`` from a loaded KotOR model.
+
+    Concatenates every skin node's geometry into a single WORLD-frame donor:
+
+    - each node's vertices are transformed by the node's full parent-chain world
+      transform (translation AND rotation) before accumulation;
+    - ``bone_positions`` come from ``node.bone_world_position()`` (already world);
+    - per-vertex bone indices are remapped from each node's local ``bone_map`` to
+      a shared global bone table.
+
+    Returns a ``DonorSkinData`` with ``frame="world_space_v1"``.  Raises
+    ``ValueError`` if the model exposes no usable skin nodes.
+    """
+    import numpy as np
+
+    # Canonical (merged-``src``-namespace) imports; lazy so module import stays
+    # cheap and so the Rendering/Math dependencies are only touched at call time
+    # (avoids any load-order cycle between the loader and the renderer helper).
+    from src.math.anatomical_partition import DonorSkinData
+    from src.core.rendering.skeleton_render_data import extract_skinning_arrays
+    try:
+        from src.core.geometry.model_data import _quat_rotate as _qrot
+    except Exception:  # pragma: no cover - defensive across import styles
+        _qrot = _quat_rotate_xyzw
+
+    def _verts_to_world(node, verts):
+        # PR C.1a: use the canonical ModelNode.world_transform() bind-world
+        # placement — the same accessor OBJExporter._node_bind_world_verts uses.
+        # Unlike a raw parent-chain walk, world_transform() collapses parent 180°
+        # bind-flips (the c_brith / Wardroid fix), so this is correct for
+        # non-Drexl donors too (byte-identical to the old walk on Drexl).
+        v = np.asarray(verts, dtype=np.float64)
+        wp, wo = node.world_transform()
+        wp = np.asarray(wp, dtype=np.float64)
+        if (wo[0] ** 2 + wo[1] ** 2 + wo[2] ** 2) ** 0.5 < 0.001:
+            return v + wp  # identity rotation → translation only
+        return np.array([_qrot(tuple(wo), tuple(p)) for p in v], dtype=np.float64) + wp
+
+    nodes = list(model.all_nodes())
+    lookup = {str(n.name).lower(): n for n in nodes}
+    skin_nodes = [
+        n for n in nodes if bool(getattr(n, "is_skin", False)) and getattr(n, "vertices", None)
+    ]
+    if not skin_nodes:
+        raise ValueError(
+            "build_donor_skin_data_from_model: model has no skin nodes; "
+            "cannot assemble an anatomical-partition donor."
+        )
+
+    all_v, all_f, all_bi, all_bw = [], [], [], []
+    global_names: List[str] = []
+    global_index: Dict[str, int] = {}
+    vert_offset = 0
+    for node in skin_nodes:
+        v_local = np.asarray(node.vertices, dtype=np.float64)
+        n_local = len(v_local)
+        skin = extract_skinning_arrays(node, n_local)
+        if skin.bone_indices is None or skin.bone_weights is None:
+            continue  # skin node without usable weights — skip (offset unchanged)
+
+        v_world = _verts_to_world(node, v_local)
+        faces = np.asarray(node.faces, dtype=np.int64)
+        bi_local = np.asarray(skin.bone_indices, dtype=np.int64)
+        bw = np.asarray(skin.bone_weights, dtype=np.float64)
+
+        bone_map = list(getattr(node, "bone_map", []) or [])
+        local_to_global = []
+        for name in bone_map:
+            key = str(name).lower()
+            if key not in global_index:
+                global_index[key] = len(global_names)
+                global_names.append(str(name))
+            local_to_global.append(global_index[key])
+        l2g = np.asarray(local_to_global, dtype=np.int64)
+
+        valid = (bi_local >= 0) & (bi_local < len(bone_map))
+        bi_global = np.where(
+            valid, l2g[np.clip(bi_local, 0, max(len(bone_map) - 1, 0))], -1
+        )
+
+        all_v.append(v_world)
+        all_f.append(faces + vert_offset)
+        all_bi.append(bi_global)
+        all_bw.append(bw)
+        vert_offset += n_local
+
+    if not all_v:
+        raise ValueError(
+            "build_donor_skin_data_from_model: skin nodes present but none had "
+            "usable skin weights."
+        )
+
+    vertices = np.vstack(all_v)
+    faces = np.vstack(all_f)
+    bone_indices = np.vstack(all_bi)
+    bone_weights = np.vstack(all_bw)
+
+    bone_positions = np.zeros((len(global_names), 3), dtype=np.float64)
+    for i, name in enumerate(global_names):
+        nd = lookup.get(str(name).lower())
+        if nd is not None:
+            try:
+                bone_positions[i] = np.asarray(nd.bone_world_position()[:3], dtype=np.float64)
+            except Exception:
+                pass
+
+    return DonorSkinData(
+        vertices=vertices,
+        faces=faces,
+        bone_indices=bone_indices,
+        bone_weights=bone_weights,
+        bone_names=global_names,
+        bone_positions=bone_positions,
+        frame="world_space_v1",
+    )

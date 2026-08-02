@@ -137,7 +137,7 @@ class WgpuResourceCache:
         self._recount()
         return resource
 
-    def get_or_update_skin_palette(self, mesh_data, anim_pose, model) -> WgpuSkinResource | None:
+    def get_or_update_skin_palette(self, mesh_data, anim_pose, model, anim_base_pose=None) -> WgpuSkinResource | None:
         import wgpu
 
         is_bas_attachment = bool(getattr(getattr(mesh_data, "source", None), "_gr_bas_attachment_layer", False))
@@ -154,6 +154,7 @@ class WgpuResourceCache:
                 animation_pose_applies_to_node,
                 animation_pose_for_node,
                 bas_attachment_palette_model_for_node,
+                runtime_source_model_for_node,
             )
             from src.core.rendering.skeleton_render_data import (
                 bas_attachment_root_local_skin_palette,
@@ -163,10 +164,11 @@ class WgpuResourceCache:
             self.last_skinning_error = f"WGPU palette builder unavailable: {exc}"
             return None
 
-        source_model = model
+        source_model = runtime_source_model_for_node(mesh_data.source) or model
         if bool(getattr(mesh_data.source, "_gr_bas_attachment_layer", False)):
-            source_model = bas_attachment_palette_model_for_node(mesh_data.source) or model
+            source_model = bas_attachment_palette_model_for_node(mesh_data.source) or source_model
         node_anim_pose = animation_pose_for_node(mesh_data.source, anim_pose) if anim_pose is not None else None
+        node_anim_base_pose = animation_pose_for_node(mesh_data.source, anim_base_pose) if anim_base_pose is not None else None
         if anim_pose is not None and node_anim_pose is None:
             if not bool(getattr(mesh_data.source, "_gr_bas_attachment_layer", False)):
                 return None
@@ -215,9 +217,15 @@ class WgpuResourceCache:
             self.skins[mesh_id] = cached
 
         pose_revision = self._pose_revision(anim_pose, mesh_data)
+        if node_anim_base_pose is not None:
+            pose_revision = (pose_revision, id(node_anim_base_pose))
         if cached.pose_revision != pose_revision:
             started = time.perf_counter()
-            palette = cached.uploader.compute_skin_node_palette(mesh_data.source, anim_pose)
+            palette = cached.uploader.compute_skin_node_palette(
+                mesh_data.source,
+                anim_pose,
+                anim_base_pose=node_anim_base_pose,
+            )
             palette_arr = cached.uploader.as_numpy_array()
             palette_arr = bas_attachment_root_local_skin_palette(mesh_data.source, palette_arr, anim_pose)
             payload = skin_palette_flat_bytes(palette_arr, cached.max_bones) or cached.uploader.as_flat_bytes()
@@ -657,9 +665,52 @@ class WgpuResourceCache:
         self._recount()
 
     def invalidate_texture(self, texture_id: str) -> None:
-        self.textures.pop(str(texture_id), None)
+        removed = self.textures.pop(str(texture_id), None)
+        if removed is not None:
+            self._drop_materials_for_textures((removed,))
         self.last_invalidation_reason = f"texture invalidated: {texture_id}"
         self._recount()
+
+    def invalidate_texture_source(self, texture_name: str, image=None) -> bool:
+        """Evict one named texture and only materials bound to that resource."""
+        clean = str(texture_name or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+        clean = clean.rsplit(".", 1)[0].lower()
+        if not clean:
+            return False
+        image_suffix = f":{id(image)}" if image is not None else ""
+        removed = []
+        for texture_id in tuple(self.textures):
+            key = str(texture_id).lower()
+            matches_name = key == clean or key.startswith(clean + ":")
+            matches_image = not image_suffix or key == clean + image_suffix
+            if not (matches_name and matches_image):
+                continue
+            resource = self.textures.pop(texture_id, None)
+            if resource is not None:
+                removed.append(resource)
+        if not removed and image_suffix:
+            # The cache may predate image-qualified IDs; fall back to the name.
+            for texture_id in tuple(self.textures):
+                key = str(texture_id).lower()
+                if key != clean and not key.startswith(clean + ":"):
+                    continue
+                resource = self.textures.pop(texture_id, None)
+                if resource is not None:
+                    removed.append(resource)
+        if not removed:
+            return False
+        self._drop_materials_for_textures(tuple(removed))
+        self.last_invalidation_reason = f"texture source invalidated: {clean}"
+        self._recount()
+        return True
+
+    def _drop_materials_for_textures(self, removed_resources: tuple[object, ...]) -> None:
+        removed_ids = {id(resource) for resource in removed_resources}
+        for material_id, material in tuple(self.materials.items()):
+            diffuse = getattr(material, "diffuse_texture_resource", None)
+            lightmap = getattr(material, "lightmap_texture_resource", None)
+            if id(diffuse) in removed_ids or id(lightmap) in removed_ids:
+                self.materials.pop(material_id, None)
 
     def invalidate_material(self, material_id: str) -> None:
         self.materials.pop(str(material_id), None)

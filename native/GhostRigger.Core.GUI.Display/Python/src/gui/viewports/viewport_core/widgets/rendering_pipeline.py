@@ -10,6 +10,18 @@ from .snap_view_bar import *  # noqa: F401,F403
 
 
 class ViewportRenderingPipelineMixin:
+    @staticmethod
+    def _renderer_consumes_scene_lighting_render_data(renderer) -> bool:
+        """Return whether the active backend consumes the shared light payload.
+
+        ModernGL resolves the canonical room/model lights directly inside its
+        retained renderer.  Building the WGPU/Pygfx payload for that backend is
+        discarded by the renderer factory and walks every node in a stock module
+        on every PIE frame.
+        """
+        backend_id = str(getattr(renderer, "backend_id", "") or "").strip().lower()
+        return backend_id == "pygfx_wgpu" or backend_id.startswith("wgpu_")
+
     def _request_render(self, fast: bool = False, reason: str = "viewport change", **dirty_flags: bool) -> None:
         if hasattr(self, "_viewcube_widget") and self._viewcube_widget is not None and (fast or dirty_flags.get("camera")):
             self._viewcube_widget.update()
@@ -24,16 +36,37 @@ class ViewportRenderingPipelineMixin:
         if fast:
             self._fast_frame_until = max(self._fast_frame_until, now + 0.08)
             elapsed_ms = (now - self._last_render_wall) * 1000.0 if self._last_render_wall else min_interval_ms
-            if governor is not None and governor.animation_playing:
-                delay = 1
-            else:
-                delay = max(1, int(min_interval_ms - elapsed_ms))
+            # Animation remains continuously eligible for rendering through the
+            # frame governor, but it must still respect the target frame interval.
+            # Dense PIE frames are synchronous; rearming this timer after 1 ms can
+            # outrun the QLabel UpdateRequest posted by setPixmap(), so the scene
+            # appears frozen until locomotion/animation stops.  Leaving one paced
+            # event-loop window lets Qt present the completed frame and process
+            # input without reducing animation-time fidelity.
+            delay = max(1, int(min_interval_ms - elapsed_ms))
         else:
             elapsed_ms = (now - self._last_render_wall) * 1000.0 if self._last_render_wall else min_interval_ms
             delay = max(min_interval_ms, int(min_interval_ms - elapsed_ms))
         if self._render_timer.isActive():
-            delay = min(delay, max(1, self._render_timer.remainingTime()))
+            # A render request is a coalesced dirty-state notification, not a
+            # timer reset.  PIE submits its newest camera/pose state every
+            # 16 ms; restarting the same single-shot timer can perpetually move
+            # its deadline and leave the last scene pixmap on screen while the
+            # simulation and HUD continue advancing.
+            return
         self._render_timer.start(delay)
+
+    def set_runtime_qimage_compositor(self, callback, *, request_render: bool = True) -> None:
+        """Install one GUI-thread compositor applied before the QPixmap publish."""
+
+        self._runtime_qimage_compositor = callback if callable(callback) else None
+        if request_render:
+            self._request_render(
+                fast=True,
+                reason="runtime frame compositor changed",
+                hud=True,
+                overlay=True,
+            )
 
     def _clear_live_surface_diagnostics(self) -> None:
         clear_text = getattr(getattr(self, "canvas", None), "clear_diagnostics_text", None)
@@ -82,11 +115,7 @@ class ViewportRenderingPipelineMixin:
             return
         now = time_module.perf_counter()
         governor = getattr(self, "_frame_governor", None)
-        if (
-            governor is not None
-            and not governor.animation_playing
-            and not governor.should_render_now(now)
-        ):
+        if governor is not None and not governor.should_render_now(now):
             if self._render_pending and (governor.dirty or governor.active_interaction or governor.animation_playing):
                 self._render_timer.start(governor.delay_until_next_frame_ms(now))
             return
@@ -106,7 +135,13 @@ class ViewportRenderingPipelineMixin:
             governor.mark_clean_after_render(render_reason, self._last_render_wall)
         if img is None:
             if self.model is None:
-                self.canvas.setText("GPU render unavailable\nEmpty Scene")
+                if bool(self.property("_gr_suppress_renderer_diagnostics")) or (
+                    hasattr(self, "_map_studio_should_hide_empty_scene_label")
+                    and self._map_studio_should_hide_empty_scene_label()
+                ):
+                    self.canvas.setText("")
+                else:
+                    self.canvas.setText("GPU render unavailable\nEmpty Scene")
                 return
             mesh_count = len(self.model.mesh_nodes()) if hasattr(self.model, "mesh_nodes") else 0
             node_count = self.model.node_count() if hasattr(self.model, "node_count") else 0
@@ -129,11 +164,24 @@ class ViewportRenderingPipelineMixin:
             img.width * 4,
             QtGui.QImage.Format_RGBA8888,
         ).copy()
+        compositor = getattr(self, "_runtime_qimage_compositor", None)
+        if callable(compositor):
+            try:
+                compositor(qimg)
+            except Exception as exc:
+                log.warning("Runtime frame compositor failed: %s", exc, exc_info=True)
         self._pixmap = QtGui.QPixmap.fromImage(qimg)
         if self.canvas.is_live_surface():
             self.canvas.set_overlay_pixmap(self._pixmap)
         else:
-            self.canvas.setPixmap(self._pixmap)
+            present = getattr(self.canvas, "present_pixmap", None)
+            if callable(present):
+                # A runtime compositor means PIE owns this full retained frame.
+                # Finish the QLabel paint now so a due simulation/render timer
+                # cannot starve presentation until movement stops.
+                present(self._pixmap, immediate=callable(compositor))
+            else:
+                self.canvas.setPixmap(self._pixmap)
         rendered_size = (w, h)
         self._last_rendered_canvas_size = rendered_size
         current_size = (max(8, self.canvas.width()), max(8, self.canvas.height()))
@@ -148,6 +196,17 @@ class ViewportRenderingPipelineMixin:
             self._set_renderer_badge(False)
             return None
         self._set_renderer_badge(True)
+        if bool(self.property("_gr_map_studio_pie_clean_runtime")):
+            # ModernGL returns a composited image rather than a native child
+            # surface.  Returning its scene image here is the backend-neutral
+            # counterpart to the live-surface overlay guard: no axes, helper
+            # diamonds, placement guides, selections, measurements, or HUD
+            # diagnostics are painted over the runtime frame.
+            self._clear_live_surface_diagnostics()
+            if self.canvas.is_live_surface():
+                self._skip_overlay_pixmap_update = True
+            self._record_overlay_rebuild(0.0)
+            return img
         if self.canvas.is_live_surface() and self._gpu_renderer_requires_native_surface_passthrough():
             self._update_live_surface_diagnostics()
             img = self._draw_live_surface_tool_overlay(img, w, h)
@@ -169,6 +228,15 @@ class ViewportRenderingPipelineMixin:
         pygfx owns the retained 3D scene; this transparent image is only for
         legacy screen-space tools that are still Qt/PIL overlay based.
         """
+        if bool(getattr(self, "_live_surface_overlay_suppressed", False)):
+            # Do not place a QWidget/QPixmap over a native child surface while
+            # it is animating.  On Windows the child HWND and Qt sibling do not
+            # have reliable per-pixel composition ordering, which presents as
+            # whole-frame black/blank flicker.  PIE exposes its status in the
+            # surrounding Qt HUD and renders moving actors natively instead.
+            self._record_overlay_rebuild(0.0)
+            self._skip_overlay_pixmap_update = True
+            return img
         if self._can_skip_animation_cpu_overlay():
             self._record_overlay_rebuild(0.0)
             self._skip_overlay_pixmap_update = True
@@ -249,6 +317,10 @@ class ViewportRenderingPipelineMixin:
         clear_text = getattr(self.canvas, "clear_diagnostics_text", None)
         if not callable(set_text):
             return
+        if bool(self.property("_gr_suppress_renderer_diagnostics")):
+            if callable(clear_text):
+                clear_text()
+            return
         if not bool(getattr(self._renderer_settings, "show_renderer_diagnostics", True)):
             if callable(clear_text):
                 clear_text()
@@ -302,12 +374,13 @@ class ViewportRenderingPipelineMixin:
         if img is None:
             return None
         try:
-            from PIL import ImageDraw
+            from PIL import Image, ImageDraw
 
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
-            self._renderer._draw_grid(ImageDraw.Draw(img, "RGBA"), w, h)
-            return img
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            self._renderer._draw_grid(ImageDraw.Draw(overlay, "RGBA"), w, h)
+            return Image.alpha_composite(img, overlay)
         except Exception as exc:
             log.debug("X-Ray grid overlay draw failed: %s", exc)
             return img
@@ -325,13 +398,33 @@ class ViewportRenderingPipelineMixin:
             self._sync_renderer_surface()
         self._preload_gpu_textures()
         textures = self._gpu_texture_snapshot()
+        clean_runtime = bool(self.property("_gr_map_studio_pie_clean_runtime"))
         self._gpu_renderer.interactive = bool(
             self._renderer.is_interactive
             or self._pan_dragging
             or self._nav_dragging
             or self._is_dragging
             or time_module.perf_counter() < self._fast_frame_until
+            # PIE is a continuously interactive runtime even when the mouse is
+            # not held.  Keeping it on the stationary editor path forced a 4x
+            # MSAA resolve and alpha-composite readback for every locomotion
+            # frame, which made dense stock modules visibly stutter.  The
+            # renderer's interactive path remains full resolution by default.
+            or clean_runtime
         )
+        # Map Studio PIE continuously redraws character animation, doors,
+        # particles, lighting, bloom, and the retail HUD.  A modest 78%
+        # internal raster size recovers the 30-fps interaction budget in dense
+        # stock-module views while the canvas remains at its native dimensions.
+        # Edit mode and still-image proof frames retain exact full resolution.
+        # Preserve native-resolution UI/HUD while rendering the PIE scene at a
+        # bounded internal scale. This is the editor's gameplay preview path,
+        # not the authoring viewport or exported KOTOR resources.
+        # The retained PIE view can contain several adjacent authored/stock
+        # rooms plus animated actors.  Half-resolution 3D is the measured
+        # performance tier for that gameplay preview; the authoring viewport,
+        # HUD/composition, and exported KOTOR assets remain native resolution.
+        self._gpu_renderer.interactive_render_scale = 0.75 if clean_runtime else 1.0
         self._gpu_renderer.show_solid = bool(self._renderer.show_solid)
         self._gpu_renderer.show_texture = bool(self._renderer.show_texture)
         self._gpu_renderer.show_diffuse_map = bool(getattr(self._renderer, "show_diffuse_map", True))
@@ -343,22 +436,29 @@ class ViewportRenderingPipelineMixin:
         self._gpu_renderer.scene_ambient = float(getattr(self._renderer, "scene_ambient", 0.06))
         self._gpu_renderer.lightmap_intensity = float(getattr(self._renderer, "lightmap_intensity", 0.55))
         self._gpu_renderer.lightmap_mode = str(getattr(self._renderer, "lightmap_mode", "baked") or "baked")
-        self._gpu_renderer.show_light_gizmos = bool(getattr(self._renderer, "show_light_gizmos", True))
-        self._gpu_renderer.show_light_radius_volumes = bool(getattr(self._renderer, "show_light_radius_volumes", False))
-        self._gpu_renderer.show_dummy_helpers = bool(getattr(self._renderer, "show_dummy_helpers", True))
+        self._gpu_renderer.show_light_gizmos = bool(
+            getattr(self._renderer, "show_light_gizmos", True)
+        ) and not clean_runtime
+        self._gpu_renderer.show_light_radius_volumes = bool(
+            getattr(self._renderer, "show_light_radius_volumes", False)
+        ) and not clean_runtime
+        self._gpu_renderer.show_dummy_helpers = bool(
+            getattr(self._renderer, "show_dummy_helpers", True)
+        ) and not clean_runtime
         self._gpu_renderer.show_wireframe = bool(self._renderer.show_wireframe)
         self._gpu_renderer.render_mode = str(getattr(self._renderer, "render_mode", "realistic") or "realistic")
         self._gpu_renderer.display_options = self.display_options
-        self._gpu_renderer.selected_node = getattr(self._renderer, "selected_node", None)
-        self._gpu_renderer.selected_nodes = list(getattr(self, "_selected_meshes", []) or [])
+        self._gpu_renderer.selected_node = None if clean_runtime else getattr(self._renderer, "selected_node", None)
+        self._gpu_renderer.selected_nodes = [] if clean_runtime else list(getattr(self, "_selected_meshes", []) or [])
         self._gpu_renderer.show_grid = bool(getattr(self._renderer, "show_grid", True))
-        self._gpu_renderer.show_bones = bool(getattr(self._renderer, "show_bones", False))
-        self._gpu_renderer.show_joint_dots = bool(getattr(self, "_joint_dot_enabled", True))
+        self._gpu_renderer.show_particles = bool(getattr(self._renderer, "show_particles", True))
+        self._gpu_renderer.show_bones = bool(getattr(self._renderer, "show_bones", False)) and not clean_runtime
+        self._gpu_renderer.show_joint_dots = bool(getattr(self, "_joint_dot_enabled", True)) and not clean_runtime
         self._gpu_renderer._hovered_bone = getattr(self._renderer, "_hovered_bone", None)
         self._gpu_renderer.cull_faces = False
-        gizmo_render_data = self._build_transform_gizmo_render_data(w, h)
+        gizmo_render_data = None if clean_runtime else self._build_transform_gizmo_render_data(w, h)
         skeleton_render_data = None
-        if bool(getattr(self._renderer, "show_bones", False)):
+        if not clean_runtime and bool(getattr(self._renderer, "show_bones", False)):
             try:
                 from src.core.rendering.skeleton_render_data import build_skeleton_render_data
 
@@ -374,31 +474,32 @@ class ViewportRenderingPipelineMixin:
             except Exception as exc:
                 log.debug("WGPU skeleton render data build failed: %s", exc)
         lighting_render_data = None
-        try:
-            from src.core.lighting.render_data import build_scene_lighting_render_data
+        if self._renderer_consumes_scene_lighting_render_data(self._gpu_renderer):
+            try:
+                from src.core.lighting.render_data import build_scene_lighting_render_data
 
-            lighting_render_data = build_scene_lighting_render_data(
-                self.model,
-                selected_node=getattr(self._renderer, "selected_node", None),
-                hovered_node=getattr(self._renderer, "_hovered_light", None),
-                ambient_color_rgb=float(getattr(self._renderer, "scene_ambient", 0.06)),
-                mode=str(getattr(self._renderer, "lighting_mode", "scene") or "scene"),
-                rig=str(getattr(self._renderer, "lighting_rig", "kotor_original") or "kotor_original"),
-                complexity=str(getattr(self._renderer, "shader_complexity_mode", "basic") or "basic"),
-                show_helpers=bool(getattr(self._renderer, "show_light_gizmos", True)),
-                show_volumes=bool(getattr(self._renderer, "show_light_radius_volumes", False)),
-                diffuse_enabled=bool(getattr(self._renderer, "show_diffuse_map", True)),
-                specular_enabled=bool(getattr(self._renderer, "show_specular_map", True)),
-                normal_enabled=bool(getattr(self._renderer, "show_normal_map", True)),
-                environment_enabled=bool(getattr(self._renderer, "show_environment_map", True)),
-                lightmap_enabled=bool(getattr(self._renderer, "show_lightmap_map", True)),
-                lm_intensity=float(getattr(self._renderer, "lightmap_intensity", 0.55)),
-                lm_mode=str(getattr(self._renderer, "lightmap_mode", "baked") or "baked"),
-            )
-        except Exception as exc:
-            log.debug("WGPU lighting render data build failed: %s", exc)
+                lighting_render_data = build_scene_lighting_render_data(
+                    self.model,
+                    selected_node=None if clean_runtime else getattr(self._renderer, "selected_node", None),
+                    hovered_node=None if clean_runtime else getattr(self._renderer, "_hovered_light", None),
+                    ambient_color_rgb=float(getattr(self._renderer, "scene_ambient", 0.06)),
+                    mode=str(getattr(self._renderer, "lighting_mode", "scene") or "scene"),
+                    rig=str(getattr(self._renderer, "lighting_rig", "kotor_original") or "kotor_original"),
+                    complexity=str(getattr(self._renderer, "shader_complexity_mode", "basic") or "basic"),
+                    show_helpers=bool(getattr(self._renderer, "show_light_gizmos", True)) and not clean_runtime,
+                    show_volumes=bool(getattr(self._renderer, "show_light_radius_volumes", False)) and not clean_runtime,
+                    diffuse_enabled=bool(getattr(self._renderer, "show_diffuse_map", True)),
+                    specular_enabled=bool(getattr(self._renderer, "show_specular_map", True)),
+                    normal_enabled=bool(getattr(self._renderer, "show_normal_map", True)),
+                    environment_enabled=bool(getattr(self._renderer, "show_environment_map", True)),
+                    lightmap_enabled=bool(getattr(self._renderer, "show_lightmap_map", True)),
+                    lm_intensity=float(getattr(self._renderer, "lightmap_intensity", 0.55)),
+                    lm_mode=str(getattr(self._renderer, "lightmap_mode", "baked") or "baked"),
+                )
+            except Exception as exc:
+                log.debug("WGPU lighting render data build failed: %s", exc)
         helper_render_data = None
-        if str(getattr(self._gpu_renderer, "backend_id", "") or "") == "pygfx_wgpu":
+        if not clean_runtime and str(getattr(self._gpu_renderer, "backend_id", "") or "") == "pygfx_wgpu":
             helper_render_data = self._build_pygfx_helper_render_data()
         try:
             self._gpu_renderer.surface_host_diagnostics = self.canvas.diagnostics()
@@ -426,11 +527,16 @@ class ViewportRenderingPipelineMixin:
             lighting_render_data=lighting_render_data,
             helper_render_data=helper_render_data,
             picking_diagnostics=self._viewport_picking_diagnostics(),
-            hovered_node=getattr(self, "_hovered_mesh_node", None),
-            show_mesh_hover=bool(getattr(self, "mesh_hover_enabled", True)),
+            hovered_node=None if clean_runtime else getattr(self, "_hovered_mesh_node", None),
+            show_mesh_hover=bool(getattr(self, "mesh_hover_enabled", True)) and not clean_runtime,
             anim_pose=getattr(self._renderer, "_anim_pose", None),
             anim_time=float(getattr(self._renderer, "_anim_time", 0.0)),
             anim_base_pose=getattr(self._renderer, "_anim_base_pose", None),
+            anim_name=(
+                str(getattr(self._renderer, "_anim_name", "") or "")
+                if getattr(self._renderer, "_anim_pose", None) is not None
+                else ""
+            ),
             dirty_flags=dirty_flags,
         )
         diagnostics = {}
@@ -466,6 +572,24 @@ class ViewportRenderingPipelineMixin:
                     self._request_render(fast=True)
 
             QtCore.QTimer.singleShot(1, _continue_uploads)
+        if bool(getattr(self._gpu_renderer, "particles_active", False)):
+            # Visible emitter particles keep their own frame cadence alive, the
+            # same way animation playback does.  The reschedule stops as soon as
+            # every particle batch fades out or the model changes.  These frames
+            # deliberately stay on the quality path (fast=True would pin the
+            # renderer in no-MSAA interactive mode for as long as any particle
+            # is visible, leaving sprites aliased and washed out).
+            particle_model_id = id(self.model)
+            interval_ms = max(
+                16,
+                int(round(1000.0 / max(1, int(getattr(self._renderer_settings, "target_fps", 60) or 60)))),
+            )
+
+            def _advance_particles() -> None:
+                if self.model is not None and id(self.model) == particle_model_id:
+                    self._request_render(reason="particle simulation", scene=True)
+
+            QtCore.QTimer.singleShot(interval_ms, _advance_particles)
         if self._gpu_upload_total > 0 and self.model is not None and id(self.model) == self._gpu_upload_model_id:
             uploaded = min(len(getattr(self._gpu_renderer, "_mesh_cache", {}) or {}), self._gpu_upload_total)
             if not getattr(self._gpu_renderer, "deferred_mesh_uploads", False):
@@ -522,10 +646,18 @@ class ViewportRenderingPipelineMixin:
             return None
         overlay_started = time_module.perf_counter()
         try:
-            from PIL import ImageDraw
+            from PIL import Image, ImageDraw
 
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
+            # Every editor guide is transient.  Keep brushes, placement ghosts,
+            # selections, gizmos, helpers, walkmesh guides, and future building
+            # previews on a disposable transparent layer instead of mutating the
+            # renderer's scene image.  Retained backends may reuse their last
+            # readback for overlay-only frames; direct drawing then leaves old
+            # guides behind as cyan/selection "paint" trails.
+            scene_img = img
+            overlay_img = Image.new("RGBA", scene_img.size, (0, 0, 0, 0))
             self._renderer._last_W = w
             self._renderer._last_H = h
             try:
@@ -534,7 +666,16 @@ class ViewportRenderingPipelineMixin:
                 self._renderer._frame_norms_cache = {}
             except Exception:
                 pass
-            draw = ImageDraw.Draw(img, "RGBA")
+            draw = ImageDraw.Draw(overlay_img, "RGBA")
+            # Map Studio camera navigation is a latency-sensitive interaction.
+            # The final mouse-release frame restores every authoring guide, but
+            # orbit/pan/zoom frames retain only feedback needed to understand
+            # selection and placement.  On 207tel, diagnostics plus unrelated
+            # room/helper overlays consumed roughly 7 ms of every Qt frame.
+            map_interaction_lod = bool(
+                getattr(self, "_map_studio_authoring_chrome_enabled", False)
+                and getattr(self, "_nav_dragging", "")
+            )
             if self._xray_mode:
                 self._renderer._draw_grid(draw, w, h)
             # T405: weight heat-map runs BEFORE bones so the joint dots
@@ -545,37 +686,51 @@ class ViewportRenderingPipelineMixin:
             if self._renderer.show_bones and not native_skeleton:
                 self._renderer._draw_bones(draw, w, h)
                 if self._locomotion_disc_enabled:
-                    self._draw_locomotion_discs(img, w, h)
+                    self._draw_locomotion_discs(overlay_img, w, h)
                 # T401: paint AccuRig-style color-coded joint dots on top.
                 # Runs only when the skeleton is visible — the dots are
                 # meant to make joints clickable/identifiable during rig
                 # editing.  Cheap (one pass over `_bone_screen_positions`).
                 if self._joint_dot_enabled:
-                    self._draw_joint_dots(img, w, h)
+                    self._draw_joint_dots(overlay_img, w, h)
             if getattr(self._renderer, "_ext_skeleton", None) is not None:
                 self._renderer._draw_ext_skeleton(draw, w, h)
             if getattr(self._renderer, "_character_fit_overlay", None):
                 self._renderer._draw_character_fit_overlay(draw, w, h)
             if self._renderer.show_walkmesh:
                 self._renderer._draw_walkmesh_overlay(draw, w, h)
-            self._draw_camera_helpers(draw, w, h)
-            self._draw_map_studio_terrain_walkability(draw, w, h)
+            if not map_interaction_lod:
+                self._draw_camera_helpers(draw, w, h)
+                self._draw_map_studio_terrain_walkability(draw, w, h)
+            self._draw_map_studio_component_selection(draw, w, h)
+            self._draw_map_studio_component_extrude_gizmo(draw, w, h)
+            self._draw_map_studio_modeling_points_overlay(draw, w, h)
+            self._draw_map_studio_hover_highlight(draw, w, h)
             self._draw_map_studio_terrain_brush_cursor(draw, w, h)
-            self._draw_map_studio_room_outlines(draw, w, h)
+            self._draw_map_studio_texture_paint_cursor(draw, w, h)
+            if not map_interaction_lod:
+                self._draw_map_studio_room_outlines(draw, w, h)
+            self._draw_map_studio_building_preview(draw, w, h)
+            self._draw_map_studio_universal_transform_overlay(draw, w, h)
             self._draw_map_studio_placement_markers(draw, w, h)
-            self._draw_wgpu_helper_markers(draw, w, h)
+            if not map_interaction_lod:
+                self._draw_wgpu_helper_markers(draw, w, h)
             if self._ensure_renderer_gimbal_state() and not self._gpu_renderer_supports_native_gizmo_drawing():
                 self._draw_transform_gizmo(draw, w, h)
-            self._draw_measurement_overlay(draw, w, h)
+            if not map_interaction_lod:
+                self._draw_measurement_overlay(draw, w, h)
             self._draw_selected_model_outline(draw, w, h)
             self._draw_mesh_subobject_selection(draw, w, h)
-            self._draw_joint_marquee(draw)
+            if not map_interaction_lod:
+                self._draw_joint_marquee(draw)
             self._renderer._draw_axes(draw, w, h)
-            self._renderer._draw_stats(draw, w, h)
-            self._draw_renderer_statistics_overlay(draw, w, h)
-            self._draw_active_camera_overlays(draw, w, h)
+            if not map_interaction_lod and not bool(self.property("_gr_suppress_renderer_diagnostics")):
+                self._renderer._draw_stats(draw, w, h)
+                self._draw_renderer_statistics_overlay(draw, w, h)
+            if not map_interaction_lod:
+                self._draw_active_camera_overlays(draw, w, h)
             self._record_overlay_rebuild(time_module.perf_counter() - overlay_started)
-            return img
+            return Image.alpha_composite(scene_img, overlay_img)
         except Exception as exc:
             log.debug("Qt GPU overlay draw failed: %s", exc)
             return img
@@ -692,18 +847,20 @@ class ViewportRenderingPipelineMixin:
         if img is None:
             return None
         try:
-            from PIL import ImageDraw
+            from PIL import Image, ImageDraw
 
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             self._renderer._last_W = w
             self._renderer._last_H = h
             self._renderer._frame_view = self._renderer._cam_view_matrix()
-            self._draw_camera_helpers(ImageDraw.Draw(img, "RGBA"), w, h)
-            self._draw_transform_gizmo(ImageDraw.Draw(img, "RGBA"), w, h)
-            self._draw_measurement_overlay(ImageDraw.Draw(img, "RGBA"), w, h)
-            self._draw_active_camera_overlays(ImageDraw.Draw(img, "RGBA"), w, h)
-            return img
+            draw = ImageDraw.Draw(overlay, "RGBA")
+            self._draw_camera_helpers(draw, w, h)
+            self._draw_transform_gizmo(draw, w, h)
+            self._draw_measurement_overlay(draw, w, h)
+            self._draw_active_camera_overlays(draw, w, h)
+            return Image.alpha_composite(img, overlay)
         except Exception as exc:
             log.debug("Transform gizmo overlay draw failed: %s", exc)
             return img

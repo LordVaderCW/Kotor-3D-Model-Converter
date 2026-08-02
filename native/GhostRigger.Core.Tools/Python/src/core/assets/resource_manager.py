@@ -15,11 +15,12 @@ Design principles
    never loads actual resource data during startup.
 2. Lazy seek reads (< 2 ms): each get() does a single lseek + read.
 3. Priority chain (matches KotOR engine):
-      Override/ > TexturePacks ERF > module ERF > BIF (via chitin.key)
+      Override/ > module ERF > TexturePacks ERF > streamed audio > BIF
 4. Module support: any .mod/.rim/.erf in modules/ is auto-indexed.
 5. Single unified API: one get(name, type) call handles everything.
-6. Thread-safe: all index lookups use read-only dicts (no locks needed
-   after init); file reads use per-call open() for safety.
+6. Thread-safe: immutable install indexes remain lock-free internally; manager
+   install/overlay publications are revisioned under an RLock, and file reads
+   use per-call open() for safety.
 
 Resource type constants (NWN / KotOR standard)
 ----------------------------------------------
@@ -35,11 +36,14 @@ DLG  = 2029   .dlg  dialog tree
 WOK  = 2016   .wok  room walkmesh (BWM)
 LYT  = 3000   .lyt  area layout
 VIS  = 3001   .vis  area visibility
+PTH  = 3003   .pth  area path graph
 TwoDA  = 2017   .2da  two-dimensional array
 GIT  = 2015   .git  area instance template
 NSS  = 2009   .nss  NWScript source
 NCS  = 2010   .ncs  NWScript compiled
 SSF  = 2015   .ssf  sound set file
+WAV  = 4       .wav  streamed audio
+MP3  = 25014   .mp3  streamed audio
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ..game.pykotor_gff_runtime_fix import ensure_pykotor_gff_acquire_quiet
+
 log = logging.getLogger(__name__)
 
 # ── Resource type constants ──────────────────────────────────────────────────
@@ -58,6 +64,7 @@ log = logging.getLogger(__name__)
 RES_BMP  = 1
 RES_TGA  = 3
 RES_WAV  = 4
+RES_MP3  = 25014
 RES_PLT  = 6
 RES_INI  = 7
 RES_TXT  = 10
@@ -68,13 +75,24 @@ RES_MDX  = 3008
 RES_TXI  = 2014
 RES_ARE  = 2012
 RES_IFO  = 2013
-RES_UTC  = 2023
-RES_UTP  = 2044
-RES_UTD  = 2038
+# Blueprint (UT*) resource type IDs — canonical Aurora/KOTOR values, matching
+# chitin.key and PyKotor's ResourceType. (Earlier RES_UTC=2023/RES_UTD=2038
+# were wrong, which silently broke creature/door model resolution for imported
+# modules — their bytes were indexed under a type id nothing ever requested.)
+RES_UTC  = 2027   # creature
+RES_UTI  = 2025   # item
+RES_UTT  = 2032   # trigger
+RES_UTS  = 2035   # sound
+RES_UTE  = 2040   # encounter
+RES_UTD  = 2042   # door
+RES_UTP  = 2044   # placeable
+RES_UTM  = 2051   # store / merchant
+RES_UTW  = 2058   # waypoint
 RES_DLG  = 2029
 RES_TPC  = 3007
 RES_LYT  = 3000
 RES_VIS  = 3001
+RES_PTH  = 3003
 RES_2DA  = 2017
 RES_GIT  = 2015
 RES_MOD  = 3011  # module reference
@@ -84,15 +102,21 @@ RES_WOK  = 2016  # WOK/BWM room walkmesh (confirmed from KEY/RIM resources)
 EXT_TO_TYPE: Dict[str, int] = {
     'mdl': RES_MDL, 'mdx': RES_MDX,
     'tpc': RES_TPC, 'tga': RES_TGA, 'txi': RES_TXI,
-    'utc': RES_UTC, 'utp': RES_UTP, 'utd': RES_UTD,
+    'utc': RES_UTC, 'utp': RES_UTP, 'utd': RES_UTD, 'utm': RES_UTM,
+    'uti': RES_UTI, 'utt': RES_UTT, 'uts': RES_UTS, 'ute': RES_UTE, 'utw': RES_UTW,
     'are': RES_ARE, 'ifo': RES_IFO, 'dlg': RES_DLG,
-    'lyt': RES_LYT, 'vis': RES_VIS, '2da': RES_2DA,
+    'lyt': RES_LYT, 'vis': RES_VIS, 'pth': RES_PTH, '2da': RES_2DA,
     'git': RES_GIT, 'wok': RES_WOK,
-    'wav': RES_WAV, 'mp3': RES_WAV,
+    'wav': RES_WAV, 'mp3': RES_MP3,
     'bmp': RES_BMP, 'ini': RES_INI, 'txt': RES_TXT,
     'nss': RES_NSS, 'ncs': RES_NCS,
 }
 TYPE_TO_EXT: Dict[int, str] = {v: k for k, v in EXT_TO_TYPE.items()}
+
+_LOOSE_AUDIO_EXT_TYPES: Dict[str, int] = {
+    '.wav': RES_WAV,
+    '.mp3': RES_MP3,
+}
 
 
 def _key(name: str, res_type: int) -> str:
@@ -240,18 +264,50 @@ class ResourceManager:
       1. Override/ loose files  (pre-loaded into memory for instant access)
       2. module ERFs (*.mod / *.rim / *.erf in modules/)
       3. TexturePacks ERFs       (for TPC/TGA only, TPA > TPB > TPC > GUI)
-      4. chitin.key / BIF        (base game data)
+      4. streamed audio paths    (VO and sounds, bytes loaded on demand)
+      5. chitin.key / BIF        (base game data)
 
     Thread safety
     -------------
-    All dicts are populated once at init and never modified afterwards.
-    Reads are concurrent-safe (no locks needed for dict lookups or file reads).
+    Installation indexes are immutable after construction. Mutable manager
+    state (installation references and module overlays) is published under an
+    RLock and advances :attr:`revision`. Strict model loads capture MDL and MDX
+    bytes under one read lock, then release it before parsing.
     """
 
     def __init__(self):
+        # PyKotor 2.3.1 wheels shipped a per-field debug print in
+        # GFFStruct.acquire.  Apply the exact, process-local compatibility
+        # guard before any Map Studio stock-module GFF hydration can run.
+        self._pykotor_gff_runtime_fix_status = ensure_pykotor_gff_acquire_quiet()
         self._k1: Optional[_GameInstall] = None
         self._k2: Optional[_GameInstall] = None
-        self._lock = threading.Lock()  # protects lazy init only
+        self._lock = threading.RLock()
+        self._revision = 0
+        # In-memory overlay for resources bundled inside a specific imported
+        # module (custom community .mod/.rim/.erf that ships its own room
+        # models, WOKs, and textures).  Checked before any game installation so
+        # editing an imported custom map resolves its bundled assets. Keyed by
+        # (resref_lower, res_type).
+        self._overlay: Dict[Tuple[str, int], bytes] = {}
+        # Replaceable in-memory resources owned by the active authored project.
+        # These sit above imported-module/base-game content so custom textures
+        # and models render in Map Studio before the module is exported.
+        self._project_overlay: Dict[Tuple[str, int], bytes] = {}
+        # Legacy community maps commonly ship a tiny ARE/GIT/IFO ``.mod`` in
+        # ``Modules`` and put LYT/VIS/MDL/MDX/WOK/textures in a sibling
+        # ``Override`` folder.  Keep those files lazy: several recovered map
+        # sets are hundreds of megabytes and must not be decoded or retained
+        # just to make the module discoverable in Map Studio.
+        self._loose_overlay: Dict[Tuple[str, int], Path] = {}
+        self._loose_overlay_candidates: Dict[Tuple[str, int], Tuple[Path, ...]] = {}
+
+    @property
+    def revision(self) -> int:
+        """Monotonic resource-publication revision for dependent caches."""
+
+        with self._lock:
+            return int(self._revision)
 
     # ── Setup ────────────────────────────────────────────────────────────
 
@@ -263,10 +319,12 @@ class ResourceManager:
             inst = _GameInstall(path, 'K1')
             with self._lock:
                 self._k1 = inst
+                self._revision += 1
             log.info(f"ResourceManager: K1 indexed {path!r} — "
                      f"{len(inst._key_map)} key entries, "
                      f"{len(inst._tex_erfs)} tex ERFs, "
                      f"{len(inst._mod_erfs)} module ERFs, "
+                     "streamed audio index deferred, "
                      f"{len(inst._override)} override files")
             return True
         except Exception as exc:
@@ -281,25 +339,206 @@ class ResourceManager:
             inst = _GameInstall(path, 'K2')
             with self._lock:
                 self._k2 = inst
+                self._revision += 1
             log.info(f"ResourceManager: K2 indexed {path!r} — "
                      f"{len(inst._key_map)} key entries, "
                      f"{len(inst._tex_erfs)} tex ERFs, "
                      f"{len(inst._mod_erfs)} module ERFs, "
+                     "streamed audio index deferred, "
                      f"{len(inst._override)} override files")
             return True
         except Exception as exc:
             log.error(f"ResourceManager: K2 index failed {path!r}: {exc}", exc_info=True)
             return False
 
+    def add_module_overlay(self, capsule_path: str) -> int:
+        """Index a custom module capsule (.mod/.rim/.erf) into the in-memory
+        overlay so its bundled resources (room MDL/MDX/WOK, textures) resolve
+        ahead of the base game.  Returns the number of resources added.
+
+        Custom community modules ship their own room models rather than
+        referencing base-game rooms; without this, converting their rooms to
+        editable geometry fails ("could not be loaded from the game resources").
+        """
+        if not capsule_path or not os.path.isfile(capsule_path):
+            return 0
+        try:
+            from pykotor.extract.capsule import LazyCapsule
+        except Exception as exc:  # pragma: no cover - pykotor always present in app
+            log.warning("ResourceManager.add_module_overlay: pykotor unavailable: %s", exc)
+            return 0
+        added = 0
+        updates: Dict[Tuple[str, int], bytes] = {}
+        try:
+            for item in LazyCapsule(capsule_path):
+                ext = str(item.restype().extension).lower()
+                res_type = EXT_TO_TYPE.get(ext)
+                if res_type is None:
+                    continue
+                data = bytes(item.data() or b"")
+                if not data:
+                    continue
+                updates[(item.resref().lower(), res_type)] = data
+                added += 1
+        except Exception as exc:
+            log.warning("ResourceManager.add_module_overlay: failed to index %r: %s", capsule_path, exc)
+            return 0
+        if updates:
+            with self._lock:
+                published = dict(self._overlay)
+                published.update(updates)
+                self._overlay = published
+                self._revision += 1
+        log.info("ResourceManager: module overlay indexed %d resources from %r", added, capsule_path)
+        return added
+
+    def set_project_overlay(self, resources: Any = ()) -> int:
+        """Publish the active project's typed resources as a replaceable overlay.
+
+        ``resources`` contains ``(resref, restype, bytes)`` rows. Replacing the
+        complete map prevents a texture removed from one KMAP from leaking into
+        the next project while preserving independently loaded module overlays.
+        The manager revision advances only when the published bytes change.
+        """
+
+        published: Dict[Tuple[str, int], bytes] = {}
+        for item in tuple(resources or ()):
+            try:
+                resref, raw_type, data = item
+            except (TypeError, ValueError):
+                continue
+            name = str(resref or "").strip().lower()
+            if isinstance(raw_type, int) and not isinstance(raw_type, bool):
+                res_type = int(raw_type)
+            else:
+                res_type = EXT_TO_TYPE.get(
+                    str(raw_type or "").strip().lower().lstrip("."),
+                    -1,
+                )
+            payload = bytes(data or b"")
+            if name and res_type >= 0 and payload:
+                published[(name, res_type)] = payload
+        with self._lock:
+            if published != self._project_overlay:
+                self._project_overlay = published
+                self._revision += 1
+        return len(published)
+
+    def add_loose_overlay(self, directory: str, *, recursive: bool = True) -> int:
+        """Index loose KOTOR resources from a recovered module bundle.
+
+        Only extensions understood by :data:`EXT_TO_TYPE` are indexed and the
+        bytes stay on disk until requested.  Later files win deterministically,
+        with files inside an ``Override`` directory taking engine-like
+        precedence over ancillary source folders in the same bundle.
+        """
+
+        root = Path(str(directory or "")).expanduser()
+        if not root.is_dir():
+            return 0
+        try:
+            candidates = root.rglob("*") if recursive else root.iterdir()
+            files = [path for path in candidates if path.is_file()]
+        except OSError as exc:
+            log.warning("ResourceManager.add_loose_overlay: cannot scan %r: %s", str(root), exc)
+            return 0
+
+        def _priority(path: Path) -> tuple[int, int, int, str]:
+            in_override = any(part.lower() == "override" for part in path.parts)
+            in_binary_dir = any(part.lower() in {"bin", "bins", "binary", "compiled"} for part in path.parts)
+            binary_mdl = False
+            if path.suffix.lower() == ".mdl":
+                try:
+                    with path.open("rb") as stream:
+                        prefix = stream.read(8)
+                    binary_mdl = len(prefix) >= 4 and prefix[:4] == b"\x00\x00\x00\x00"
+                except OSError:
+                    binary_mdl = False
+            return (
+                1 if in_override else 0,
+                1 if in_binary_dir else 0,
+                1 if binary_mdl else 0,
+                str(path).lower(),
+            )
+
+        added = 0
+        candidates_by_key: Dict[Tuple[str, int], List[Path]] = {}
+        selected_by_key: Dict[Tuple[str, int], Path] = {}
+        for path in sorted(files, key=_priority):
+            extension = path.suffix.lower().lstrip(".")
+            res_type = EXT_TO_TYPE.get(extension)
+            if res_type is None:
+                continue
+            resref = path.stem.strip().lower()
+            if not resref:
+                continue
+            key = (resref, res_type)
+            candidates_by_key.setdefault(key, []).append(path)
+            selected_by_key[key] = path
+            added += 1
+        if selected_by_key:
+            with self._lock:
+                published_overlay = dict(self._loose_overlay)
+                published_overlay.update(selected_by_key)
+                published_candidates = dict(self._loose_overlay_candidates)
+                for key, candidates in candidates_by_key.items():
+                    prior = list(published_candidates.get(key, ()))
+                    for candidate in candidates:
+                        if candidate not in prior:
+                            prior.append(candidate)
+                    published_candidates[key] = tuple(prior)
+                self._loose_overlay = published_overlay
+                self._loose_overlay_candidates = published_candidates
+                self._revision += 1
+        log.info("ResourceManager: loose overlay indexed %d resources from %r", added, str(root))
+        return added
+
+    def _get_loose_overlay(self, name: str, res_type: int) -> Optional[bytes]:
+        with self._lock:
+            path = self._loose_overlay.get((str(name or "").lower(), int(res_type)))
+        if path is None:
+            return None
+        try:
+            return path.read_bytes()
+        except OSError as exc:
+            log.warning("ResourceManager: loose overlay read failed for %r: %s", str(path), exc)
+            return None
+
+    def overlay_source_path(self, name: str, res_type: int) -> str:
+        """Return the physical loose-overlay source used for diagnostics."""
+
+        with self._lock:
+            path = self._loose_overlay.get((str(name or "").lower(), int(res_type)))
+        return str(path) if path is not None else ""
+
+    def overlay_candidate_paths(self, name: str, res_type: int) -> Tuple[str, ...]:
+        """Return every same-resref loose candidate considered for diagnostics."""
+
+        with self._lock:
+            paths = self._loose_overlay_candidates.get((str(name or "").lower(), int(res_type)), ())
+        return tuple(str(path) for path in paths)
+
+    def clear_module_overlay(self) -> None:
+        """Drop all bundled-module overlay resources."""
+        with self._lock:
+            self._overlay = {}
+            self._project_overlay = {}
+            self._loose_overlay = {}
+            self._loose_overlay_candidates = {}
+            self._revision += 1
+
     def get_k1(self) -> Optional['_GameInstall']:
-        return self._k1
+        with self._lock:
+            return self._k1
 
     def get_k2(self) -> Optional['_GameInstall']:
-        return self._k2
+        with self._lock:
+            return self._k2
 
     def is_ready(self) -> bool:
         """True if at least one installation is indexed."""
-        return self._k1 is not None or self._k2 is not None
+        with self._lock:
+            return self._k1 is not None or self._k2 is not None
 
     # ── Resource access ──────────────────────────────────────────────────
 
@@ -310,6 +549,17 @@ class ResourceManager:
         game: 'K1', 'K2', or 'auto' (tries game-tagged install first,
               then the other one as fallback).
         """
+        # Bundled-module overlay wins (matches the engine's Override priority):
+        # a custom module's own room models/WOKs/textures shadow the base game.
+        authored = self._project_overlay.get((name.lower(), res_type))
+        if authored is not None:
+            return authored
+        loose = self._get_loose_overlay(name, res_type)
+        if loose is not None:
+            return loose
+        overlaid = self._overlay.get((name.lower(), res_type))
+        if overlaid is not None:
+            return overlaid
         inst = self._k1 if game == 'K1' else self._k2
         if inst is not None:
             data = inst.get(name, res_type)
@@ -322,6 +572,33 @@ class ResourceManager:
             if data is not None:
                 return data
         return None
+
+    def _get_strict_locked(self, name: str, res_type: int, game: str = 'K1') -> Optional[bytes]:
+        """Fetch one strict resource while the caller holds ``self._lock``."""
+
+        authored = self._project_overlay.get((name.lower(), res_type))
+        if authored is not None:
+            return authored
+        loose = self._get_loose_overlay(name, res_type)
+        if loose is not None:
+            return loose
+        overlaid = self._overlay.get((name.lower(), res_type))
+        if overlaid is not None:
+            return overlaid
+        tag = str(game or 'K1').strip().upper()
+        inst = self._k2 if tag == 'K2' else self._k1
+        return inst.get(name, res_type) if inst is not None else None
+
+    def get_strict(self, name: str, res_type: int, game: str = 'K1') -> Optional[bytes]:
+        """Fetch only from the requested game (plus the active module overlay).
+
+        Map Studio uses this for engine-facing template/model validation. A K1
+        fallback while authoring K2 can produce a convincing preview for a UTP
+        that does not exist in the target game.
+        """
+
+        with self._lock:
+            return self._get_strict_locked(name, res_type, game)
 
     def get_mdl(self, name: str, game: str = 'K1') -> Optional[bytes]:
         return self.get(name, RES_MDL, game)
@@ -405,16 +682,34 @@ class ResourceManager:
 
     # ── High-level loaders ───────────────────────────────────────────────
 
-    def load_model(self, name: str, game: str = 'K1'):
+    def load_model(self, name: str, game: str = 'K1',
+                   prefer_base_archive: bool = False):
         """
         Load and parse a model by resref name.
         Returns a KotorModel on success, None on failure.
+
+        prefer_base_archive: read the KEY/BIF archive pair first, ignoring
+        Override/ERF shadows.  Use this when the TRUE vanilla model is
+        required (rig donors, vanilla baselines) — a user's own exported
+        model in Override/ silently replaces the original otherwise.
         """
-        mdl = self.get_mdl(name, game)
+        mdl = None
+        mdx = None
+        source_layer = None
+        if prefer_base_archive:
+            inst = self._k1 if game == 'K1' else self._k2
+            if inst is not None:
+                mdl = inst.get_bif(name, RES_MDL)
+                if mdl is not None:
+                    mdx = inst.get_bif(name, RES_MDX) or b''
+                    source_layer = 'base_game_archive'
         if mdl is None:
-            log.warning(f"ResourceManager.load_model: '{name}' not found in {game}")
-            return None
-        mdx = self.get_mdx(name, game) or b''
+            mdl = self.get_mdl(name, game)
+            if mdl is None:
+                log.warning(f"ResourceManager.load_model: '{name}' not found in {game}")
+                return None
+            mdx = self.get_mdx(name, game) or b''
+            source_layer = 'game_library'
         try:
             from ..game.kotor_loader import load_model_from_bytes
             model = load_model_from_bytes(mdl, mdx)
@@ -423,10 +718,70 @@ class ResourceManager:
                 model._gr_source_mdx_bytes = mdx
                 model._gr_source_resref = name
                 model._gr_source_game = game
+                model._gr_source_layer = source_layer
             return model
         except Exception as exc:
             log.error(f"ResourceManager.load_model: parse failed for '{name}': {exc}",
                       exc_info=True)
+            return None
+
+    def load_model_strict(self, name: str, game: str = 'K1',
+                          prefer_base_archive: bool = False):
+        """Load a model without silently borrowing it from the other game.
+
+        Engine-facing authoring and simulation previews must reflect the
+        selected target installation.  The regular ``load_model`` API keeps
+        its historical cross-game fallback for general browsing workflows;
+        this explicit variant is the contract for Map Studio and supermodels.
+        The active imported-module overlay remains eligible because it is part
+        of the target module being edited.
+        """
+
+        tag = str(game or 'K1').strip().upper()
+        if tag not in {'K1', 'K2'}:
+            tag = 'K1'
+        # Capture the binary pair under one resource-state revision. Parsing is
+        # deliberately outside the lock because it is the expensive CPU phase.
+        with self._lock:
+            mdl = None
+            mdx = None
+            source_layer = None
+            if prefer_base_archive:
+                inst = self._k1 if tag == 'K1' else self._k2
+                if inst is not None:
+                    mdl = inst.get_bif(name, RES_MDL)
+                    if mdl is not None:
+                        mdx = inst.get_bif(name, RES_MDX) or b''
+                        source_layer = 'base_game_archive'
+            if mdl is None:
+                mdl = self._get_strict_locked(name, RES_MDL, tag)
+                if mdl is None:
+                    log.warning(
+                        "ResourceManager.load_model_strict: %r not found in %s",
+                        name,
+                        tag,
+                    )
+                    return None
+                mdx = self._get_strict_locked(name, RES_MDX, tag) or b''
+                source_layer = 'target_game_library'
+        try:
+            from ..game.kotor_loader import load_model_from_bytes
+
+            model = load_model_from_bytes(mdl, mdx)
+            if model is not None:
+                model._gr_source_mdl_bytes = mdl
+                model._gr_source_mdx_bytes = mdx
+                model._gr_source_resref = name
+                model._gr_source_game = tag
+                model._gr_source_layer = source_layer
+            return model
+        except Exception as exc:
+            log.error(
+                "ResourceManager.load_model_strict: parse failed for %r: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
             return None
 
     def load_texture_image(self, name: str, game: str = 'K1',
@@ -465,6 +820,12 @@ class ResourceManager:
                     'key_entries': len(inst._key_map),
                     'tex_erfs': len(inst._tex_erfs),
                     'mod_erfs': len(inst._mod_erfs),
+                    'stream_sounds': sum(
+                        1 for _path, res_type in inst._loose_audio.values()
+                        if res_type == RES_WAV
+                    ),
+                    'stream_audio': len(inst._loose_audio),
+                    'stream_audio_indexed': inst._loose_audio_indexed,
                     'override': len(inst._override),
                 }
             else:
@@ -482,7 +843,8 @@ class _GameInstall:
       1. _override dict  (indexed loose Override/ file paths, lazy read)
       2. _mod_erfs list  (module ERFs, lazy seek)
       3. _tex_erfs list  (TexturePacks ERFs for TPC/TGA, lazy seek)
-      4. _bif_index dict (BIF files via chitin.key, lazy seek)
+      4. _loose_audio    (StreamVoice/StreamWaves/StreamSounds paths, lazy read)
+      5. _bif_index dict (BIF files via chitin.key, lazy seek)
     """
 
     def __init__(self, game_dir: str, tag: str):
@@ -495,6 +857,11 @@ class _GameInstall:
         self._tex_erfs: List[_ErfIndex] = []              # TexturePacks ERFs, TPA first
         self._mod_erfs: List[_ErfIndex] = []              # modules/ ERFs
         self._override: Dict[str, str] = {}               # Override/ loose file paths
+        # Unified loose-audio index.  Values retain the concrete path and the
+        # real resource type; bytes are not read or decoded during indexing.
+        self._loose_audio: Dict[str, Tuple[str, int]] = {}
+        self._loose_audio_indexed = False
+        self._loose_audio_index_lock = threading.Lock()
 
         t0 = time.perf_counter()
         self._index_chitin()
@@ -503,6 +870,29 @@ class _GameInstall:
         self._load_override()
         elapsed = (time.perf_counter() - t0) * 1000
         log.debug(f"_GameInstall {tag} indexed {game_dir!r} in {elapsed:.0f}ms")
+
+    @property
+    def _stream_sounds(self) -> Dict[str, str]:
+        """Read-only compatibility view of the former WAV-path index."""
+
+        self._index_loose_audio()
+        return {
+            key: path
+            for key, (path, res_type) in self._loose_audio.items()
+            if res_type == RES_WAV
+        }
+
+    @_stream_sounds.setter
+    def _stream_sounds(self, paths: Dict[str, str]) -> None:
+        """Accept legacy test/caller setup while retaining one stored index."""
+
+        self._loose_audio = {
+            key: (path, RES_WAV)
+            for key, path in paths.items()
+        }
+        self._loose_audio_indexed = False
+        if not hasattr(self, '_loose_audio_index_lock'):
+            self._loose_audio_index_lock = threading.Lock()
 
     # ── Indexing ──────────────────────────────────────────────────────────
 
@@ -619,12 +1009,85 @@ class _GameInstall:
         if loaded:
             log.debug(f"_GameInstall {self.tag}: {loaded} Override files indexed")
 
+    def _index_loose_audio(self) -> None:
+        """Populate the path-only audio index once, on first audio access."""
+
+        if getattr(self, '_loose_audio_indexed', False):
+            return
+        lock = getattr(self, '_loose_audio_index_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._loose_audio_index_lock = lock
+        with lock:
+            if getattr(self, '_loose_audio_indexed', False):
+                return
+            self._scan_loose_audio()
+            self._loose_audio_indexed = True
+
+    def _scan_loose_audio(self) -> None:
+        """Index streamed KOTOR audio paths without reading or decoding bytes.
+
+        KOTOR 1 stores dialogue voice-over recursively under ``StreamWaves``;
+        KOTOR 2 uses ``StreamVoice``.  A few installations contain both names,
+        so the target game's canonical VO directory wins, followed by the
+        alternate VO name and then ``StreamSounds``.  That final tier keeps
+        ambient UTS audio available without allowing a same-named ambient clip
+        to shadow dialogue VO.  Directory and extension matching is
+        case-insensitive.
+
+        ``.wav`` and genuine ``.mp3`` files retain their distinct resource
+        types.  Only paths are indexed; file contents remain on disk until
+        :meth:`get` resolves a requested resource.
+        """
+
+        tag = str(self.tag or '').strip().upper()
+        directory_names = (
+            ('StreamWaves', 'StreamVoice', 'StreamSounds')
+            if tag == 'K1'
+            else ('StreamVoice', 'StreamWaves', 'StreamSounds')
+        )
+        indexed = 0
+        for directory_name in directory_names:
+            stream_dir = self._find_dir(directory_name)
+            if not stream_dir:
+                continue
+            try:
+                for current_dir, child_dirs, files in os.walk(stream_dir):
+                    # Deterministic traversal makes duplicate-resref precedence
+                    # stable even on case-insensitive filesystems.
+                    child_dirs.sort(key=str.lower)
+                    files.sort(key=str.lower)
+                    for filename in files:
+                        base, ext = os.path.splitext(filename)
+                        res_type = _LOOSE_AUDIO_EXT_TYPES.get(ext.lower())
+                        if res_type is None:
+                            continue
+                        key = _key(base, res_type)
+                        if key in self._loose_audio:
+                            continue
+                        path = os.path.join(current_dir, filename)
+                        if not os.path.isfile(path):
+                            continue
+                        self._loose_audio[key] = (path, res_type)
+                        indexed += 1
+            except OSError:
+                continue
+        if indexed:
+            log.debug(f"_GameInstall {self.tag}: {indexed} streamed audio files indexed")
+
+    def _index_stream_sounds(self) -> None:
+        """Compatibility wrapper for the former StreamSounds-only indexer."""
+
+        if not hasattr(self, '_loose_audio'):
+            self._loose_audio = {}
+        self._index_loose_audio()
+
     # ── Resource access ───────────────────────────────────────────────────
 
     def get(self, name: str, res_type: int) -> Optional[bytes]:
         """
         Fetch raw resource bytes by name + type.
-        Priority: Override > modules ERF > TexturePacks ERF > BIF.
+        Priority: Override > modules ERF > TexturePacks ERF > streamed audio > BIF.
         """
         k = _key(name, res_type)
 
@@ -651,7 +1114,22 @@ class _GameInstall:
                 if data is not None:
                     return data
 
-        # 4. BIF via chitin.key
+        # 4. StreamVoice/StreamWaves/StreamSounds loose audio. Authored module
+        # resources above retain precedence over stock installation audio.
+        if res_type in (RES_WAV, RES_MP3):
+            self._index_loose_audio()
+            loose_audio = self._loose_audio.get(k)
+            if loose_audio is not None:
+                stream_path, indexed_type = loose_audio
+                if indexed_type == res_type:
+                    try:
+                        with open(stream_path, 'rb') as fh:
+                            return fh.read()
+                    except OSError:
+                        # A stale/deleted path may still have a valid BIF fallback.
+                        pass
+
+        # 5. BIF via chitin.key
         slot = self._key_map.get(k)
         if slot is not None:
             bif_idx, var_idx = slot
@@ -660,6 +1138,17 @@ class _GameInstall:
                 return bif.read(var_idx)
 
         return None
+
+    def get_bif(self, name: str, res_type: int) -> Optional[bytes]:
+        """Fetch KEY/BIF bytes only, ignoring Override/ERF shadows."""
+        slot = self._key_map.get(_key(name, res_type))
+        if slot is None:
+            return None
+        bif_idx, var_idx = slot
+        bif = self._bif_index.get(bif_idx)
+        if bif is None:
+            return None
+        return bif.read(var_idx)
 
     def has(self, name: str, res_type: int) -> bool:
         k = _key(name, res_type)
@@ -672,6 +1161,10 @@ class _GameInstall:
             for erf in self._tex_erfs:
                 if erf.has(name, res_type):
                     return True
+        if res_type in (RES_WAV, RES_MP3):
+            self._index_loose_audio()
+            if k in self._loose_audio:
+                return True
         return k in self._key_map
 
     def list_resrefs(self, res_type: int) -> List[str]:
@@ -687,6 +1180,11 @@ class _GameInstall:
         for erf in self._tex_erfs:
             for r in erf.list_type(res_type):
                 out.add(r)
+        if res_type in (RES_WAV, RES_MP3):
+            self._index_loose_audio()
+            for k in self._loose_audio:
+                if k.endswith(suffix):
+                    out.add(k[:-(len(suffix))])
         for k in self._key_map:
             if k.endswith(suffix):
                 out.add(k[:-(len(suffix))])

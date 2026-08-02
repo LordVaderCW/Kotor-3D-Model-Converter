@@ -42,11 +42,13 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("MapStudioWorkflowPanel")
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(5)
 
-        self.header_label = QtWidgets.QLabel("Map Studio workflow")
+        self.header_label = QtWidgets.QLabel("Build & test")
         self.header_label.setObjectName("mapStudioWorkflowHeaderLabel")
         self.header_label.setWordWrap(True)
         root.addWidget(self.header_label)
@@ -71,6 +73,24 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
         self.test_state_label.setWordWrap(True)
         root.addWidget(self.test_state_label)
 
+        self.purpose_label = QtWidgets.QLabel(
+            "Map Studio checks that the module has the game files KOTOR needs before it is staged or installed."
+        )
+        self.purpose_label.setObjectName("mapStudioWorkflowPurposeLabel")
+        self.purpose_label.setWordWrap(True)
+        root.addWidget(self.purpose_label)
+
+        self.advanced_details_toggle = QtWidgets.QToolButton(self)
+        self.advanced_details_toggle.setObjectName("mapStudioWorkflowAdvancedDetailsButton")
+        self.advanced_details_toggle.setText("Advanced workflow details")
+        self.advanced_details_toggle.setCheckable(True)
+        self.advanced_details_toggle.setChecked(False)
+        self.advanced_details_toggle.setArrowType(QtCore.Qt.ArrowType.RightArrow)
+        self.advanced_details_toggle.setToolButtonStyle(
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        root.addWidget(self.advanced_details_toggle)
+
         self.smoke_test_label = QtWidgets.QLabel(
             "First playable map smoke test: start with one small KMAP module, one starter room, "
             "one test placeable, validation, staged install, warp test, and recorded proof. "
@@ -89,6 +109,10 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
         )
         self.smoke_test_recipe_table.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.smoke_test_recipe_table.setWordWrap(True)
+        self.smoke_test_recipe_table.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self._set_smoke_test_recipe(
             (
                 (
@@ -210,6 +234,11 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
         self.export_label.setWordWrap(True)
         root.addWidget(self.export_label)
 
+        self.export_job_label = QtWidgets.QLabel("ExportJob: No package transaction recorded")
+        self.export_job_label.setObjectName("mapStudioWorkflowExportJobLabel")
+        self.export_job_label.setWordWrap(True)
+        root.addWidget(self.export_job_label)
+
         self.proof_label = QtWidgets.QLabel("Game proof: Required before game-ready")
         self.proof_label.setObjectName("mapStudioWorkflowProofLabel")
         self.proof_label.setWordWrap(True)
@@ -237,7 +266,8 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
         project_actions.addWidget(self.save_kmap_button)
         root.addLayout(project_actions)
 
-        selection_actions = QtWidgets.QHBoxLayout()
+        self.selection_actions_widget = QtWidgets.QWidget(self)
+        selection_actions = QtWidgets.QHBoxLayout(self.selection_actions_widget)
         selection_actions.setContentsMargins(0, 0, 0, 0)
         selection_actions.setSpacing(4)
         self.rename_selected_button = QtWidgets.QPushButton("Rename Selected")
@@ -256,10 +286,15 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
         selection_actions.addWidget(self.duplicate_selected_button)
         selection_actions.addWidget(self.delete_selected_button)
         selection_actions.addWidget(self.focus_selected_button)
-        root.addLayout(selection_actions)
+        root.addWidget(self.selection_actions_widget)
         self.set_selection_context("")
 
-        actions = QtWidgets.QGridLayout()
+        primary_actions = QtWidgets.QGridLayout()
+        primary_actions.setContentsMargins(0, 4, 0, 0)
+        primary_actions.setHorizontalSpacing(4)
+        primary_actions.setVerticalSpacing(4)
+        self.secondary_actions_widget = QtWidgets.QWidget(self)
+        actions = QtWidgets.QGridLayout(self.secondary_actions_widget)
         actions.setContentsMargins(0, 4, 0, 0)
         actions.setHorizontalSpacing(4)
         actions.setVerticalSpacing(4)
@@ -314,24 +349,69 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
         self.install_button.clicked.connect(self.installRequested.emit)
         self.launch_handoff_button.clicked.connect(self.launchHandoffRequested.emit)
         self.proof_button.clicked.connect(self.proofRequested.emit)
-        actions.addWidget(self.open_builder_button, 0, 0)
-        actions.addWidget(self.geometry_tools_button, 0, 1)
-        actions.addWidget(self.starter_room_button, 1, 0)
-        actions.addWidget(self.doorway_blockout_button, 1, 1)
-        actions.addWidget(self.corridor_button, 2, 0)
-        actions.addWidget(self.starter_terrain_button, 2, 1)
-        actions.addWidget(self.terrain_tools_button, 3, 0)
-        actions.addWidget(self.lighting_tools_button, 3, 1)
-        actions.addWidget(self.placement_tools_button, 4, 0)
-        actions.addWidget(self.script_tools_button, 4, 1)
-        actions.addWidget(self.walkmesh_tools_button, 5, 0)
-        actions.addWidget(self.test_placeable_button, 5, 1)
-        actions.addWidget(self.validate_button, 6, 0)
-        actions.addWidget(self.stage_button, 6, 1)
-        actions.addWidget(self.install_button, 7, 0)
-        actions.addWidget(self.launch_handoff_button, 7, 1)
-        actions.addWidget(self.proof_button, 8, 0, 1, 2)
-        root.addLayout(actions)
+        primary_actions.addWidget(self.open_builder_button, 0, 0)
+        primary_actions.addWidget(self.placement_tools_button, 0, 1)
+        primary_actions.addWidget(self.validate_button, 1, 0)
+        primary_actions.addWidget(self.stage_button, 1, 1)
+        primary_actions.addWidget(self.install_button, 2, 0)
+        primary_actions.addWidget(self.launch_handoff_button, 2, 1)
+        primary_actions.addWidget(self.proof_button, 3, 0, 1, 2)
+        root.addLayout(primary_actions)
+
+        actions.addWidget(self.geometry_tools_button, 0, 0)
+        actions.addWidget(self.starter_room_button, 0, 1)
+        actions.addWidget(self.doorway_blockout_button, 1, 0)
+        actions.addWidget(self.corridor_button, 1, 1)
+        actions.addWidget(self.starter_terrain_button, 2, 0)
+        actions.addWidget(self.terrain_tools_button, 2, 1)
+        actions.addWidget(self.lighting_tools_button, 3, 0)
+        actions.addWidget(self.script_tools_button, 3, 1)
+        actions.addWidget(self.walkmesh_tools_button, 4, 0)
+        actions.addWidget(self.test_placeable_button, 4, 1)
+        root.addWidget(self.secondary_actions_widget)
+
+        self._advanced_detail_widgets = (
+            self.smoke_test_label,
+            self.smoke_test_recipe_table,
+            self.authoring_label,
+            self.active_context_label,
+            self.mode_label,
+            self.editing_target_label,
+            self.selection_label,
+            self.resources_label,
+            self.missing_resources_label,
+            self.geometry_label,
+            self.walkmesh_label,
+            self.visibility_label,
+            self.lighting_label,
+            self.placement_label,
+            self.layout_label,
+            self.transitions_label,
+            self.scripts_label,
+            self.validation_label,
+            self.export_label,
+            self.export_job_label,
+            self.proof_label,
+            self.selection_actions_widget,
+            self.secondary_actions_widget,
+        )
+        for button in self.findChildren(QtWidgets.QPushButton):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+        self.advanced_details_toggle.toggled.connect(self._set_advanced_details_visible)
+        self._set_advanced_details_visible(False)
+
+    def _set_advanced_details_visible(self, visible: bool) -> None:
+        """Keep expert diagnostics available without overwhelming the default workflow."""
+
+        for widget in self._advanced_detail_widgets:
+            widget.setVisible(bool(visible))
+        self.advanced_details_toggle.setArrowType(
+            QtCore.Qt.ArrowType.DownArrow if visible else QtCore.Qt.ArrowType.RightArrow
+        )
 
     def _set_smoke_test_recipe(self, rows: tuple[tuple[str, str, str], ...]) -> None:
         self.smoke_test_recipe_table.setRowCount(len(rows))
@@ -341,8 +421,12 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
                 item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
                 self.smoke_test_recipe_table.setItem(row_index, column_index, item)
         header = self.smoke_test_recipe_table.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.smoke_test_recipe_table.verticalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.smoke_test_recipe_table.resizeRowsToContents()
 
     def set_state(self, project: Any | None, readiness: Any | None) -> None:
         """Render workflow state without mutating the project."""
@@ -371,6 +455,7 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
             self.scripts_label.setText("Scripts: Add module or area script hooks when this map needs scripted behavior.")
             self.validation_label.setText("Validation: Not checked")
             self.export_label.setText("Export/install: Not ready")
+            self.export_job_label.setText("ExportJob: No package transaction recorded")
             self.proof_label.setText("Game proof: Required before game-ready")
             self.next_action_label.setText("Next: create or open a KMAP project.")
             return
@@ -415,6 +500,7 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
             self._set_action_enabled(True, can_place=has_authored_module, can_export=False, can_proof=False)
             self.validation_label.setText("Validation: Not checked")
             self.export_label.setText("Export/install: Not ready")
+            self.export_job_label.setText("ExportJob: Waiting for authored content and validation")
             self.proof_label.setText("Game proof: Required before game-ready")
             self.next_action_label.setText("Next: create authored content in Builder.")
             return
@@ -429,6 +515,7 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
         metadata = dict(getattr(readiness, "metadata", {}) or {})
         pathing = dict(metadata.get("pathing") or {})
         pathing_blockers = tuple(pathing.get("blockers", ()) or ())
+        export_job = dict(metadata.get("export_job") or {})
         installed_path = str(metadata.get("installed_module_path") or "")
         proof_manifest = str(metadata.get("proof_manifest_path") or "")
         readiness_game = str(getattr(readiness, "game", "") or game)
@@ -531,6 +618,13 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
             )
         else:
             self.export_label.setText(f"Export/install: {export_status}.")
+        self.export_job_label.setText(
+            self._export_job_text(
+                export_job,
+                can_export_candidate=can_export_candidate,
+                game_tested=game_tested,
+            )
+        )
         if game_tested:
             self.proof_label.setText("Game proof: Recorded from a live KOTOR warp test.")
         else:
@@ -652,6 +746,34 @@ class MapStudioWorkflowPanel(QtWidgets.QWidget):
         if stage_label.lower() == "previewable":
             return "Test state: Previewable only. Generate missing runtime resources before staging."
         return f"Test state: {stage_label}. Resolve blockers before game testing."
+
+    @staticmethod
+    def _export_job_text(
+        export_job: dict[str, Any],
+        *,
+        can_export_candidate: bool,
+        game_tested: bool,
+    ) -> str:
+        if not export_job:
+            if can_export_candidate:
+                return "ExportJob: Ready to stage; no package transaction recorded yet."
+            return "ExportJob: Waiting for preflight, package, readback, and proof handoff."
+
+        status = str(export_job.get("status") or "not_run").replace("_", " ")
+        preflight = dict(export_job.get("preflight") or {})
+        package = dict(export_job.get("package") or {})
+        readback = dict(export_job.get("readback") or {})
+        proof = dict(export_job.get("proof_handoff") or {})
+
+        blocking_count = int(preflight.get("blocking_issue_count") or 0)
+        preflight_text = "preflight ready" if preflight.get("ready") else f"preflight blocked ({blocking_count})"
+        package_text = "package written" if package.get("ok") else "package not written"
+        readback_text = "readback OK" if readback.get("ok") else "readback pending"
+        proof_state = str(proof.get("state") or ("game_smoke_tested" if game_tested else "requires_live_warp_proof"))
+        proof_text = proof_state.replace("_", " ")
+        if game_tested:
+            proof_text = "game smoke tested"
+        return f"ExportJob: {status}; {preflight_text}; {package_text}; {readback_text}; proof {proof_text}."
 
     @staticmethod
     def _format_resource_key(resource: Any) -> str:

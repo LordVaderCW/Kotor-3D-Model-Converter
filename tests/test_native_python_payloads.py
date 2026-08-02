@@ -3,7 +3,10 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -51,7 +54,105 @@ def test_python_payload_manifest_covers_every_python_source_and_dll_project() ->
     }
 
     assert len(entries) == 18
-    assert len(payload_files) == 1142
+    # 2026-07-14: the complete Scripting Suite plus package-local legacy
+    # module-repair and exact vanilla-texture-port workflows add their typed
+    # Workflow/GUI/Automation payloads.
+    # The prepared live-topology evaluator is packaged by both Scene (owner)
+    # and Tools (embedded consumer), adding two byte-identical payload rows.
+    # Core.Math also owns the direct manifold3d closed-solid Boolean kernel.
+    # The Maya-style Map Studio shelf, neutral component marking menu, and
+    # non-mutating Multi-Cut session add eight owner/consumer payload rows.
+    # Retained primitive construction now packages the connected logical cage
+    # and topology-budget policy through both Scene and Tools.
+    # The PIE gameplay entity registry (map_studio_pie_entities.py) ships
+    # through both Scene and Tools.
+    # The modular-map room catalog (map_studio_room_catalog.py) ships through
+    # both Scene and Tools, adding two byte-identical payload rows.
+    # Doorway snapping (map_studio_room_snapping.py) ships through both too,
+    # adding another two byte-identical payload rows.
+    # Scene-animation NCS intent extraction (map_studio_scene_animations.py)
+    # ships through both, adding another two byte-identical payload rows.
+    # Animated PIE door actors (map_studio_pie_doors.py) ship through both,
+    # adding another two byte-identical payload rows.
+    # The composed PIE gameplay coordinator and typed template-resource
+    # projection ship through Scene and Tools, adding four payload rows.
+    # The standalone GUI Editor window/workflow and renderer-neutral KOTOR
+    # GUI preview contract add three owner payload rows.
+    # Unity transfer/export is now owned only by Core.IO; the stale Tools copy
+    # was removed so DLL discovery order cannot select divergent behavior.
+    # Engine-compatible FBX take selection adds one Workflow service plus the
+    # mirrored GUI Display/Tools selector dialog payloads.
+    # 2026-07-17: the Map Studio PIE gameplay-simulation core ships through both
+    # Scene and Tools — dialogue, dialogue cameras, triggers, party, combat,
+    # resources, interactions, gameplay coordinator — plus the bounded OnEnter
+    # scripting-state reader (map_studio_pie_scripting.py) and the runtime quest
+    # log (map_studio_pie_journal.py), each adding a byte-identical
+    # owner/consumer payload pair.
+    # 2026-07-17: the clean-room NCS virtual machine
+    # (map_studio_pie_nwscript_vm.py) and the scripted-event/cinematic playback
+    # runtime (map_studio_pie_scripted_events.py) ship through Scene and Tools,
+    # adding two more byte-identical owner/consumer payload pairs.
+    # 2026-07-18: editable KOTOR GUI documents and transactional GUI IO add
+    # one Core.Tools owner payload and one Core.IO owner payload.
+    # Automatic file-level MDL inspection/import adds one Core.IO owner
+    # payload shared by all GUI and tool entry points.
+    # 2026-07-19: the independent Custom Rigged Character Builder adds its
+    # versioned Project model, Validation snapshot/rules, three Workflow
+    # services (import/build/package), and three GUI Display entry/controller
+    # surfaces. Native Character Builder payload ownership is unchanged.
+    # Installed UTC behavior authoring adds one Resources catalog owner and one
+    # Workflow behavior compiler/profile owner.
+    # 2026-07-20: the KOTOR emitter particle system adds four Core.Rendering
+    # payloads (src/core/particles: __init__, emitter_data, simulation,
+    # emitter_library) plus the ModernGL billboard pass
+    # (adapters/rendering/moderngl_particles.py) and the Core.Tools Particle
+    # Editor window (gui/windows/qt_particle_editor.py).
+    # The retail-style glow post-process adds the Core.Rendering bloom pass
+    # (adapters/rendering/moderngl_bloom.py).
+    # 2026-07-21: retail particle-placeable compilation adds the Workflow
+    # owner that bakes emitters into MDL/MDX and allocates placeables.2da.
+    # Custom-map authoring adds the reviewed OBJ parser/import service and UI,
+    # plus the panorama/HDR conversion adapter and its compact options dialog.
+        # The focused terrain sculpt shelf ships through Tools and GUI Display;
+        # the terrain-kit catalog/compiler ships through Scene and its visual
+        # browser ships through Tools and GUI Display, adding five payload rows.
+        # Pascal-style direct building and learned retail environment palettes
+        # ship through Scene and the embedded Tools consumer. The typed vanilla
+        # environment-kit catalog and its visual room-piece browser add paired
+        # Scene/Tools and GUI Display/Tools payload rows.
+    # The stable-ID Pascal wall graph and T-junction planarizer ship through
+    # Scene and the embedded Tools consumer, adding two payload rows.
+    # The versioned Custom Head Builder project/evidence contract adds one
+    # Core.Workflow owner payload.
+    # Head Builder Slice 2 adds its atomic Project repository, Resources donor
+    # catalog/install verifier, and Workflow donor snapshot/service: five
+    # additional owner payloads.
+    # Head Builder Slice 3 adds the Core.IO custom-art contract and Core.Math
+    # named-space headhook alignment solver: two additional owner payloads.
+    # Head Builder Slice 4 adds donor-preserving head skin transfer in Core
+    # Math and geometry-transplant orchestration in Core Workflow.
+    # Head Builder Slice 5 adds UV orientation in Core Math, texture inspection
+    # in Core IO, and material-policy orchestration in Core Workflow.
+    # Head Builder Slice 6 adds exact-headhook attachment and inherited
+    # animation preview orchestration in Core Workflow.
+    # Head Builder Slice 7 adds raw binary export/readback in Core IO and
+    # head-specific structural preflight in Core Validation.
+    # Head Builder Slice 8 adds merge-safe game records plus transactional
+    # package/install/restore IO.
+    # The production Head Builder UI adds one GUI Display workspace, one Core
+    # Tools controller, and the Tools-side namespace initializer used to join
+    # that controller to the canonical Qt controller package.
+    # Stock face/eyes/eyelids/hair recipes add one Core Workflow inventory
+    # and assembly owner plus one Core Math named-space rebase helper.
+    # Purpose-led Map Studio spatial plans ship through Scene and the embedded
+    # Tools consumer, adding two byte-identical payload rows.
+    # The authenticated Ghost Studio bridge adds three Automation payloads
+    # (shared HMAC/session security plus its two-file narrow MCP package) and
+    # one Scene-owned revisioned spatial snapshot serializer.
+    # Facial Performance Head adds the source-agnostic facial clip, the
+    # geometry-backed range audit, head-art anatomy/transplant services, and
+    # the two-file ARKit input adapter to the Core.Workflow payload.
+    assert len(payload_files) == 1420
     assert set(source_files).issubset(set(payload_files))
     assert payload_projects == dll_projects
 
@@ -134,6 +235,29 @@ def test_twoda_parser_is_owned_by_domain_core_templates_only() -> None:
         assert path.replace("/", "\\") not in workflow_sources
 
 
+def test_unity_export_bridge_is_owned_only_by_core_io() -> None:
+    """Embedded import order must not select a stale Tools copy of Unity export."""
+
+    owner_project = ROOT / "native" / "GhostRigger.Core.IO"
+    tools_project = ROOT / "native" / "GhostRigger.Core.Tools"
+    packaged_path = "Python/src/core/export/unity_export_bridge.py"
+    include_path = packaged_path.replace("/", "\\")
+
+    owner_payload = json.loads((owner_project / "GhostRiggerPythonPayload.json").read_text(encoding="utf-8"))
+    tools_payload = json.loads((tools_project / "GhostRiggerPythonPayload.json").read_text(encoding="utf-8"))
+    owner_paths = {str(row["packaged_path"]) for row in owner_payload["files"]}
+    tools_paths = {str(row["packaged_path"]) for row in tools_payload["files"]}
+    tools_project_text = (
+        (tools_project / "GhostRigger.Core.Tools.vcxproj").read_text(encoding="utf-8")
+        + (tools_project / "GhostRigger.Core.Tools.vcxproj.filters").read_text(encoding="utf-8")
+    )
+
+    assert packaged_path in owner_paths
+    assert packaged_path not in tools_paths
+    assert not (tools_project / packaged_path).exists()
+    assert include_path not in tools_project_text
+
+
 def test_reusable_workflow_payloads_are_owned_by_workflow_not_tools() -> None:
     """Tools must consume reusable workflow packages instead of repackaging forks."""
 
@@ -163,6 +287,18 @@ def test_reusable_workflow_payloads_are_owned_by_workflow_not_tools() -> None:
         assert path.replace("/", "\\") not in tools_project_text
 
 
+def test_duplicate_renderer_contract_payloads_are_byte_identical() -> None:
+    """Duplicate import names cannot depend on unsorted DLL discovery order."""
+
+    packaged_path = Path("Python/src/core/rendering/mesh_render_data.py")
+    rendering_copy = ROOT / "native" / "GhostRigger.Core.Rendering" / packaged_path
+    runtime_shared_copy = ROOT / "native" / "GhostRigger.Runtime.Shared" / packaged_path
+
+    assert rendering_copy.is_file()
+    assert runtime_shared_copy.is_file()
+    assert runtime_shared_copy.read_bytes() == rendering_copy.read_bytes()
+
+
 def test_python_payload_copies_are_byte_identical_and_manifested() -> None:
     for entry in _payload_entries():
         project = str(entry["project"])
@@ -188,6 +324,68 @@ def test_python_payload_copies_are_byte_identical_and_manifested() -> None:
                 assert packaged.read_bytes() == source.read_bytes()
             assert hashlib.sha256(packaged.read_bytes()).hexdigest() == row["sha256"]
             assert f'{row["resource_name"]} RCDATA' in rc_text
+
+
+def test_shared_geometry_imports_use_embedded_src_namespace() -> None:
+    """Payload manifests register Python/src modules below the ``src`` package."""
+
+    runtime_import_paths = (
+        ROOT / "native/GhostRigger.Core.Scene/Python/src/core/modules/authored_imported_mesh.py",
+        ROOT / "native/GhostRigger.Core.Scene/Python/src/core/modules/authored_room_composition.py",
+        ROOT / "native/GhostRigger.Core.Scene/Python/src/core/modules/authored_room_operations.py",
+        ROOT / "native/GhostRigger.Core.Tools/Python/src/core/modules/authored_imported_mesh.py",
+        ROOT / "native/GhostRigger.Core.Tools/Python/src/core/modules/authored_room_composition.py",
+        ROOT / "native/GhostRigger.Core.Tools/Python/src/core/modules/authored_room_operations.py",
+        ROOT / "native/GhostRigger.Core.Tools/Python/src/mesh_tools/mesh_topology.py",
+    )
+    offenders: list[str] = []
+    for path in runtime_import_paths:
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if re.match(r"(?:from|import)\s+core\.geometry(?:\.|\s|$)", line):
+                offenders.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
+
+    assert offenders == [], "Bare core.geometry imports bypass the embedded src namespace:\n" + "\n".join(offenders)
+
+
+def test_native_source_fallback_imports_qt_main_window() -> None:
+    """Reproduce the root executable's source fallback without adding Python/src."""
+
+    script = r"""
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+sys.path[:] = [
+    item
+    for item in sys.path
+    if not ((Path(item or '.').resolve() == root) or (root in Path(item or '.').resolve().parents))
+]
+source_roots = [root]
+for project_dir in sorted((root / 'native').glob('GhostRigger*')):
+    python_root = project_dir / 'Python'
+    if (python_root / 'src').is_dir():
+        source_roots.append(python_root)
+for source_root in reversed(source_roots):
+    sys.path.insert(0, str(source_root))
+
+from src.gui.qt_lib.windows.qt_main_window import QtGhostRiggerMainWindow, run
+
+assert QtGhostRiggerMainWindow is not None
+assert callable(run)
+"""
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(ROOT)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_python_payload_resource_names_are_path_named() -> None:
@@ -269,6 +467,18 @@ def test_native_host_depends_on_every_payload_dll_project_without_linking_libs()
         link_node = node.find("msb:LinkLibraryDependencies", ns)
         assert link_node is not None
         assert link_node.text == "false"
+
+
+def test_native_host_stages_every_built_payload_dll_beside_both_developer_launchers() -> None:
+    host_project = ROOT / "native" / "GhostRigger.Native.Core.Host" / "GhostRigger.Native.Core.Host.vcxproj"
+    project_text = host_project.read_text(encoding="utf-8")
+    staging_script = ROOT / "scripts" / "stage_native_payload_dlls.ps1"
+
+    assert staging_script.is_file()
+    assert project_text.count("stage_native_payload_dlls.ps1") == 2
+    assert '-RepoRoot "$(GhostRiggerRepoRoot)."' in project_text
+    assert '-HostOutDir "$(OutDir)."' in project_text
+    assert "Get-ChildItem -LiteralPath '$(GhostRiggerRepoRoot)native'" not in project_text
 
 
 def test_native_host_dependency_table_covers_every_payload_project() -> None:

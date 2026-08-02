@@ -127,7 +127,7 @@ class ViewportConstructionMixin:
         self.locomotion_disc_button = self._icon_button(
             "Locomotion",
             self.toggle_locomotion_discs,
-            "locomotion_disc",
+            "viewport_locomotion_disc",
             checkable=True,
             tooltip="Show locomotion discs on key joints. Right-click to set disc size.",
         )
@@ -204,7 +204,7 @@ class ViewportConstructionMixin:
         self.center_pivot_button = self._icon_button(
             "Center Pivot",
             self.center_pivot_to_selection,
-            "viewport_gimbal",
+            "viewport_center_pivot",
             tooltip="Center pivot on the selected object or mesh bounds",
         )
         self.center_pivot_button.setObjectName("ViewportCenterPivotButton")
@@ -212,7 +212,7 @@ class ViewportConstructionMixin:
         self.freeze_transform_button = self._icon_button(
             "Freeze Transforms",
             self.freeze_selected_transform,
-            "viewport_scale",
+            "viewport_freeze_transform",
             tooltip="Bake the selected mesh transform into its vertices and reset transform values",
         )
         self.freeze_transform_button.setObjectName("ViewportFreezeTransformsButton")
@@ -220,7 +220,7 @@ class ViewportConstructionMixin:
         self.walkmesh_button = self._icon_button(
             "WalkMesh",
             self.toggle_walkmesh,
-            "viewport_wire",
+            "viewport_walkmesh",
             checkable=True,
             tooltip="Walkmesh overlay",
         )
@@ -325,13 +325,20 @@ class ViewportConstructionMixin:
         toolbar_scroll.setMinimumHeight(26)
         toolbar_scroll.setMinimumWidth(0)
         self.viewport_toolbar_scroll = toolbar_scroll
+        self.viewport_map_studio_modeling_tabs = None
+        if self._map_studio_authoring_chrome_enabled:
+            self.viewport_map_studio_modeling_tabs = self._make_map_studio_modeling_tabs(self)
         if self._compact_controls:
             toolbar_scroll.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
             root.addWidget(toolbar_scroll)
+            if self.viewport_map_studio_modeling_tabs is not None:
+                root.addWidget(self.viewport_map_studio_modeling_tabs)
             self.setMinimumSize(140, 130)
             self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Expanding)
         else:
             root.addWidget(toolbar_scroll)
+            if self.viewport_map_studio_modeling_tabs is not None:
+                root.addWidget(self.viewport_map_studio_modeling_tabs)
         root.addWidget(self.canvas, 1)
         self.transform_typein_bar = QtTransformTypeInBar(self)
         self.transform_typein_bar.transformValueEdited.connect(self._on_transform_typein_edited)
@@ -478,6 +485,131 @@ class ViewportConstructionMixin:
         self._install_label_renderer_surface(backend_id or "modern_gl")
         self._apply_canvas_theme()
 
+    def _make_map_studio_modeling_tabs(self, parent: QtWidgets.QWidget) -> QtWidgets.QTabWidget:
+        """Build the KMAP-authored Maya-style Modeling shelf in the viewport."""
+
+        from src.gui.panels.module_editor.map_studio_modeling_shelf import MapStudioModelingShelf
+
+        tabs = QtWidgets.QTabWidget(parent)
+        tabs.setObjectName("ViewportToolbarMapStudioModelingTabs")
+        tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        tabs.setMinimumHeight(40)
+
+        modeling_tab = QtWidgets.QWidget(tabs)
+        modeling_tab.setObjectName("ViewportToolbarMapStudioModelingTab")
+        modeling_root = QtWidgets.QVBoxLayout(modeling_tab)
+        modeling_root.setContentsMargins(0, 0, 0, 0)
+        modeling_root.setSpacing(0)
+        modeling_scroll = QtWidgets.QScrollArea(modeling_tab)
+        modeling_scroll.setObjectName("ViewportToolbarMapStudioModelingScrollArea")
+        modeling_scroll.setWidgetResizable(True)
+        modeling_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        modeling_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        modeling_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        modeling_scroll.setMinimumHeight(36)
+        modeling_content = QtWidgets.QWidget(modeling_scroll)
+        modeling_content.setObjectName("ViewportToolbarMapStudioModelingRow")
+        modeling_row = QtWidgets.QHBoxLayout(modeling_content)
+        modeling_row.setContentsMargins(4, 1, 4, 1)
+        modeling_row.setSpacing(3)
+
+        self.map_studio_modeling_shelf = MapStudioModelingShelf(modeling_content)
+        self.map_studio_modeling_shelf.commandRequested.connect(self._run_map_studio_command_from_toolbar)
+        self.map_studio_modeling_shelf.optionsRequested.connect(self._open_map_studio_tool_options_from_toolbar)
+        modeling_row.addWidget(self.map_studio_modeling_shelf)
+
+        modeling_row.addSpacing(8)
+        mode_label = QtWidgets.QLabel("Modes", modeling_content)
+        mode_label.setObjectName("ViewportToolbarMapStudioModeLabel")
+        modeling_row.addWidget(mode_label)
+        for mode in ("Object", "Vertex", "Edge", "Face", "Terrain", "Walkmesh"):
+            button = QtWidgets.QToolButton(modeling_content)
+            button.setObjectName(f"ViewportToolbarMapStudioModeButton_{mode.lower()}")
+            button.setText(mode)
+            button.setProperty("_gr_full_text", mode)
+            button.setToolTip(f"Open Map Studio {mode} mode for KMAP-authored modeling.")
+            button.clicked.connect(lambda _checked=False, label=mode: self._open_map_studio_mode_from_toolbar(label))
+            modeling_row.addWidget(button)
+
+        modeling_row.addStretch(1)
+        modeling_scroll.setWidget(modeling_content)
+        modeling_root.addWidget(modeling_scroll)
+        tabs.addTab(modeling_tab, "Modeling")
+
+        blockout_tab = QtWidgets.QWidget(tabs)
+        blockout_tab.setObjectName("ViewportToolbarMapStudioBlockoutTab")
+        blockout_root = QtWidgets.QVBoxLayout(blockout_tab)
+        blockout_root.setContentsMargins(0, 0, 0, 0)
+        blockout_root.setSpacing(0)
+        blockout_scroll = QtWidgets.QScrollArea(blockout_tab)
+        blockout_scroll.setObjectName("ViewportToolbarMapStudioBlockoutScrollArea")
+        blockout_scroll.setWidgetResizable(True)
+        blockout_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        blockout_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        blockout_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        blockout_scroll.setMinimumHeight(30)
+        blockout_content = QtWidgets.QWidget(blockout_scroll)
+        blockout_content.setObjectName("ViewportToolbarMapStudioBlockoutRow")
+        blockout_row = QtWidgets.QHBoxLayout(blockout_content)
+        blockout_row.setContentsMargins(4, 1, 4, 1)
+        blockout_row.setSpacing(3)
+        blockout_label = QtWidgets.QLabel("Blockout", blockout_content)
+        blockout_label.setObjectName("ViewportToolbarMapStudioBlockoutLabel")
+        blockout_row.addWidget(blockout_label)
+        blockout_actions = (
+            ("blockout_room", "Room", "Create a KMAP-authored starter room with editable primitives, WOK, LYT/VIS, and player start intent."),
+            ("floor", "Floor", "Add an authored walkable floor/platform primitive to the active Map Studio room."),
+            ("wall", "Wall", "Add an authored wall/slab primitive to the active Map Studio room."),
+            ("cube", "Cube", "Add an authored cube/blockout primitive to the active Map Studio room."),
+            ("ramp", "Ramp", "Add an authored ramp primitive with generated walkmesh-facing surface intent."),
+            ("stairs", "Stairs", "Add authored stairs with a continuous walkable WOK proxy."),
+            ("door_frame", "Doorway", "Add an authored doorway frame primitive for portal or transition blockout."),
+            ("arch", "Arch", "Add an authored arch primitive for entrance or portal silhouettes."),
+            ("terrain_patch", "Terrain", "Create a KMAP-authored terrain heightfield patch with slope-aware WOK intent."),
+        )
+        for key, label, tooltip in blockout_actions:
+            button = QtWidgets.QToolButton(blockout_content)
+            button.setObjectName(f"ViewportToolbarMapStudioBlockoutButton_{key}")
+            button.setText(label)
+            button.setProperty("_gr_full_text", label)
+            button.setToolTip(tooltip)
+            button.clicked.connect(lambda _checked=False, action_key=key: self._run_map_studio_command_from_toolbar(action_key))
+            blockout_row.addWidget(button)
+        blockout_row.addStretch(1)
+        blockout_scroll.setWidget(blockout_content)
+        blockout_root.addWidget(blockout_scroll)
+        tabs.addTab(blockout_tab, "Blockout")
+        tabs.setMinimumHeight(max(40, tabs.sizeHint().height()))
+        return tabs
+
+    def _open_map_studio_mode_from_toolbar(self, mode_label: str) -> None:
+        window = self.window()
+        handler = getattr(window, "_open_map_studio_mode_from_viewport", None)
+        if callable(handler):
+            handler(str(mode_label or "Object"))
+            return
+        opener = getattr(window, "_open_map_studio_modeling_workspace", None)
+        if callable(opener):
+            opener()
+
+    def _run_map_studio_command_from_toolbar(self, action_key: str) -> None:
+        window = self.window()
+        handler = getattr(window, "_run_map_studio_viewport_modeling_command", None)
+        if callable(handler):
+            handler(str(action_key or "").strip())
+            return
+        opener = getattr(window, "_open_map_studio_modeling_workspace", None)
+        if callable(opener):
+            opener()
+
+    def _open_map_studio_tool_options_from_toolbar(self, action_key: str) -> None:
+        """Route a shelf double-click/right-click to Map Studio Tool Options."""
+
+        window = self.window()
+        handler = getattr(window, "_open_map_studio_modeling_tool_options", None)
+        if callable(handler):
+            handler(str(action_key or "").strip())
+
     def take_viewport_toolbar(self) -> QtWidgets.QWidget | None:
         """Detach the viewport tool strip so the application shell can host it."""
 
@@ -494,6 +626,21 @@ class ViewportConstructionMixin:
         toolbar_scroll.deleteLater()
         self.viewport_toolbar_scroll = None
         return toolbar
+
+    def take_viewport_modeling_tabs(self) -> QtWidgets.QTabWidget | None:
+        """Detach the viewport-owned Map Studio tabs for the application shell."""
+
+        tabs = getattr(self, "viewport_map_studio_modeling_tabs", None)
+        if tabs is None:
+            return None
+        layout = getattr(self, "_root_layout", None) or self.layout()
+        if layout is not None and layout.indexOf(tabs) >= 0:
+            layout.removeWidget(tabs)
+        tabs.setParent(None)
+        tabs.setVisible(True)
+        tabs.setMinimumHeight(max(40, tabs.sizeHint().height()))
+        self.viewport_map_studio_modeling_tabs = None
+        return tabs
 
     def set_viewport_chrome_visible(
         self,
@@ -541,6 +688,12 @@ class ViewportConstructionMixin:
     @property
     def transform_typein_chrome_visible(self) -> bool:
         return bool(self._transform_typein_visible)
+
+    @property
+    def map_studio_authoring_chrome_enabled(self) -> bool:
+        """Whether this viewport owns KMAP Modeling and Blockout controls."""
+
+        return bool(self._map_studio_authoring_chrome_enabled)
 
     def _button(
         self,

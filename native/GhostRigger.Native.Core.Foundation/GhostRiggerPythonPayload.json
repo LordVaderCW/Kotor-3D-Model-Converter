@@ -51,7 +51,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_DIAGNOSTICS_VALIDATION_SERVICE",
             "source_path": "src/core/diagnostics/validation_service.py",
             "packaged_path": "Python/src/core/diagnostics/validation_service.py",
-            "sha256": "f872b684f7f0bf4197afbfbc02218eeb2d3eb81ce3c5ca446ba6cf395da26a05"
+            "sha256": "b2c941a6aed20b963a6726c814c00340bd6e2c5f9128e21c27ccf073edc1d570"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RENDERING_GPU_DIAGNOSTICS_CONFIG",
@@ -63,7 +63,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RENDERING_GPU_DIAGNOSTICS_RECORDS",
             "source_path": "src/core/rendering/gpu_diagnostics_records.py",
             "packaged_path": "Python/src/core/rendering/gpu_diagnostics_records.py",
-            "sha256": "5c2222453229f30dbadc87ca4776c4813c61dc16d7e0ba0de8857e9daec8ce43"
+            "sha256": "3b6018b0b3945646d4d80567707301fe900e18e1d9aeb4c8bc839ae6d7946605"
         }
     ]
 }

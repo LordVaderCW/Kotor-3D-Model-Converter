@@ -28,6 +28,7 @@ from src.core.lighting.light_gizmo_renderer import (
     LIGHT_HELPER_SPOT_CAP_MAX_RADIUS,
     LIGHT_HELPER_SPOT_LENGTH,
 )
+from src.core.lighting.render_data import scene_light_relevance_key
 from src.core.rendering.gpu_debug_tables import (
     ModuleDrawItem,
     debug_draw_table,
@@ -62,7 +63,6 @@ from src.core.rendering.gpu_vbo_layout import (
 )
 from src.core.geometry.lightsaber import (
     is_lightsaber_blade_node,
-    lightsaber_blade_emissive_rgb,
     lightsaber_blade_procedural_rgba8,
     lightsaber_blade_texture_cache_key,
     should_use_procedural_lightsaber_blade_texture,
@@ -70,6 +70,7 @@ from src.core.geometry.lightsaber import (
 from src.core.special.render_constants import INNER_GEO_SUBSTRINGS as _INNER_GEO_SUBSTRINGS
 from src.math.gpu_math import (
     _bas_attachment_local_transform_np,
+    _compose_world_transform_np,
     _mat3_normal,
     _mat4_from_pos_quat_scale,
     _mat4_identity,
@@ -85,18 +86,351 @@ from src.adapters.rendering.moderngl_resources import (
     _GlTexCache,
     _GpuMesh,
     _build_vbo_data,
+    _configure_lightsaber_blade_sampler,
+    _is_saber_runtime_helper,
     _prebuilt_static_gpu_mesh_data,
     _split_vbo_attributes_for_gpu,
 )
 from src.core.rendering.mesh_render_data import (
     _animated_node_world_transform,
+    _bas_attachment_world_transform,
+    _effective_animation_pose_for_node,
     _pose_node_for_transform,
     animation_pose_applies_to_node,
     animation_pose_for_node,
+    bas_attachment_palette_model_for_node,
+    runtime_source_model_for_node,
+)
+from src.core.rendering.skeleton_render_data import (
+    bas_attachment_root_local_skin_palette,
+    skin_palette_flat_bytes,
+)
+from src.core.rendering.renderer_performance import (
+    bounds_intersects_frustum,
+    extract_frustum_planes,
 )
 from src.core.rendering.gpu_shaders import _FRAG_SRC, _GRID_FRAG_SRC, _GRID_VERT_SRC, _VERT_SRC
 
 log = logging.getLogger(__name__)
+
+
+_SUBMISSION_CACHE_EMPTY = object()
+
+
+def _effective_diffuse_uv_v_flip(node, diffuse_image) -> float:
+    """Return the shader's single effective diffuse V-flip.
+
+    TextureCache normalizes loose raster rows to OpenGL's bottom-up upload
+    order. Native KOTOR/D3D UVs therefore request one shader inversion, while
+    imported DCC/OpenGL UVs explicitly opt out with ``uv_v_flip=False``.
+    Texture provenance may also opt out when its decoded rows already encode a
+    bottom-left-authored loose-atlas profile.
+    """
+
+    node_uses_kotor_uvs = bool(getattr(node, "uv_v_flip", True))
+    texture_needs_kotor_uv_conversion = bool(
+        getattr(diffuse_image, "_gr_gpu_uv_v_flip", True)
+    )
+    return 1.0 if node_uses_kotor_uvs and texture_needs_kotor_uv_conversion else 0.0
+
+
+def _uniform_value_stamp(value):
+    """Return an exact, comparison-safe stamp for one uniform value."""
+    if np is not None and isinstance(value, np.ndarray):
+        return ("ndarray", value.dtype.str, tuple(value.shape), value.tobytes())
+    # ModernGL vector uniforms overwhelmingly arrive as immutable numeric
+    # tuples.  Let CPython hash those tuples in C and retain the exact typed
+    # value instead of recursively allocating a tagged tuple for every scalar.
+    # The 207TEL PIE draw loop asks this cache about 14,000 times per frame;
+    # the recursive form spent several milliseconds rebuilding stamps even
+    # though almost every submission was skipped.  Unhashable containers keep
+    # the recursive snapshot below so later mutation cannot corrupt equality.
+    try:
+        hash(value)
+    except (TypeError, ValueError):
+        pass
+    else:
+        return (type(value), value)
+    if isinstance(value, tuple):
+        return (tuple, tuple(_uniform_value_stamp(item) for item in value))
+    if isinstance(value, list):
+        return (list, tuple(_uniform_value_stamp(item) for item in value))
+    return (type(value), value)
+
+
+class _ExactUniformSubmission:
+    """Uniform proxy that suppresses only byte/value-identical submissions."""
+
+    def __init__(self, uniform, stats: dict[str, int], *, cache_writes: bool = True):
+        self._uniform = uniform
+        self._stats = stats
+        self._cache_writes = bool(cache_writes)
+        self._last_submission = _SUBMISSION_CACHE_EMPTY
+
+    def reset_submission_cache(self) -> None:
+        self._last_submission = _SUBMISSION_CACHE_EMPTY
+
+    @property
+    def value(self):
+        return self._uniform.value
+
+    @value.setter
+    def value(self, value) -> None:
+        submission = ("value", _uniform_value_stamp(value))
+        if submission == self._last_submission:
+            self._stats["uniform_skips"] += 1
+            return
+        self._uniform.value = value
+        self._last_submission = submission
+        self._stats["uniform_writes"] += 1
+
+    def write(self, data) -> None:
+        # Animated skin palettes are deliberately excluded from this generic
+        # cache.  Their actor/pose/signature cache is owned by
+        # _skin_palette_bytes_for_draw and remains the correctness gate.
+        if not self._cache_writes:
+            self._uniform.write(data)
+            self._last_submission = _SUBMISSION_CACHE_EMPTY
+            self._stats["uniform_writes"] += 1
+            return
+        payload = bytes(data)
+        submission = ("bytes", payload)
+        if submission == self._last_submission:
+            self._stats["uniform_skips"] += 1
+            return
+        self._uniform.write(data)
+        self._last_submission = submission
+        self._stats["uniform_writes"] += 1
+
+    def __getattr__(self, name):
+        return getattr(self._uniform, name)
+
+
+class _ExactBlendSubmission:
+    """Track the last submitted GL blend state for one draw pass."""
+
+    def __init__(self, stats: dict[str, int]):
+        self._stats = stats
+        self.reset()
+
+    def reset(self) -> None:
+        self._enabled = _SUBMISSION_CACHE_EMPTY
+        self._equation = _SUBMISSION_CACHE_EMPTY
+        self._func = _SUBMISSION_CACHE_EMPTY
+
+    def apply(self, ctx, *, enabled: bool, equation=None, func=None) -> None:
+        enabled = bool(enabled)
+        if enabled != self._enabled:
+            if enabled:
+                ctx.enable(moderngl.BLEND)
+            else:
+                ctx.disable(moderngl.BLEND)
+            self._enabled = enabled
+            self._stats["blend_state_writes"] += 1
+        else:
+            self._stats["blend_state_skips"] += 1
+
+        if not enabled:
+            return
+        if equation is not None:
+            if equation != self._equation:
+                ctx.blend_equation = equation
+                self._equation = equation
+                self._stats["blend_state_writes"] += 1
+            else:
+                self._stats["blend_state_skips"] += 1
+        if func is not None:
+            func = tuple(func)
+            if func != self._func:
+                ctx.blend_func = func
+                self._func = func
+                self._stats["blend_state_writes"] += 1
+            else:
+                self._stats["blend_state_skips"] += 1
+
+
+def _strict_emitter_world_transform(node, anim_pose):
+    """Strict Aurora FK world transform for emitter nodes.
+
+    The shared mesh transform paths collapse 180°-about-axis bind rotations on
+    parent nodes (a droid/character rendering workaround).  Emitter placement
+    must NOT collapse them: K1 ``plc_starmap`` parents its star-field emitters
+    under ``Dummy01`` with a real (1,0,0,0) 180° X flip that moves the stars
+    from below the pedestal up into the dome.  Pose-node locals replace bind
+    locals when the node is animated (NodePose positions are absolute locals).
+    """
+    import math as _math
+
+    from src.core.geometry.model_data import _quat_mul, _quat_normalize, _quat_rotate
+    from src.core.rendering.mesh_render_data import _pose_node_for_transform
+
+    chain = []
+    current = node
+    seen: set = set()
+    while current is not None and id(current) not in seen and len(chain) <= 512:
+        seen.add(id(current))
+        chain.append(current)
+        current = getattr(current, "parent", None)
+    chain.reverse()
+
+    wx = wy = wz = 0.0
+    orientation = [0.0, 0.0, 0.0, 1.0]
+    for chain_node in chain:
+        pose_node = _pose_node_for_transform(chain_node, anim_pose) if anim_pose is not None else None
+        if pose_node is not None:
+            lx, ly, lz = getattr(pose_node, "position", chain_node.position)
+            rot = list(getattr(pose_node, "rotation", chain_node.rotation))
+        else:
+            lx, ly, lz = getattr(chain_node, "position", (0.0, 0.0, 0.0))
+            rot = list(getattr(chain_node, "rotation", (0.0, 0.0, 0.0, 1.0)))
+        if not (_math.isfinite(lx) and _math.isfinite(ly) and _math.isfinite(lz)):
+            lx, ly, lz = 0.0, 0.0, 0.0
+        if not all(_math.isfinite(v) for v in rot):
+            rot = [0.0, 0.0, 0.0, 1.0]
+        rx, ry, rz = _quat_rotate(orientation, (lx, ly, lz))
+        wx += rx
+        wy += ry
+        wz += rz
+        orientation = _quat_normalize(_quat_mul(orientation, _quat_normalize(rot)))
+    return (float(wx), float(wy), float(wz)), tuple(float(v) for v in orientation)
+
+
+def _is_untextured_glow(node) -> bool:
+    """Untextured self-illuminated planes are additive glows in the engine.
+
+    The Star Map's ``lightflare`` ignition burst and its holo ``Object*``
+    planes are authored with ``texture='null'`` plus a selfillum color.
+    Routing them through the opaque/cutout passes rasterizes hard-edged solid
+    white geometry (the giant white wedges seen during ``off2on``); retail
+    composites them as soft additive selfillum glows.
+    """
+    tex = str(getattr(node, 'texture', '') or '').strip().lower()
+    if tex and tex not in ('null', 'none', '****'):
+        return False
+    selfillum = getattr(node, 'selfillum', (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+    try:
+        return (float(selfillum[0]) + float(selfillum[1]) + float(selfillum[2])) > 0.05
+    except Exception:
+        return False
+
+
+def _set_depth_write(ctx, enabled: bool) -> None:
+    """Set glDepthMask through the bound framebuffer.
+
+    moderngl (5.12) exposes ``depth_mask`` on ``Framebuffer``, not ``Context``.
+    Assigning ``ctx.depth_mask`` silently creates an inert Python attribute, so
+    the "depth write OFF" transparent pass still wrote depth — an additive
+    surface such as the K1 Star Map dome then z-rejected every particle and
+    additive mesh drawn behind it.
+    """
+    try:
+        ctx.fbo.depth_mask = bool(enabled)
+    except Exception:
+        pass
+
+
+def _skin_vbo_signature_for_node(node):
+    """Return the skin state that must match a cached GPU VBO."""
+    if node is None or not bool(getattr(node, "is_skin", False)):
+        return None
+    skin_data = getattr(node, "skin_data", None)
+    vertices = getattr(node, "vertices", getattr(node, "verts", None))
+    faces = getattr(node, "faces", None)
+    def _safe_len(value):
+        try:
+            return len(value)
+        except Exception:
+            return 0
+    return (
+        tuple(getattr(node, "bone_map", []) or ()),
+        _safe_len(skin_data),
+        id(skin_data),
+        _safe_len(vertices),
+        id(vertices),
+        _safe_len(faces),
+        id(faces),
+        bool(getattr(node, "_gr_bound_to_kotor_skeleton", False)),
+        id(getattr(node, "_gr_skin_binding_report", None)),
+    )
+
+
+def _skin_influence_summary_for_log(node):
+    bone_map = list(getattr(node, "bone_map", []) or [])
+    skin_rows = list(getattr(node, "skin_data", []) or [])
+    used: set[int] = set()
+    max_influences = 0
+    min_sum = None
+    max_sum = None
+    for row in skin_rows:
+        influences = list(getattr(row, "influences", []) or [])
+        max_influences = max(max_influences, len(influences))
+        total = 0.0
+        for influence in influences:
+            try:
+                index = int(getattr(influence, "bone_index", -1))
+                weight = float(getattr(influence, "weight", 0.0))
+            except Exception:
+                continue
+            if 0 <= index < len(bone_map) and weight > 0.0:
+                used.add(index)
+                total += weight
+        min_sum = total if min_sum is None else min(min_sum, total)
+        max_sum = total if max_sum is None else max(max_sum, total)
+    return {
+        "rows": len(skin_rows),
+        "bone_map_count": len(bone_map),
+        "bone_map_sample": [str(name or "") for name in bone_map[:12]],
+        "used_influence_slot_count": len(used),
+        "max_influences_per_vertex": max_influences,
+        "weight_sum_min": float(min_sum or 0.0),
+        "weight_sum_max": float(max_sum or 0.0),
+    }
+
+
+def _diffuse_is_reflectivity_mask(img) -> bool:
+    """True when a diffuse image's alpha is a KOTOR environment/spec mask.
+
+    KOTOR stores a reflectivity mask in the diffuse alpha of opaque skins: the
+    engine blends the environment cube map by ``1 - alpha`` (bright metal where
+    alpha is low, matte cloth where alpha is 1).  Packaged TPC assets get this
+    driven by their TXI ``envmaptexture``; a raw TGA/PNG dropped into the
+    viewport keeps the mask but names no cube map, so it would render as its
+    (deliberately dark) diffuse with no sheen.  Detect that mask so the caller
+    can fall back to the default environment map.
+
+    A texture qualifies when a meaningful band of texels is partially
+    transparent (the mask) *without* a hard cutout (which would indicate
+    punch-through/foliage alpha) and it is not effectively fully opaque.  The
+    verdict is memoized on the image.
+    """
+    if img is None:
+        return False
+    cached = getattr(img, "_gr_reflectivity_mask", None)
+    if cached is not None:
+        return bool(cached)
+    result = False
+    try:
+        if "A" in img.getbands():
+            sample = img
+            if max(img.size) > 256:
+                sample = img.resize((256, 256))
+            hist = sample.getchannel("A").histogram()
+            total = float(sum(hist)) or 1.0
+            frac_cutout = sum(hist[0:8]) / total      # near-zero → transparency/cutout
+            frac_partial = sum(hist[16:248]) / total  # the reflectivity band
+            frac_opaque = sum(hist[248:256]) / total
+            result = (
+                frac_partial >= 0.05
+                and frac_cutout < 0.02
+                and frac_opaque < 0.995
+            )
+    except Exception:
+        result = False
+    try:
+        img._gr_reflectivity_mask = result
+    except Exception:
+        pass
+    return result
 
 
 class GpuRenderer:
@@ -155,6 +489,12 @@ class GpuRenderer:
         # correct: the env blend weight (diffuse alpha) modulates towards grey
         # rather than towards zero, keeping the surface opaque.
         self._grey_env_tex: Optional['moderngl.Texture'] = None
+        # FIX-ENVDEFAULT: Built-in metallic sphere-map used as the default
+        # environment reflection for opaque skins whose diffuse alpha is a
+        # reflectivity mask but that name no cube map (bare TGA/PNG drops).
+        # Mirrors appearance.2da envmap=DEFAULT so metallic armour previews
+        # with sheen instead of rendering as its dark diffuse.
+        self._default_env_tex: Optional['moderngl.Texture'] = None
         # FIX-PERSCACHE: Persistent world-transform cache keyed by (model_id, node_id).
         # Survives across frames for static geometry; invalidated when the model changes.
         # This reduces per-frame cost from O(N×depth) parent-chain walks to O(1) lookups.
@@ -163,6 +503,13 @@ class GpuRenderer:
         # PERF-UNIFCACHE: Cached uniform references (populated on first render).
         # Avoids prog['name'] dict lookup overhead per draw call.
         self._u: Dict[str, object] = {}   # uniform name → Uniform object
+        self._submission_stats: dict[str, int] = {
+            "uniform_writes": 0,
+            "uniform_skips": 0,
+            "blend_state_writes": 0,
+            "blend_state_skips": 0,
+        }
+        self._blend_submission = _ExactBlendSubmission(self._submission_stats)
         # PERF-NODECACHE: Pre-classified node lists cached per model.
         # Avoids re-classifying every node every frame when the model hasn't changed.
         self._node_cache_model_id: int = 0
@@ -172,6 +519,23 @@ class GpuRenderer:
         self._node_cache_proxy_ids: set = set()
         self._node_cache_is_module: bool = False
         self._node_cache_signature: tuple = ()
+        # PERF-NODECACHE-REVISION: Render-time classification must be O(1) on
+        # an unchanged scene.  The previous implementation rebuilt a detailed
+        # signature for every node on every frame, which cost about 54 ms/frame
+        # on the retained 207TEL PIE scene before any draw calls were submitted.
+        # UI material/visibility workflows already call invalidate_node_cache();
+        # model replacement is covered by model identity, and attach/detach is
+        # covered by the node count.  Headless/core callers can also bump the
+        # explicit model/root ``_gr_classification_revision`` contract.
+        self._node_classification_revision: int = 0
+        self._node_cache_built_revision: int = -1
+        self._node_cache_node_count: int = 0
+        self._node_cache_model_revision: tuple[int, int] = (0, 0)
+        # Scene-light attributes and transforms remain live every frame, but
+        # node type is static for a retained scene revision.  Keep the small
+        # candidate set so light selection does not scan every room/actor node.
+        self._scene_light_candidate_key: tuple = ()
+        self._scene_light_candidate_nodes: tuple = ()
         # PERF: Interactive mode skips MSAA for faster frame times.
         # Keep the default scale at full resolution; lowering it is available
         # for emergency performance mode, but makes animated previews pixelated.
@@ -204,6 +568,7 @@ class GpuRenderer:
         self._wireframe_pass: bool = False
         self.show_grid: bool = True
         self.cull_faces: bool = True
+        self.enable_frustum_culling: bool = True
         self.max_new_mesh_uploads_per_frame: int = 64
         self.deferred_mesh_uploads: bool = False
         # ── Phase A: GPU Skinning state ──────────────────────────────────────────
@@ -212,14 +577,47 @@ class GpuRenderer:
         # must not share one palette lookup table.
         self._skin_uploader: Optional['MatrixPaletteUploader'] = None
         self._skin_uploaders_by_scope: Dict[tuple, tuple[tuple[int, ...], object]] = {}
+        # Actor-local serialized palette cache.  One entry is retained per
+        # (actor scope, skin node) and replaced when that actor's pose changes.
+        # This avoids recomputing/padding 128 matrices on camera-only frames
+        # without ever sharing a character's palette with another character.
+        self._skin_palette_bytes_cache: Dict[tuple, tuple] = {}
         self._skin_model_id: int = 0  # id() of model for which bind-pose was built
         self._skin_bone_count: int = 0  # number of bones in the current palette
         self._skin_logged: bool = False  # one-shot log for GPU skinning activation
+        self._skin_preview_gate_logged: set[tuple[int, int]] = set()
+        self._skin_preview_palette_logged: set[tuple[int, int]] = set()
         self._gl_state_trace_path: str = _gl_state_trace_path()
         self._lm_data_dump_path: str = _lm_data_dump_path()
         self._lm_data_dump_seen: set = set()
         self._skin_dump_path: str = _skin_dump_path()
         self._skin_dump_seen: set = set()
+        # ── Emitter particle simulation state ────────────────────────────────
+        # One ModelParticleSystems per rendered model (single-entry cache: the
+        # viewport renders one model/scene at a time).  Advanced with wall-clock
+        # time each frame; the viewport polls ``particles_active`` to keep
+        # scheduling live frames while emitters are visible.
+        self.show_particles: bool = True
+        self.particles_active: bool = False
+        self._particle_pass = None
+        self._particle_systems = None
+        self._particle_model_id: int = 0
+        self._particle_last_wall: float = 0.0
+        self._particle_anim_cache: tuple = ("", None)
+        # ── Bloom post-process ───────────────────────────────────────────────
+        # Subtle glow accent for genuinely bright content (star cores and saber
+        # blades).  Retail KOTOR's emitter glow primarily comes from additive
+        # texture falloff, so the luminance threshold excludes saturated cyan
+        # structure and the strength stays an accent rather than a wash.
+        self.bloom_enabled: bool = True
+        # Luminance-gated extraction in ModernGLBloomPass blooms only genuinely
+        # bright cores.  Keep the residual halo restrained because KotOR.js
+        # Forge renders these emitter sprites with no post-process glow at all.
+        self.bloom_threshold: float = 0.82
+        self.bloom_strength: float = 0.18
+        self._bloom_pass = None
+        self._fbo_resolve_tex = None
+        self._fbo_simple_tex = None
         # Performance counters
         self.perf: Dict[str, float] = {
             'last_frame_ms': 0.0,
@@ -227,8 +625,35 @@ class GpuRenderer:
             'draw_ms': 0.0,
             'readback_ms': 0.0,
             'tri_count': 0,
+            'draw_calls': 0,
+            'visible_meshes': 0,
+            'culled_meshes': 0,
+            'culled_actor_meshes': 0,
+            'uniform_writes': 0,
+            'uniform_skips': 0,
+            'blend_state_writes': 0,
+            'blend_state_skips': 0,
             'backend': 'none',
         }
+
+    def _reset_uniform_submission_cache(self) -> None:
+        for uniform in self._u.values():
+            reset = getattr(uniform, "reset_submission_cache", None)
+            if reset is not None:
+                reset()
+
+    def _begin_submission_frame(self) -> None:
+        for key in self._submission_stats:
+            self._submission_stats[key] = 0
+        self._reset_uniform_submission_cache()
+        self._blend_submission.reset()
+
+    def _begin_draw_pass(self, ctx, *, blend_enabled: bool | None) -> None:
+        """Reset exact submission knowledge at an explicit render-pass edge."""
+        self._reset_uniform_submission_cache()
+        self._blend_submission.reset()
+        if blend_enabled is not None:
+            self._blend_submission.apply(ctx, enabled=blend_enabled)
 
     def set_theme_colors(self, theme) -> None:
         self.viewport_background = _hex_to_rgb_float(theme.color("viewport.background"), self.viewport_background)
@@ -343,6 +768,7 @@ class GpuRenderer:
             _u = {}
             for _uname in (
                 'u_mvp', 'u_model', 'u_normal_mat', 'u_cam_pos',
+                'u_map_fog_enabled', 'u_map_fog_color', 'u_map_fog_near', 'u_map_fog_far',
                 'u_light_dir', 'u_light_dir2', 'u_ambient', 'u_specular',
                 'u_shininess', 'u_alpha_test', 'u_decal', 'u_wateralpha',
                 'u_has_spec', 'u_has_bump', 'u_alpha', 'u_node_alpha', 'u_blend_mode',
@@ -367,7 +793,11 @@ class GpuRenderer:
                 'u_skin_enabled', 'u_bone_count', 'u_bones',
             ):
                 try:
-                    _u[_uname] = _p[_uname]
+                    _u[_uname] = _ExactUniformSubmission(
+                        _p[_uname],
+                        self._submission_stats,
+                        cache_writes=_uname != "u_bones",
+                    )
                 except KeyError:
                     pass
             self._u = _u
@@ -397,6 +827,24 @@ class GpuRenderer:
         for m in self._mesh_cache.values():
             m.release()
         self._mesh_cache.clear()
+        self._skin_palette_bytes_cache.clear()
+        if self._particle_pass is not None:
+            try:
+                self._particle_pass.release()
+            except Exception:
+                pass
+            self._particle_pass = None
+        self._particle_systems = None
+        self._particle_model_id = 0
+        self._particle_anim_cache = ("", None)
+        if self._bloom_pass is not None:
+            try:
+                self._bloom_pass.release()
+            except Exception:
+                pass
+            self._bloom_pass = None
+        self._fbo_resolve_tex = None
+        self._fbo_simple_tex = None
         # Release persistent FBO
         if self._fbo is not None:
             try:
@@ -433,6 +881,11 @@ class GpuRenderer:
             try: self._grey_env_tex.release()
             except Exception: pass
             self._grey_env_tex = None
+        # Release default metallic env sphere-map
+        if self._default_env_tex is not None:
+            try: self._default_env_tex.release()
+            except Exception: pass
+            self._default_env_tex = None
         # Phase A: Release GPU skinning uploader
         if self._skin_uploader is not None:
             try: self._skin_uploader.release()
@@ -460,8 +913,46 @@ class GpuRenderer:
             try: self._ctx.release()
             except Exception: pass
             self._ctx = None
+        self._u.clear()
+        self._blend_submission.reset()
         self._gpu_available = False
         self._init_attempted = False  # allow re-initialisation after release
+
+    def _default_env_texture(self, ctx):
+        """Lazily build the default metallic sphere-map (matcap) reflection.
+
+        A vertical grey gradient — bright near the top with a soft highlight
+        band, darkening toward the bottom — reads as a neutral chrome/sky
+        reflection through the shader's ``env_uv = R.xy/m + 0.5`` sphere map.
+        Blended by ``1 - diffuse_alpha`` it lifts a dark metallic diffuse into a
+        metallic sheen without tinting matte (alpha=1) regions.
+        """
+        if self._default_env_tex is not None:
+            return self._default_env_tex
+        size = 128
+        buf = bytearray(size * size * 4)
+        for y in range(size):
+            v = y / (size - 1)                       # 0 = top row, 1 = bottom
+            base = 1.0 - v                           # bright top → dark bottom
+            highlight = math.exp(-((v - 0.25) ** 2) / (2 * 0.06 ** 2)) * 0.45
+            lum = 0.22 + 0.66 * base + highlight
+            c = int(max(0.0, min(1.0, lum)) * 255)
+            row = y * size * 4
+            for x in range(size):
+                i = row + x * 4
+                buf[i] = c
+                buf[i + 1] = c
+                buf[i + 2] = c
+                buf[i + 3] = 255
+        tex = ctx.texture((size, size), 4, bytes(buf))
+        try:
+            tex.build_mipmaps()
+        except Exception:
+            pass
+        tex.repeat_x = False
+        tex.repeat_y = False
+        self._default_env_tex = tex
+        return tex
 
     def clear_caches(self) -> None:
         """Clear per-model GPU mesh and texture caches without destroying the context.
@@ -488,12 +979,15 @@ class GpuRenderer:
         # Clear persistent world-transform cache (invalidated per model anyway)
         self._wt_cache.clear()
         self._wt_model_id = 0
+        self._skin_palette_bytes_cache.clear()
         # PERF-NODECACHE: Clear pre-classified node lists
         self._node_cache_model_id = 0
         self._node_cache_opaque = []
         self._node_cache_cutout = []
         self._node_cache_transparent = []
         self._node_cache_proxy_ids = set()
+        self._scene_light_candidate_key = ()
+        self._scene_light_candidate_nodes = ()
         # Phase A: Clear GPU skinning state (new model = new bone palette)
         if self._skin_uploader is not None:
             try: self._skin_uploader.release()
@@ -501,6 +995,10 @@ class GpuRenderer:
             self._skin_uploader = None
         self._skin_model_id = 0
         self._skin_bone_count = 0
+        # Drop live particle simulations (new model = new emitter set)
+        self._particle_systems = None
+        self._particle_model_id = 0
+        self._particle_anim_cache = ("", None)
         # NOTE: _init_attempted is intentionally NOT reset here — the EGL context
         # remains alive and valid across clear_caches() calls.
 
@@ -529,11 +1027,19 @@ class GpuRenderer:
         self._fbo = None
         self._fbo_resolve = None
         self._fbo_simple = None
+        self._fbo_resolve_tex = None
+        self._fbo_simple_tex = None
         self._fbo_w = 0
         self._fbo_h = 0
         self._fbo_simple_w = 0
         self._fbo_simple_h = 0
         self._fbo_msaa = False
+        if self._bloom_pass is not None:
+            try:
+                self._bloom_pass.release()
+            except Exception:
+                pass
+            self._bloom_pass = None
 
     def _reset_frame_state(self, ctx, width: int, height: int) -> None:
         """Reset mutable GL state that can leak between scene/grid/overlay passes."""
@@ -554,7 +1060,7 @@ class GpuRenderer:
             pass
         try:
             ctx.depth_func = '<='
-            ctx.depth_mask = True
+            _set_depth_write(ctx, True)
         except Exception:
             pass
         try:
@@ -620,7 +1126,7 @@ class GpuRenderer:
             return
         self._grid_prog['u_mvp'].write(_mat4_tobytes(mvp))
         ctx.disable(moderngl.BLEND)
-        ctx.depth_mask = False
+        _set_depth_write(ctx, False)
         try:
             ctx.line_width = 1.0
         except Exception:
@@ -628,7 +1134,7 @@ class GpuRenderer:
         try:
             vao.render(moderngl.LINES)
         finally:
-            ctx.depth_mask = True
+            _set_depth_write(ctx, True)
 
     def _is_node_selected_for_render(self, node) -> bool:
         if node is getattr(self, "selected_node", None) or bool(getattr(node, "_gr_selected", False)):
@@ -679,6 +1185,8 @@ class GpuRenderer:
         draw_volumes = bool(getattr(self, "show_light_radius_volumes", True))
         for node in nodes:
             if not bool(getattr(node, "is_light", False)):
+                continue
+            if bool(getattr(node, "_gr_light_helper_hidden", False)):
                 continue
             if bool(getattr(node, "_gr_light_hidden", False)) or bool(getattr(node, "_gr_light_deleted", False)):
                 continue
@@ -755,14 +1263,14 @@ class GpuRenderer:
         try:
             ctx.disable(moderngl.DEPTH_TEST)
             ctx.disable(moderngl.BLEND)
-            ctx.depth_mask = False
+            _set_depth_write(ctx, False)
             try:
                 ctx.line_width = 1.0
             except Exception:
                 pass
             vao.render(moderngl.LINES)
         finally:
-            ctx.depth_mask = True
+            _set_depth_write(ctx, True)
             if depth_was_enabled:
                 ctx.enable(moderngl.DEPTH_TEST)
             vao.release()
@@ -778,6 +1286,8 @@ class GpuRenderer:
             return 2
         if kind == "area":
             return 3
+        if kind == "ambient":
+            return 4
         return 0
 
     @staticmethod
@@ -796,7 +1306,34 @@ class GpuRenderer:
         except Exception:
             return (0.0, 0.0, -1.0)
 
-    def _scene_light_records(self, nodes, get_world_transform) -> list[dict]:
+    def _scene_light_candidates_for_model(self, model, nodes) -> tuple:
+        """Return light-typed nodes for the retained scene topology revision.
+
+        Enabled/hidden state, color, radius, intensity, and world transform are
+        deliberately not cached: ``_scene_light_records`` reads those values
+        from each candidate every frame.  Only the immutable node-type filter is
+        retained.  Topology/material workflows invalidate the same explicit
+        classification revision used by draw-list caching.
+        """
+        root = getattr(model, "root_node", None)
+        key = (
+            id(model),
+            len(nodes),
+            int(self._node_classification_revision),
+            int(getattr(model, "_gr_classification_revision", 0) or 0),
+            int(getattr(root, "_gr_classification_revision", 0) or 0),
+            int(getattr(model, "_gr_lighting_revision", 0) or 0),
+            int(getattr(root, "_gr_lighting_revision", 0) or 0),
+        )
+        if key != self._scene_light_candidate_key:
+            self._scene_light_candidate_nodes = tuple(
+                node for node in nodes
+                if bool(getattr(node, "is_light", False))
+            )
+            self._scene_light_candidate_key = key
+        return self._scene_light_candidate_nodes
+
+    def _scene_light_records(self, nodes, get_world_transform, *, reference_position=None) -> list[dict]:
         records: list[dict] = []
         for node in nodes:
             if not bool(getattr(node, "is_light", False)):
@@ -814,7 +1351,8 @@ class GpuRenderer:
             radius = max(0.001, float(getattr(node, "light_radius", 5.0) or 5.0))
             intensity = max(0.0, float(getattr(node, "light_multiplier", 1.0) or 1.0))
             cone_deg = max(1.0, min(179.0, float(getattr(node, "light_cone_degrees", 45.0) or 45.0)))
-            records.append({
+            light_kind = str(getattr(node, "light_kind", "point") or "point").strip().lower()
+            record = {
                 "enabled": 1,
                 "kind": self._light_kind_int(node),
                 "ambient_only": 1 if bool(getattr(node, "light_ambient_only", False)) else 0,
@@ -826,14 +1364,28 @@ class GpuRenderer:
                 "cone_cos": math.cos(math.radians(cone_deg * 0.5)),
                 "area_size": max(0.0, float(getattr(node, "light_area_size", 1.0) or 1.0)),
                 "score": radius * max(0.01, intensity),
-            })
-        records.sort(key=lambda item: item["score"], reverse=True)
+            }
+            record["selection_key"] = scene_light_relevance_key(
+                position=record["pos"],
+                radius=radius,
+                intensity=intensity,
+                reference_position=reference_position,
+                light_type=light_kind,
+                color_rgb=record["color"],
+            )
+            records.append(record)
+        records.sort(key=lambda item: item["selection_key"], reverse=True)
         return records[:16]
 
     def _upload_scene_lights(self, prog, uniforms, records: list[dict]) -> None:
         count = len(records)
         mode = str(getattr(self, "lighting_mode", "scene") or "scene").lower()
-        if mode in {"unlit", "fullbright", "diffuse_only", "normal_only", "specular_only", "environment_only", "lightmap_preview", "shader_complexity"}:
+        if mode == "lightmap_preview":
+            # Preserve the baked-lightmap branch.  Value 0 is the true unlit
+            # contract and the fragment shader intentionally replaces every
+            # prior lighting result with diffuse color for that value.
+            lighting_int = 3
+        elif mode in {"unlit", "fullbright", "diffuse_only", "normal_only", "specular_only", "environment_only", "shader_complexity"}:
             lighting_int = 0
         elif mode in {"scene", "photoreal_preview"} and count > 0:
             lighting_int = 2
@@ -893,6 +1445,157 @@ class GpuRenderer:
             except Exception:
                 log.debug("GpuRenderer: failed to upload %s", name, exc_info=True)
 
+    @staticmethod
+    def _skin_pose_cache_stamp(pose) -> tuple:
+        """Return the explicit revision contract for one actor-local pose."""
+        if pose is None:
+            return (0, 0.0, 0.0, 0.0, 0, "", 0, 0)
+
+        def _float_stamp(name: str) -> float:
+            try:
+                return round(float(getattr(pose, name, 0.0) or 0.0), 6)
+            except Exception:
+                return 0.0
+
+        nodes = getattr(pose, "nodes", {}) or {}
+        return (
+            id(pose),
+            _float_stamp("time"),
+            _float_stamp("current_time"),
+            _float_stamp("_gr_animation_time"),
+            int(getattr(pose, "_gr_revision", 0) or 0),
+            str(getattr(pose, "_gr_animation_name", "") or ""),
+            id(nodes),
+            len(nodes),
+        )
+
+    def _skin_palette_bytes_for_draw(
+        self,
+        *,
+        scope_key: tuple,
+        skin_node,
+        uploader,
+        anim_pose,
+        anim_base_pose,
+        skin_signature: tuple | None,
+    ) -> tuple[int, bytes, bool]:
+        """Return actor-local palette bytes, reusing only the exact same pose."""
+        bone_count = min(len(getattr(skin_node, "bone_map", []) or []), _SKIN_MAX_BONES)
+        cache_key = (tuple(scope_key), id(skin_node))
+        stamp = (
+            id(uploader),
+            self._skin_pose_cache_stamp(anim_pose),
+            self._skin_pose_cache_stamp(anim_base_pose),
+            skin_signature,
+            bone_count,
+        )
+        cached = self._skin_palette_bytes_cache.get(cache_key)
+        if cached is not None and cached[0] == stamp:
+            _stamp, cached_count, cached_bytes, formula, inverse_bind_source = cached
+            # Preserve diagnostic parity for callers which inspect the uploader
+            # after a cached draw rather than only consuming the uniform bytes.
+            uploader._skin_palette_formula = formula
+            uploader._skin_inverse_bind_source = inverse_bind_source
+            return int(cached_count), cached_bytes, True
+
+        uploader.compute_skin_node_palette(
+            skin_node,
+            anim_pose,
+            anim_base_pose=anim_base_pose,
+        )
+        if bool(getattr(skin_node, "_gr_bas_attachment_layer", False)):
+            palette = bas_attachment_root_local_skin_palette(
+                skin_node,
+                uploader.as_numpy_array(),
+                anim_pose,
+            )
+            palette_bytes = skin_palette_flat_bytes(palette, _SKIN_MAX_BONES)
+        else:
+            palette_bytes = uploader.as_flat_bytes()
+        self._skin_palette_bytes_cache[cache_key] = (
+            stamp,
+            bone_count,
+            palette_bytes,
+            str(getattr(uploader, "_skin_palette_formula", "") or ""),
+            str(getattr(uploader, "_skin_inverse_bind_source", "") or ""),
+        )
+        return bone_count, palette_bytes, False
+
+    def _skin_uploader_for_palette_scope(
+        self,
+        *,
+        scope_key: tuple,
+        palette_model,
+        fallback_nodes,
+    ):
+        """Return the retained palette uploader for one renderer scope.
+
+        PIE runtime actors and BAS attachment palette models are immutable for
+        their retained lifetime, and both scope keys include the model object
+        identity.  Once built, an exact-key hit therefore does not need another
+        recursive ``all_nodes()`` walk for every skin draw.  Editable scene and
+        model scopes retain the identity-signature validation used previously.
+        """
+        if MatrixPaletteUploader is None:
+            return None
+        cached = self._skin_uploaders_by_scope.get(scope_key)
+        immutable_scope = bool(
+            scope_key
+            and scope_key[0] in {"runtime_actor", "bas_attachment"}
+        )
+        if cached is not None and immutable_scope:
+            return cached[1]
+        try:
+            palette_nodes = list(palette_model.all_nodes())
+        except Exception:
+            palette_nodes = list(fallback_nodes)
+        signature = tuple(id(item) for item in palette_nodes)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        uploader = MatrixPaletteUploader(max_bones=_SKIN_MAX_BONES)
+        n_built = uploader.build_inverse_bind_pose(palette_model)
+        self._skin_uploaders_by_scope[scope_key] = (signature, uploader)
+        self._skin_uploader = uploader
+        self._skin_model_id = self._wt_model_id
+        self._skin_bone_count = n_built
+        if not self._skin_logged:
+            log.info(
+                "GPU-SKINNING: MatrixPaletteUploader built %s inverse bind-pose "
+                "matrices for scope %s",
+                n_built,
+                scope_key,
+            )
+            self._skin_logged = True
+        return uploader
+
+    @staticmethod
+    def _transformed_bounds_outside_frustum(bounds, model_matrix, planes) -> bool:
+        """Conservatively reject an affine-transformed local AABB."""
+        if not bounds or not planes:
+            return False
+        try:
+            mins = np.asarray(bounds[0], dtype=np.float64)[:3]
+            maxs = np.asarray(bounds[1], dtype=np.float64)[:3]
+            if mins.shape != (3,) or maxs.shape != (3,):
+                return False
+            if not np.all(np.isfinite(mins)) or not np.all(np.isfinite(maxs)):
+                return False
+            if np.any(maxs < mins):
+                return False
+            matrix = np.asarray(model_matrix, dtype=np.float64).reshape(4, 4)
+            center = (mins + maxs) * 0.5
+            extents = (maxs - mins) * 0.5
+            world_center = matrix[:3, :3] @ center + matrix[:3, 3]
+            world_extents = np.abs(matrix[:3, :3]) @ extents
+            world_bounds = (
+                tuple(float(v) for v in world_center - world_extents),
+                tuple(float(v) for v in world_center + world_extents),
+            )
+            return not bounds_intersects_frustum(world_bounds, planes)
+        except Exception:
+            # Culling must fail open: uncertain bounds stay drawable.
+            return False
+
     def render(self,
                model,
                camera,
@@ -901,7 +1604,8 @@ class GpuRenderer:
                anim_pose=None,
                anim_time: float = 0.0,
                anim_base_pose=None,
-               display_options=None) -> Optional['Image.Image']:
+               display_options=None,
+               anim_name: str = '') -> Optional['Image.Image']:
         """
         Render `model` from `camera` into a W×H PIL RGBA image.
 
@@ -931,7 +1635,7 @@ class GpuRenderer:
 
         if self._ensure_context():
             result = self._render_gpu(model, camera, W, H, textures, anim_pose, anim_time,
-                                       anim_base_pose=anim_base_pose)
+                                       anim_base_pose=anim_base_pose, anim_name=anim_name)
             if result is not None:
                 self.perf['last_frame_ms'] = (time.perf_counter() - t0) * 1000
                 self.perf['backend'] = 'gpu'
@@ -947,7 +1651,7 @@ class GpuRenderer:
     def _render_gpu(self, model, camera, W: int, H: int,
                     textures: Dict[str, 'Image.Image'],
                     anim_pose, anim_time: float,
-                    anim_base_pose=None) -> Optional['Image.Image']:
+                    anim_base_pose=None, anim_name: str = '') -> Optional['Image.Image']:
         """Full GPU render via ModernGL EGL."""
         ctx = self._ctx
         prog = self._prog
@@ -968,6 +1672,7 @@ class GpuRenderer:
             H = max(8, int(H * _scale))
 
         try:
+            self._begin_submission_frame()
             t_upload = time.perf_counter()
 
             # ── PERF-FBO: Dual Framebuffer strategy ──────────────────────
@@ -1002,8 +1707,11 @@ class GpuRenderer:
                             color_attachments=[ctx.renderbuffer((W, H), components=4, samples=_MSAA_SAMPLES)],
                             depth_attachment=ctx.depth_renderbuffer((W, H), samples=_MSAA_SAMPLES),
                         )
+                        # Texture color attachment (not a renderbuffer) so the
+                        # bloom bright-pass can sample the resolved scene.
+                        self._fbo_resolve_tex = ctx.texture((W, H), 4)
                         self._fbo_resolve = ctx.framebuffer(
-                            color_attachments=[ctx.renderbuffer((W, H), components=4)],
+                            color_attachments=[self._fbo_resolve_tex],
                         )
                         self._fbo_msaa = True
                     except Exception:
@@ -1012,6 +1720,7 @@ class GpuRenderer:
                             depth_attachment=ctx.depth_renderbuffer((W, H)),
                         )
                         self._fbo_resolve = None
+                        self._fbo_resolve_tex = None
                         self._fbo_msaa = False
                     self._fbo_w = W
                     self._fbo_h = H
@@ -1027,8 +1736,9 @@ class GpuRenderer:
                             if da is not None: da.release()
                             self._fbo_simple.release()
                         except Exception: pass
+                    self._fbo_simple_tex = ctx.texture((W, H), 4)
                     self._fbo_simple = ctx.framebuffer(
-                        color_attachments=[ctx.renderbuffer((W, H), components=4)],
+                        color_attachments=[self._fbo_simple_tex],
                         depth_attachment=ctx.depth_renderbuffer((W, H)),
                     )
                     self._fbo_simple_w = W
@@ -1048,7 +1758,7 @@ class GpuRenderer:
             # GL_LEQUAL allows co-planar decal geometry to render correctly without
             # z-fighting, matching the original engine's depth test mode.
             ctx.depth_func = '<='
-            ctx.depth_mask = True  # depth writes ON by default
+            _set_depth_write(ctx, True)  # depth writes ON by default
 
             # BUG-WIND FIX: KotOR models use CLOCKWISE triangle winding (Direct3D
             # convention).  OpenGL defaults to COUNTER-CLOCKWISE front faces.
@@ -1091,6 +1801,13 @@ class GpuRenderer:
             # Matrices are standard row-major; _mat4_tobytes() transposes for GLSL column-major.
             mvp        = _mat4_mul(_mat4_mul(proj, view), model_mat)
             normal_mat = _mat3_normal(model_mat)
+            _frustum_planes = None
+            if bool(getattr(self, "enable_frustum_culling", True)):
+                try:
+                    _frustum_planes = extract_frustum_planes(mvp)
+                except Exception:
+                    # A malformed/custom camera must never hide the scene.
+                    _frustum_planes = None
 
             # PERF-UNIFCACHE: Use cached uniform references from self._u instead of
             # prog['name'] dict lookups.  This saves ~0.4ms/frame on 56-node models.
@@ -1100,6 +1817,27 @@ class GpuRenderer:
             _u['u_model'].write(_mat4_tobytes(model_mat))
             _u['u_normal_mat'].write(normal_mat.T.astype(np.float32).tobytes())
             _u['u_cam_pos'].value = tuple(eye)
+            _map_world_preview = dict(getattr(self, "map_studio_world_lighting_preview", {}) or {})
+            _map_fog_enabled = bool(_map_world_preview.get("fog_previewed") and _map_world_preview.get("fog_enabled"))
+            if 'u_map_fog_enabled' in _u:
+                _u['u_map_fog_enabled'].value = 1 if _map_fog_enabled else 0
+                _fog_color = tuple(
+                    _map_world_preview.get(
+                        "fog_preview_color_rgb",
+                        _map_world_preview.get("fog_color_rgb", (0.0, 0.0, 0.0)),
+                    )
+                    or (0.0, 0.0, 0.0)
+                )
+                if len(_fog_color) < 3:
+                    _fog_color = (0.0, 0.0, 0.0)
+                _u['u_map_fog_color'].value = tuple(max(0.0, min(1.0, float(channel))) for channel in _fog_color[:3])
+                _fog_near = max(0.0, float(_map_world_preview.get("fog_preview_near", _map_world_preview.get("fog_near", 0.0)) or 0.0))
+                _fog_far = max(
+                    _fog_near + 0.001,
+                    float(_map_world_preview.get("fog_preview_far", _map_world_preview.get("fog_far", 1.0)) or 1.0),
+                )
+                _u['u_map_fog_near'].value = _fog_near
+                _u['u_map_fog_far'].value = _fog_far
 
             # Lighting uniforms — only set once per frame (values don't change per-node).
             _u['u_light_dir'].value  = (0.4839, 0.3519, 0.7918)  # pre-normalised
@@ -1196,10 +1934,11 @@ class GpuRenderer:
             # ── FIX-PERSCACHE: Persistent world-transform cache ────────────
             _cur_model_id = id(model)
             _model_changed = (_cur_model_id != self._wt_model_id)
-            if _model_changed:
+            if _model_changed or len(nodes) != self._node_cache_node_count:
                 self._wt_cache.clear()
                 self._wt_model_id = _cur_model_id
                 self._skin_uploaders_by_scope.clear()
+                self._skin_palette_bytes_cache.clear()
 
             # ── Phase A: GPU Skinning — build bone palette for skin models ─────
             # Detect if this model has any skin nodes; if so, build the
@@ -1235,6 +1974,27 @@ class GpuRenderer:
                     return list(self._nodes)
 
             def _skin_palette_scope_for_node(nd):
+                if bool(getattr(nd, "_gr_bas_attachment_layer", False)):
+                    attachment_model = bas_attachment_palette_model_for_node(nd)
+                    if attachment_model is not None:
+                        return ("bas_attachment", id(attachment_model)), attachment_model
+
+                runtime_model = runtime_source_model_for_node(nd)
+                if runtime_model is not None:
+                    root = getattr(nd, "_gr_scene_object_root_ref", None)
+                    object_id = str(
+                        getattr(root, "_gr_scene_object_id", "")
+                        or getattr(nd, "_gr_scene_object_id", "")
+                        or ""
+                    )
+                    actor_identity = root if root is not None else nd
+                    return (
+                        "runtime_actor",
+                        object_id or str(id(actor_identity)),
+                        id(actor_identity),
+                        id(runtime_model),
+                    ), runtime_model
+
                 root = getattr(nd, "_gr_scene_object_root_ref", None)
                 if root is not None and bool(getattr(root, "_gr_scene_object_root", False)):
                     object_id = str(
@@ -1255,38 +2015,22 @@ class GpuRenderer:
                     return key, _SkinPaletteModelView(model, root_nodes or [root])
                 return ("model", _cur_model_id), model
 
-            def _skin_uploader_for_node(nd):
-                if MatrixPaletteUploader is None:
-                    return None
-                scope_key, palette_model = _skin_palette_scope_for_node(nd)
-                try:
-                    palette_nodes = list(palette_model.all_nodes())
-                except Exception:
-                    palette_nodes = nodes
-                signature = tuple(id(item) for item in palette_nodes)
-                cached = self._skin_uploaders_by_scope.get(scope_key)
-                if cached is not None and cached[0] == signature:
-                    return cached[1]
-                uploader = MatrixPaletteUploader(max_bones=_SKIN_MAX_BONES)
-                n_built = uploader.build_inverse_bind_pose(palette_model)
-                self._skin_uploaders_by_scope[scope_key] = (signature, uploader)
-                self._skin_uploader = uploader
-                self._skin_model_id = _cur_model_id
-                self._skin_bone_count = n_built
-                if not self._skin_logged:
-                    log.info(
-                        "GPU-SKINNING: MatrixPaletteUploader built %s inverse bind-pose "
-                        "matrices for scope %s",
-                        n_built,
-                        scope_key,
-                    )
-                    self._skin_logged = True
-                return uploader
+            def _skin_uploader_for_node(nd, resolved_scope=None):
+                scope_key, palette_model = (
+                    resolved_scope
+                    if resolved_scope is not None
+                    else _skin_palette_scope_for_node(nd)
+                )
+                return self._skin_uploader_for_palette_scope(
+                    scope_key=scope_key,
+                    palette_model=palette_model,
+                    fallback_nodes=nodes,
+                )
 
             # PERF: Only stamp model refs and compute proxy IDs when model changes.
             # These are O(N) walks that produce identical results across frames for
             # the same model.
-            if _model_changed:
+            if _model_changed or len(nodes) != self._node_cache_node_count:
                 for _n in nodes:
                     try:
                         _n._model_ref = model
@@ -1336,23 +2080,44 @@ class GpuRenderer:
                 _proxy_node_ids = self._node_cache_proxy_ids
             # Local alias for closure capture
             _wt_cache = self._wt_cache
+            _bas_root_cache: Dict[int, object | None] = {}
+            _bas_socket_cache: Dict[int, object | None] = {}
+            _bas_transform_cache: Dict[object, object] = {}
 
             def _bas_attachment_root_for_node(nd):
+                _node_id = id(nd)
+                if _node_id in _bas_root_cache:
+                    return _bas_root_cache[_node_id]
                 _cur = nd
                 _seen = set()
+                _trail = []
+                _result = None
                 while _cur is not None and id(_cur) not in _seen:
-                    _seen.add(id(_cur))
+                    _cur_id = id(_cur)
+                    if _cur_id in _bas_root_cache:
+                        _result = _bas_root_cache[_cur_id]
+                        break
+                    _seen.add(_cur_id)
+                    _trail.append(_cur)
                     if bool(getattr(_cur, "_gr_bas_attachment_root", False)):
-                        return _cur
+                        _result = _cur
+                        break
                     _cur = getattr(_cur, "parent", None)
-                return None
+                for _item in _trail:
+                    _bas_root_cache[id(_item)] = _result
+                return _result
 
             def _bas_attachment_socket_node(_bas_root):
+                _root_id = id(_bas_root)
+                if _root_id in _bas_socket_cache:
+                    return _bas_socket_cache[_root_id]
                 _socket_name = str(getattr(_bas_root, "_gr_bas_socket_name", "") or "").lower()
                 _body_root = getattr(_bas_root, "parent", None)
                 if _body_root is None or not _socket_name:
+                    _bas_socket_cache[_root_id] = None
                     return None
                 if str(getattr(_body_root, "name", "") or "").lower() == _socket_name:
+                    _bas_socket_cache[_root_id] = _body_root
                     return _body_root
                 _stack = [_body_root]
                 _seen = {id(_bas_root)}
@@ -1362,12 +2127,42 @@ class GpuRenderer:
                         continue
                     _seen.add(id(_cur))
                     if str(getattr(_cur, "name", "") or "").lower() == _socket_name:
+                        _bas_socket_cache[_root_id] = _cur
                         return _cur
                     for _child in reversed(getattr(_cur, "children", []) or []):
                         if bool(getattr(_child, "_gr_bas_attachment_root", False)):
                             continue
                         _stack.append(_child)
+                _bas_socket_cache[_root_id] = None
                 return None
+
+            # A node can be queried several times in one frame (light gather,
+            # transparent sort, and draw).  Animated transforms are not valid
+            # across frames, but they are immutable for this render call.
+            _frame_wt_cache: Dict[int, tuple] = {}
+            _node_anim_pose_cache: Dict[int, object | None] = {}
+
+            def _resolved_animation_pose(nd):
+                """Resolve one actor pose once without animating static map nodes.
+
+                PIE publishes a fresh ``ScopedAnimationPoseSet`` after every
+                retained actor batch.  Treating that non-null collection as a
+                pose for every scene node discarded the persistent transform
+                path for the complete module, even though almost all room and
+                placeable nodes belong to no animated actor.  Cache the scoped
+                identity lookup for this render and return ``None`` for those
+                static nodes so they continue through ``_wt_cache``.
+                """
+
+                if anim_pose is None or nd is None:
+                    return None
+                node_id = id(nd)
+                if node_id not in _node_anim_pose_cache:
+                    _node_anim_pose_cache[node_id] = _effective_animation_pose_for_node(
+                        nd,
+                        anim_pose,
+                    )
+                return _node_anim_pose_cache[node_id]
 
             def _get_world_transform(nd):
                 """Return (world_pos, world_orient) with persistent memoization.
@@ -1395,55 +2190,42 @@ class GpuRenderer:
                            xoreos modelnode.cpp:805 (skin pass separation).
                 """
                 nid = id(nd)
+                if nid in _frame_wt_cache:
+                    return _frame_wt_cache[nid]
                 _bas_root = _bas_attachment_root_for_node(nd)
                 if _bas_root is not None:
-                    _socket = _bas_attachment_socket_node(_bas_root)
-                    if _socket is not None:
-                        _base_wp, _base_wo = _get_world_transform(_socket)
-                    else:
-                        _base_wp, _base_wo = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
-                    _chain = []
-                    _cur = nd
-                    _seen = set()
-                    while _cur is not None:
-                        if id(_cur) in _seen or len(_chain) > 512:
-                            break
-                        _seen.add(id(_cur))
-                        _chain.append(_cur)
-                        if _cur is _bas_root:
-                            break
-                        _cur = getattr(_cur, "parent", None)
-                    _chain.reverse()
-                    _awx, _awy, _awz = (float(_base_wp[0]), float(_base_wp[1]), float(_base_wp[2]))
-                    _aparent_q = np.array([float(v) for v in _base_wo[:4]], dtype=np.float64)
-                    for _cn in _chain:
-                        _lx, _ly, _lz = getattr(_cn, "position", (0.0, 0.0, 0.0))
-                        _rot = list(getattr(_cn, "rotation", (0.0, 0.0, 0.0, 1.0)))
-                        _r2 = _rot[0]**2 + _rot[1]**2 + _rot[2]**2 + _rot[3]**2
-                        if _r2 > 1e-9 and abs(_r2 - 1.0) > 1e-4:
-                            _rs = _r2 ** 0.5
-                            _rot = [_rot[0]/_rs, _rot[1]/_rs, _rot[2]/_rs, _rot[3]/_rs]
-                        _local_pos = np.array([[_lx, _ly, _lz]], dtype=np.float64)
-                        _rotated = _quat_rotate_batch(_aparent_q, _local_pos)[0]
-                        _awx += _rotated[0]
-                        _awy += _rotated[1]
-                        _awz += _rotated[2]
-                        _px, _py, _pz, _pw = _aparent_q
-                        _nx, _ny, _nz, _nw = np.array(_rot, dtype=np.float64)
-                        _aparent_q = np.array([
-                            _pw*_nx + _px*_nw + _py*_nz - _pz*_ny,
-                            _pw*_ny - _px*_nz + _py*_nw + _pz*_nx,
-                            _pw*_nz + _px*_ny - _py*_nx + _pz*_nw,
-                            _pw*_nw - _px*_nx - _py*_ny - _pz*_nz,
-                        ], dtype=np.float64)
-                    return ((_awx, _awy, _awz), tuple(_aparent_q.tolist()))
+                    # BAS heads need two poses at once: the body pose places the
+                    # headhook socket, while the attachment source pose drives
+                    # facial bones and rigid eye/mouth descendants.  The shared
+                    # renderer-neutral helper owns that space conversion.
+                    result = _bas_attachment_world_transform(
+                        nd,
+                        _bas_root,
+                        anim_pose=_resolved_animation_pose(nd),
+                        transform_cache=_bas_transform_cache,
+                    )
+                    _frame_wt_cache[nid] = result
+                    return result
                 if anim_pose is not None:
                     _is_skin_nd = bool(getattr(nd, 'is_skin', False))
                     if not _is_skin_nd:
-                        return _animated_node_world_transform(nd, anim_pose)
+                        _resolved_pose = _resolved_animation_pose(nd)
+                        if _resolved_pose is not None:
+                            # Pass the actor-local pose, not the short-lived
+                            # scoped collection.  Unchanged actors therefore
+                            # retain their own world-chain cache while a newly
+                            # evaluated pose still recomputes exactly its actor.
+                            result = _animated_node_world_transform(
+                                nd,
+                                _resolved_pose,
+                            )
+                            _frame_wt_cache[nid] = result
+                            return result
                 # Static / no override → use persistent cache
                 if nid in _wt_cache:
-                    return _wt_cache[nid]
+                    result = _wt_cache[nid]
+                    _frame_wt_cache[nid] = result
+                    return result
                 try:
                     _wp, _wo = nd.world_transform()
                 except Exception:
@@ -1451,6 +2233,7 @@ class GpuRenderer:
                     _wo = getattr(nd, 'rotation', (0.0, 0.0, 0.0, 1.0))
                 result = (_wp, _wo)
                 _wt_cache[nid] = result
+                _frame_wt_cache[nid] = result
                 return result
 
             # ── FIX-DEFORM: Deformation-helper detection ──────────────────
@@ -1473,7 +2256,15 @@ class GpuRenderer:
             _gpu_model_type  = int(_gpu_model_type_raw) if _gpu_model_type_raw is not None else 4
             _gpu_is_module   = (_gpu_model_cls in ('effect', 'tile', 'other') or
                                 _gpu_model_type in (0, 2))
-            _scene_lights = self._scene_light_records(nodes, _get_world_transform)
+            _scene_light_candidates = self._scene_light_candidates_for_model(
+                model,
+                nodes,
+            )
+            _scene_lights = self._scene_light_records(
+                _scene_light_candidates,
+                _get_world_transform,
+                reference_position=target,
+            )
             self._upload_scene_lights(prog, _u, _scene_lights)
 
             def _is_deform_helper(nd) -> bool:
@@ -1485,9 +2276,14 @@ class GpuRenderer:
                 has_uvs    = bool(uvs) and len(uvs) > 0
                 node_name  = str(getattr(nd, 'name', '') or '').lower()
 
-                # Stock lightsaber blade planes frequently omit MDL UV arrays;
-                # the GPU path synthesizes UVs and a procedural glow texture for
-                # them, so they are renderable geometry rather than bone helpers.
+                # NODE_SABER records are animation/runtime helpers that duplicate
+                # the two ordinary crossed glow cards.  Drawing all four stacks
+                # rectangular additive layers and creates blocky glow bands.
+                if _is_saber_runtime_helper(nd):
+                    return True
+
+                # Ordinary stock lightsaber glow cards can omit MDL UV arrays;
+                # the GPU path synthesizes a smooth preview quad and texture.
                 if is_lightsaber_blade_node(nd):
                     return False
 
@@ -1571,6 +2367,11 @@ class GpuRenderer:
                 if _gpu_is_module and _render_mode_int in (1, 2):
                     return 1.0, 0, False, False
 
+                # Untextured selfillum planes render as additive glows, never
+                # opaque/cutout geometry (Star Map lightflare burst/holo bits).
+                if tb == 0 and _is_untextured_glow(nd):
+                    tb = 1
+
                 # Punchthrough classification (alpha-test discard in shader):
                 # Use cutout pass when the MDL node explicitly requests it
                 # via transparency_hint > 0 (head meshes, hair cards, foliage).
@@ -1597,7 +2398,7 @@ class GpuRenderer:
                     if tb == 0:
                         tb = 3
                     is_trans = True
-                if is_lightsaber_blade_node(node) and not self._has_sprite_material_override(node):
+                if is_lightsaber_blade_node(nd) and not self._has_sprite_material_override(nd):
                     tb = 1
                     is_trans = True
                 return na, tb, is_trans, has_env
@@ -1606,11 +2407,19 @@ class GpuRenderer:
             # Node classification (opaque/cutout/transparent) is expensive due to
             # _is_deform_helper() and _classify_node() per node.  Cache the result
             # per model and reuse across frames.  Invalidate when the model changes.
-            # For animated models, re-classify only when anim_pose changes alpha.
-            _node_cache_signature = self._node_classification_signature(nodes)
+            # Classification is invalidated explicitly by material/visibility
+            # edits.  Do not inspect every node merely to prove that no edit
+            # occurred: this function is on every camera and PIE animation frame.
+            _root_node = getattr(model, "root_node", None)
+            _model_classification_revision = (
+                int(getattr(model, "_gr_classification_revision", 0) or 0),
+                int(getattr(_root_node, "_gr_classification_revision", 0) or 0),
+            )
             _need_reclassify = (
                 _cur_model_id != self._node_cache_model_id
-                or _node_cache_signature != getattr(self, "_node_cache_signature", ())
+                or len(nodes) != self._node_cache_node_count
+                or self._node_cache_built_revision != self._node_classification_revision
+                or _model_classification_revision != self._node_cache_model_revision
             )
             if _need_reclassify:
                 opaque_nodes      = []
@@ -1646,12 +2455,144 @@ class GpuRenderer:
                 self._node_cache_transparent = transparent_nodes
                 self._node_cache_proxy_ids = _proxy_node_ids
                 self._node_cache_is_module = _gpu_is_module
-                self._node_cache_signature = _node_cache_signature
+                self._node_cache_node_count = len(nodes)
+                self._node_cache_model_revision = _model_classification_revision
+                self._node_cache_built_revision = self._node_classification_revision
             else:
                 # Reuse cached classification
                 opaque_nodes = self._node_cache_opaque
                 cutout_nodes = self._node_cache_cutout
                 transparent_nodes = self._node_cache_transparent
+
+            # PERF-FRUSTUM-ACTOR: Retained PIE creatures contain many skinned
+            # submeshes whose animated vertex bounds are intentionally not culled
+            # individually.  Reject the complete actor only when an expanded
+            # source-model envelope is wholly outside the camera frustum.  The
+            # expansion keeps idle limb/head motion conservative, and failure to
+            # resolve trustworthy bounds always leaves the actor visible.
+            _actor_frustum_cache: Dict[int, bool] = {}
+
+            def _pie_actor_root_for_node(nd):
+                root_ref = getattr(nd, "_gr_scene_object_root_ref", None)
+                if root_ref is not None and bool(
+                    getattr(root_ref, "_gr_map_studio_pie_actor", False)
+                ):
+                    return root_ref
+                return None
+
+            def _pie_actor_outside_frustum(nd) -> bool:
+                if _frustum_planes is None:
+                    return False
+                actor_root = _pie_actor_root_for_node(nd)
+                if actor_root is None:
+                    return False
+                root_id = id(actor_root)
+                cached = _actor_frustum_cache.get(root_id)
+                if cached is not None:
+                    return cached
+                outside = False
+                try:
+                    source_model = runtime_source_model_for_node(actor_root)
+                    mins = tuple(float(v) for v in getattr(source_model, "bb_min", ())[:3])
+                    maxs = tuple(float(v) for v in getattr(source_model, "bb_max", ())[:3])
+                    spans = tuple(maxs[i] - mins[i] for i in range(3))
+                    if len(mins) == 3 and len(maxs) == 3 and max(spans) > 1.0e-5:
+                        padding = max(1.25, max(spans) * 0.35)
+                        expanded = (
+                            tuple(mins[i] - padding for i in range(3)),
+                            tuple(maxs[i] + padding for i in range(3)),
+                        )
+                        actor_matrix = _scene_gpu_model_matrix(actor_root)
+                        if actor_matrix is not None:
+                            outside = self._transformed_bounds_outside_frustum(
+                                expanded,
+                                actor_matrix,
+                                _frustum_planes,
+                            )
+                except Exception:
+                    outside = False
+                _actor_frustum_cache[root_id] = outside
+                return outside
+
+            _classified_mesh_count = (
+                len(opaque_nodes) + len(cutout_nodes) + len(transparent_nodes)
+            )
+            _culled_actor_meshes = 0
+            if _frustum_planes is not None:
+                def _without_culled_actors(items):
+                    nonlocal _culled_actor_meshes
+                    visible = []
+                    for item in items:
+                        if _pie_actor_outside_frustum(item):
+                            _culled_actor_meshes += 1
+                        else:
+                            visible.append(item)
+                    return visible
+
+                opaque_nodes = _without_culled_actors(opaque_nodes)
+                cutout_nodes = _without_culled_actors(cutout_nodes)
+                transparent_nodes = _without_culled_actors(transparent_nodes)
+
+            # Opaque submission order does not affect compositing.  Group it by
+            # material/sampler state so the exact uniform cache and texture-unit
+            # cache below can suppress redundant Python→OpenGL calls.  Keep
+            # transparent geometry on its required back-to-front path.
+            def _opaque_submission_sort_key(node):
+                return (
+                    str(getattr(node, "texture", "") or "").strip().lower(),
+                    str(getattr(node, "lightmap", "") or "").strip().lower(),
+                    str(getattr(node, "txi_envmaptexture", "") or "").strip().lower(),
+                    str(getattr(node, "txi_specularcolour", "") or "").strip().lower(),
+                    str(
+                        getattr(node, "txi_bumpmaptexture", "")
+                        or getattr(node, "bump_map", "")
+                        or ""
+                    ).strip().lower(),
+                    int(getattr(node, "txi_blending", 0) or 0),
+                    bool(getattr(node, "txi_clamp_s", False)),
+                    bool(getattr(node, "txi_clamp_t", False)),
+                    tuple(float(value) for value in tuple(getattr(node, "diffuse", ()) or ())[:3]),
+                    tuple(float(value) for value in tuple(getattr(node, "selfillum", ()) or ())[:3]),
+                    float(getattr(node, "shininess", 0.0) or 0.0),
+                    id(node),
+                )
+
+            opaque_nodes = sorted(opaque_nodes, key=_opaque_submission_sort_key)
+            cutout_nodes = sorted(cutout_nodes, key=_opaque_submission_sort_key)
+
+            _culled_rigid_meshes = 0
+            _draw_call_count = 0
+            _drawn_node_names: list[str] = []
+            _bound_texture_units: dict[int, int] = {}
+            _texture_sampler_states: dict[int, tuple[object, ...]] = {}
+
+            def _bind_texture_exact(texture, location: int) -> None:
+                """Bind only when a texture unit does not already name this object."""
+
+                texture_id = id(texture)
+                if _bound_texture_units.get(int(location)) == texture_id:
+                    return
+                texture.use(location=int(location))
+                _bound_texture_units[int(location)] = texture_id
+
+            def _set_texture_sampler_exact(
+                texture,
+                *,
+                repeat_x: bool,
+                repeat_y: bool,
+                filter_value=None,
+            ) -> None:
+                """Avoid re-submitting identical sampler state for shared materials."""
+
+                texture_id = id(texture)
+                desired = (bool(repeat_x), bool(repeat_y), filter_value)
+                if _texture_sampler_states.get(texture_id) == desired:
+                    return
+                texture.repeat_x = desired[0]
+                texture.repeat_y = desired[1]
+                if filter_value is not None:
+                    texture.filter = filter_value
+                _texture_sampler_states[texture_id] = desired
 
             def _draw_node(node, tex_name_override: str = '',
                            pass_name: str = 'opaque',
@@ -1665,13 +2606,14 @@ class GpuRenderer:
                 override_tri_count: triangle count for the override VAO.
                 """
                 nonlocal total_tris, _new_mesh_uploads_this_frame
+                nonlocal _culled_rigid_meshes, _draw_call_count
                 # Use world-space transform (full parent-chain walk) for correct
                 # positioning of all mesh nodes, not just local node.position.
                 wp, wo = _get_world_transform(node)
                 scene_gpu_mat = _scene_gpu_model_matrix(node)
                 vbo_wp, vbo_wo = wp, wo
                 _nd_is_skin = bool(getattr(node, 'is_skin', False))
-                _node_anim_pose = animation_pose_for_node(node, anim_pose) if anim_pose is not None else None
+                _node_anim_pose = _resolved_animation_pose(node)
                 _scene_animated_node_draw_mat = None
                 if scene_gpu_mat is not None and anim_pose is None:
                     authored_transform = _scene_authored_world_transform(node)
@@ -1690,9 +2632,18 @@ class GpuRenderer:
                             selfillum = _pn.selfillum
                 if _gpu_is_module and _render_mode_int in (1, 2):
                     node_alpha = 1.0
+                if node_alpha <= (1.0 / 255.0) and not self._wireframe_pass:
+                    # Alpha-keyed-off geometry (Star Map Sphere02 during "on")
+                    # must not rasterize at all: an invisible surface that
+                    # still writes depth z-rejects every particle and additive
+                    # mesh behind it, and the engine treats alpha 0 as hidden.
+                    return
                 _is_blade_node = is_lightsaber_blade_node(node)
                 if _is_blade_node:
-                    selfillum = lightsaber_blade_emissive_rgb(node)
+                    # The procedural texture already contains the emissive core
+                    # and aura.  A uniform self-illumination term colors every
+                    # fragment of the rectangular card under ONE/ONE blending.
+                    selfillum = (0.0, 0.0, 0.0)
 
                 node_id = id(node)
                 # FIX-SKIN-ANIM: Skin nodes are NOT considered "animated" for VBO
@@ -1716,10 +2667,27 @@ class GpuRenderer:
                         (1.0, 1.0, 1.0),
                     )
                 _skin_anim_pose = _node_anim_pose
-                _skin_uploader = _skin_uploader_for_node(node) if _nd_is_skin and _has_skin_nodes else None
+                _skin_anim_base_pose = (
+                    _effective_animation_pose_for_node(node, anim_base_pose)
+                    if anim_base_pose is not None else None
+                )
+                _skin_palette_scope = (
+                    _skin_palette_scope_for_node(node)
+                    if _nd_is_skin and _has_skin_nodes
+                    else None
+                )
+                _skin_palette_scope_key = (
+                    _skin_palette_scope[0]
+                    if _skin_palette_scope is not None
+                    else ("model", _cur_model_id)
+                )
+                _skin_uploader = (
+                    _skin_uploader_for_node(node, _skin_palette_scope)
+                    if _skin_palette_scope is not None
+                    else None
+                )
                 _skin_can_lbs = bool(
                     _nd_is_skin
-                    and not bool(getattr(node, "_gr_bas_attachment_layer", False))
                     and _has_skin_nodes
                     and _skin_uploader is not None
                     and _skin_anim_pose is not None
@@ -1727,18 +2695,41 @@ class GpuRenderer:
                     and getattr(node, 'bone_map', None)
                     and getattr(node, 'skin_data', None)
                 )
+                if (
+                    _nd_is_skin
+                    and bool(getattr(node, "_gr_bound_to_kotor_skeleton", False))
+                    and _node_anim_pose is not None
+                ):
+                    _preview_key = (_cur_model_id, node_id)
+                    if _preview_key not in self._skin_preview_gate_logged:
+                        self._skin_preview_gate_logged.add(_preview_key)
+                        log.info(
+                            "GPU-SKINNING: Character Builder preview node=%s enabled=%s "
+                            "skin_nodes=%s uploader=%s applies=%s bones=%d rows=%d base_pose=%s",
+                            getattr(node, "name", "?"),
+                            bool(_skin_can_lbs),
+                            bool(_has_skin_nodes),
+                            _skin_uploader is not None,
+                            bool(animation_pose_applies_to_node(node, _skin_anim_pose)),
+                            len(getattr(node, "bone_map", []) or []),
+                            len(getattr(node, "skin_data", []) or []),
+                            _skin_anim_base_pose is not None,
+                        )
                 _skin_bind_transform = bool(_nd_is_skin and not _skin_can_lbs)
                 is_animated = False
                 if _node_anim_pose is not None and hasattr(_node_anim_pose, 'nodes') and not _nd_is_skin:
                     # Check if this node or any ancestor has animation data
                     _acheck = node
                     while _acheck is not None:
-                        _acheck_pose = animation_pose_for_node(_acheck, anim_pose)
+                        _acheck_pose = _resolved_animation_pose(_acheck)
                         if _acheck_pose is not None and _pose_node_for_transform(_acheck, _acheck_pose) is not None:
                             is_animated = True
                             break
                         _acheck = getattr(_acheck, 'parent', None)
-                if scene_gpu_mat is not None and is_animated and not _nd_is_skin:
+                _scene_rigid_gpu_pose = bool(
+                    scene_gpu_mat is not None and is_animated and not _nd_is_skin
+                )
+                if _scene_rigid_gpu_pose:
                     vbo_wp = (0.0, 0.0, 0.0)
                     vbo_wo = (0.0, 0.0, 0.0, 1.0)
                     _scene_animated_node_draw_mat = _mat4_from_pos_quat_scale(
@@ -1746,15 +2737,39 @@ class GpuRenderer:
                         wo,
                         (1.0, 1.0, 1.0),
                     )
+                # A retained scene actor's rigid mesh remains in node-local VBO
+                # space.  Its current animated world transform is uploaded via
+                # u_model above, so a new pose does not mutate vertex geometry.
+                # Legacy single-model animation still bakes rigid transforms into
+                # VBO data and therefore keeps its existing rebuild behavior.
+                _dynamic_rigid_vbo = bool(is_animated and not _scene_rigid_gpu_pose)
+                _rigid_vbo_mode_changed = False
+                if not _nd_is_skin and node_id in self._mesh_cache:
+                    _gm_existing = self._mesh_cache[node_id]
+                    _rigid_vbo_mode_changed = (
+                        bool(getattr(_gm_existing, 'scene_rigid_gpu_pose', False))
+                        != _scene_rigid_gpu_pose
+                    )
                 _skin_vbo_mode_changed = False
+                _skin_vbo_signature = (
+                    _skin_vbo_signature_for_node(node)
+                    if _nd_is_skin else None
+                )
                 if _nd_is_skin and node_id in self._mesh_cache:
                     _gm_existing = self._mesh_cache[node_id]
                     _skin_vbo_mode_changed = (
                         getattr(_gm_existing, 'skin_bind_transform', None)
                         != _skin_bind_transform
+                        or getattr(_gm_existing, 'skin_vbo_signature', None)
+                        != _skin_vbo_signature
                     )
-                if is_animated or node_id not in self._mesh_cache or _skin_vbo_mode_changed:
-                    if anim_pose is None and not is_animated:
+                if (
+                    _dynamic_rigid_vbo
+                    or node_id not in self._mesh_cache
+                    or _rigid_vbo_mode_changed
+                    or _skin_vbo_mode_changed
+                ):
+                    if anim_pose is None and not _dynamic_rigid_vbo:
                         upload_budget = int(getattr(self, "max_new_mesh_uploads_per_frame", 0) or 0)
                         if upload_budget > 0 and _new_mesh_uploads_this_frame >= upload_budget:
                             self.deferred_mesh_uploads = True
@@ -1765,7 +2780,7 @@ class GpuRenderer:
                     # vertex influences addresses qBone[k]/tBone[k] for this skin.
                     _bone_remap = None
                     _prebuilt_vbo = None
-                    if anim_pose is None and not is_animated and scene_gpu_mat is None:
+                    if anim_pose is None and not _dynamic_rigid_vbo and scene_gpu_mat is None:
                         _prebuilt_vbo = _prebuilt_static_gpu_mesh_data(
                             node, _cur_model_id, _skin_bind_transform
                         )
@@ -1783,6 +2798,10 @@ class GpuRenderer:
                         self._mesh_cache[node_id].release()
                     gm = _GpuMesh()
                     gm.skin_bind_transform = _skin_bind_transform if _nd_is_skin else None
+                    gm.skin_vbo_signature = _skin_vbo_signature
+                    gm.scene_rigid_gpu_pose = (
+                        _scene_rigid_gpu_pose if not _nd_is_skin else None
+                    )
                     main_vdata, bone_id_vdata = _split_vbo_attributes_for_gpu(vdata)
                     gm.vbo = ctx.buffer(main_vdata.tobytes())
                     gm.bone_id_vbo = ctx.buffer(bone_id_vdata.tobytes())
@@ -1790,6 +2809,11 @@ class GpuRenderer:
                     gm.first8_uv0_uploaded = _first_vbo_uv_pairs(vdata, 6)
                     gm.first8_uv1_uploaded = _first_vbo_uv_pairs(vdata, 8)
                     try:
+                        uploaded_positions = np.asarray(vdata[:, 0:3], dtype=np.float64)
+                        gm.uploaded_bounds = (
+                            tuple(float(v) for v in uploaded_positions.min(axis=0)),
+                            tuple(float(v) for v in uploaded_positions.max(axis=0)),
+                        )
                         gm.uploaded_positions = [
                             [round(float(x), 6) for x in row[:3]]
                             for row in vdata[:, 0:3]
@@ -1808,6 +2832,7 @@ class GpuRenderer:
                             )
                         ]
                     except Exception:
+                        gm.uploaded_bounds = None
                         gm.uploaded_positions = []
                         gm.uploaded_bone_ids = []
                         gm.uploaded_weights = []
@@ -1872,10 +2897,65 @@ class GpuRenderer:
                             log.debug("ASCII multi-texture split failed for %s: %s",
                                       getattr(node, 'name', ''), exc)
 
-                    if not is_animated:
+                    if not _dynamic_rigid_vbo:
                         self._mesh_cache[node_id] = gm
                 else:
                     gm = self._mesh_cache[node_id]
+
+                # Match the exact matrix uploaded for this draw.  Bounds stored
+                # on _GpuMesh are in VBO space, so testing them with this matrix
+                # is equivalent to the WGPU world-space bounds contract.
+                draw_model_mat = model_mat
+                if _scene_animated_node_draw_mat is not None:
+                    draw_model_mat = _scene_animated_node_draw_mat
+                elif _bas_skin_draw_mat is not None:
+                    # ``_bas_skin_draw_mat`` is built from
+                    # ``_get_world_transform(_bas_root_for_draw)``.  For a
+                    # retained PIE actor that transform already walks through
+                    # the runtime wrapper, including its authored placement and
+                    # facing.  Multiplying by ``scene_gpu_mat`` here applied the
+                    # wrapper a second time to BAS skin meshes only: the main
+                    # detachable-head skin moved away while rigid eyes/teeth
+                    # stayed on the animated headhook.
+                    draw_model_mat = _bas_skin_draw_mat
+                elif scene_gpu_mat is not None:
+                    draw_model_mat = scene_gpu_mat
+
+                # Animated skin vertices move in the shader and therefore keep
+                # their fail-open behavior unless their entire expanded PIE
+                # actor envelope was rejected above.  Rigid/static VBO bounds
+                # are exact and can be safely rejected before material, texture,
+                # palette, and uniform work.
+                _rigid_outside_frustum = False
+                _uploaded_bounds = getattr(gm, "uploaded_bounds", None)
+                _actor_root = _pie_actor_root_for_node(node)
+                _allow_rigid_actor_mesh_cull = bool(
+                    _actor_root is not None
+                    and getattr(_actor_root, "_gr_map_studio_pie_rigid_actor", False)
+                )
+                if (
+                    override_vao is None
+                    and _frustum_planes is not None
+                    and (_actor_root is None or _allow_rigid_actor_mesh_cull)
+                    and not (_nd_is_skin and _skin_anim_pose is not None)
+                    and _uploaded_bounds is not None
+                ):
+                    if draw_model_mat is model_mat:
+                        # Most room VBOs are already in world space.  Avoid a
+                        # tiny NumPy matrix operation per room mesh per frame.
+                        _rigid_outside_frustum = not bounds_intersects_frustum(
+                            _uploaded_bounds,
+                            _frustum_planes,
+                        )
+                    else:
+                        _rigid_outside_frustum = self._transformed_bounds_outside_frustum(
+                            _uploaded_bounds,
+                            draw_model_mat,
+                            _frustum_planes,
+                        )
+                if _rigid_outside_frustum:
+                    _culled_rigid_meshes += 1
+                    return
 
                 # Use override VAO/tri_count if provided (per-material-slot draw)
                 _use_vao = override_vao if override_vao is not None else gm.vao
@@ -1928,6 +3008,10 @@ class GpuRenderer:
                 txi_blend = int(getattr(node, 'txi_blending', 0))
                 if _is_blade_node and not self._has_sprite_material_override(node):
                     txi_blend = 1
+                if txi_blend == 0 and _is_untextured_glow(node):
+                    # Keep the draw's blend state in sync with the additive
+                    # classification of untextured selfillum glow planes.
+                    txi_blend = 1
 
                 # FIX-ALPHATEST: Per-node punchthrough alpha-test threshold.
                 # KotOR TPC header bytes [4-7] = float alpha_test_threshold.
@@ -1959,7 +3043,6 @@ class GpuRenderer:
                     # Punchthrough: set alpha threshold uniform and disable GL blending.
                     # Shader discards fragments below the threshold — no GL blend needed.
                     _u['u_alpha_test'].value = max(0.0, min(1.0, txi_alpha_test if txi_alpha_test > 0.0 else 0.5))
-                    ctx.disable(moderngl.BLEND)
 
                 # TXI decal: surface blends over background using its own alpha
                 txi_decal = 1 if bool(getattr(node, 'txi_decal', False)) else 0
@@ -1978,12 +3061,15 @@ class GpuRenderer:
                 blend_enabled = False
                 if txi_blend == 1:
                     # Additive blend: src=ONE, dst=ONE
-                    ctx.enable(moderngl.BLEND)
-                    ctx.blend_equation = moderngl.FUNC_ADD
-                    ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+                    self._blend_submission.apply(
+                        ctx,
+                        enabled=True,
+                        equation=moderngl.FUNC_ADD,
+                        func=(moderngl.ONE, moderngl.ONE),
+                    )
                     blend_enabled = True
                 elif txi_blend == 2:
-                    pass  # Already handled above (alpha_test + disable BLEND)
+                    self._blend_submission.apply(ctx, enabled=False)
                 elif txi_blend == 3:
                     # v7.1 FIX-GLMAX (Finding 5.6 — reone context.cpp cross-ref):
                     # GL_MAX blend equation for lighten mode effects.
@@ -1991,23 +3077,34 @@ class GpuRenderer:
                     # glBlendEquationSeparate(GL_MAX, GL_FUNC_ADD)
                     # KotOR uses this for some particle effects and self-illumination
                     # overlays where the brightest pixel should win.
-                    ctx.enable(moderngl.BLEND)
                     try:
-                        ctx.blend_equation = moderngl.MAX
-                        ctx.blend_func = (moderngl.ONE, moderngl.ONE)
-                    except (AttributeError, Exception):
+                        self._blend_submission.apply(
+                            ctx,
+                            enabled=True,
+                            equation=moderngl.MAX,
+                            func=(moderngl.ONE, moderngl.ONE),
+                        )
+                    except Exception:
                         # Fallback: GL_MAX not available on this driver
-                        ctx.blend_equation = moderngl.FUNC_ADD
-                        ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+                        self._blend_submission.reset()
+                        self._blend_submission.apply(
+                            ctx,
+                            enabled=True,
+                            equation=moderngl.FUNC_ADD,
+                            func=(moderngl.ONE, moderngl.ONE),
+                        )
                     blend_enabled = True
                 elif is_semi_transparent or txi_decal:
                     # Decal / wateralpha / per-node transparency
-                    ctx.enable(moderngl.BLEND)
-                    ctx.blend_equation = moderngl.FUNC_ADD
-                    ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                    self._blend_submission.apply(
+                        ctx,
+                        enabled=True,
+                        equation=moderngl.FUNC_ADD,
+                        func=(moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA),
+                    )
                     blend_enabled = True
                 else:
-                    ctx.disable(moderngl.BLEND)
+                    self._blend_submission.apply(ctx, enabled=False)
 
                 uv_scroll = (0.0, 0.0)
                 if bool(getattr(node, 'animate_uv', False)):
@@ -2041,18 +3138,15 @@ class GpuRenderer:
                 else:
                     _u['u_dangly_enabled'].value = 0.0
 
-                # v7.2 FIX-SABER (Finding 5.11 — reone v_model.glsl cross-ref):
-                # Enable GPU lightsaber blade vertex deformation for SABER node type.
-                # The vertex shader extends blade vertices along the local Z-axis
-                # based on gl_VertexID, creating the blade ignition/retraction effect.
-                # Reference: reone v_model.glsl line 61-65; KotorBlender NUM_SABER_VERTS.
-                _is_saber = bool(getattr(node, 'is_saber', False))
-                if _is_saber:
-                    _u['u_saber_enabled'].value = 1.0
-                    _u['u_saber_displacement'].value = 1.0
-                    _u['u_saber_length'].value = 1.0
-                else:
-                    _u['u_saber_enabled'].value = 0.0
+                # FIX-SABER-PROXY: _build_vbo_data has already normalized every
+                # blade layer to its authored, fully extended local bounds.  The
+                # old scalar gl_VertexID path displaced that world-space proxy on
+                # world Z, shearing stock NODE_SABER triangles into white spokes.
+                # Keep deformation disabled until the complete KOTOR vector
+                # hdist/vdist ignition contract is implemented.
+                _u['u_saber_enabled'].value = 0.0
+                _u['u_saber_displacement'].value = 0.0
+                _u['u_saber_length'].value = 1.0
 
                 # FIX-FLIPBOOK: TXI proceduretype=cycle sprite-sheet animation.
                 # When txi_proceduretype == 'cycle', the texture is a grid of
@@ -2116,10 +3210,12 @@ class GpuRenderer:
                     except Exception as exc:
                         log.debug("lightsaber procedural blade texture failed: %s", exc)
                 gl_diff = self._tex_cache.get(diff_img) if diff_img else None
-                _tex_gpu_v_flip = bool(getattr(diff_img, '_gr_gpu_uv_v_flip', True))
-                _u['u_uv_v_flip'].value = (
-                    1.0 if bool(getattr(node, 'uv_v_flip', True)) and _tex_gpu_v_flip else 0.0
-                )
+                if _is_blade_node and gl_diff is not None:
+                    # Trilinear blade mips collapse the 64x256 aura to blocky
+                    # 1x4 samples at oblique angles.  Sample the authored mask
+                    # directly and let its black edge provide the smooth fade.
+                    _configure_lightsaber_blade_sampler(gl_diff)
+                _u['u_uv_v_flip'].value = _effective_diffuse_uv_v_flip(node, diff_img)
 
                 _texture_allowed = bool(self.show_texture and self.show_diffuse_map)
                 _detail_texture_allowed = bool(self.show_texture and _render_mode_int == 0)
@@ -2132,6 +3228,12 @@ class GpuRenderer:
                     # here for nodes that require clamping (head decals, UI overlays).
                     _node_clamp_s = bool(getattr(node, 'txi_clamp_s', False))
                     _node_clamp_t = bool(getattr(node, 'txi_clamp_t', False))
+                    if _is_blade_node:
+                        # Blade proxies occupy one authored 0..1 tile.  Clamp
+                        # both axes so oblique samples cannot wrap the bright
+                        # core across the transparent base, tip, or card edge.
+                        _node_clamp_s = True
+                        _node_clamp_t = True
                     if not (_node_clamp_s and _node_clamp_t) and _should_auto_clamp_diffuse(
                         node,
                         is_module=_gpu_is_module,
@@ -2142,16 +3244,19 @@ class GpuRenderer:
                         # opposite atlas edge along armor-panel UV borders.
                         _node_clamp_s = True
                         _node_clamp_t = True
-                    gl_diff.repeat_x = not _node_clamp_s
-                    gl_diff.repeat_y = not _node_clamp_t
-                    gl_diff.use(location=0)
+                    _set_texture_sampler_exact(
+                        gl_diff,
+                        repeat_x=not _node_clamp_s,
+                        repeat_y=not _node_clamp_t,
+                    )
+                    _bind_texture_exact(gl_diff, 0)
                     _u['u_tex'].value = 0
                     _u['u_has_tex'].value = 1
                 else:
                     if self._white_tex is None:
                         self._white_tex = ctx.texture((1, 1), 4,
                                                        bytes([255, 255, 255, 255]))
-                    self._white_tex.use(location=0)
+                    _bind_texture_exact(self._white_tex, 0)
                     _u['u_tex'].value = 0
                     _u['u_has_tex'].value = 0
 
@@ -2183,10 +3288,13 @@ class GpuRenderer:
                     # Cross-ref: KotOR.js ShaderOdysseyModel.ts lightMap sampling;
                     # xoreos model_kotor.cpp — lightmap uses CLAMP_TO_EDGE wrap;
                     # KotorBlender — lightmap UV is always in [0,1] range.
-                    gl_lm.repeat_x = False  # GL_CLAMP_TO_EDGE
-                    gl_lm.repeat_y = False  # GL_CLAMP_TO_EDGE
-                    gl_lm.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                    gl_lm.use(location=1)
+                    _set_texture_sampler_exact(
+                        gl_lm,
+                        repeat_x=False,
+                        repeat_y=False,
+                        filter_value=(moderngl.LINEAR, moderngl.LINEAR),
+                    )
+                    _bind_texture_exact(gl_lm, 1)
                     _u['u_lm_tex'].value = 1
                     _u['u_has_lm'].value = 1
                     _u['u_lm_shade'].value = 1 if _gpu_is_module else 0
@@ -2208,17 +3316,40 @@ class GpuRenderer:
                 # alpha applied as transparency), which is wrong — the surface
                 # should remain opaque with a slight metallic tint.
                 env_name = str(getattr(node, 'txi_envmaptexture', '')).strip().lower()
-                if _detail_texture_allowed and bool(self.show_environment_map) and env_name:
-                    env_img  = textures.get(env_name)
-                    gl_env   = self._tex_cache.get(env_img) if env_img else None
-                    if gl_env is None:
-                        # Use grey fallback: neutral env tint keeps surface opaque
-                        if self._grey_env_tex is None:
-                            # 128,128,128,255 → 50% grey → neutral metallic tint
-                            self._grey_env_tex = ctx.texture((1, 1), 4,
-                                                              bytes([128, 128, 128, 255]))
-                        gl_env = self._grey_env_tex
-                    gl_env.use(location=2)
+                # FIX-ENVDEFAULT: A bare TGA/PNG drop names no cube map, so an
+                # opaque metallic skin whose diffuse alpha is a reflectivity mask
+                # would render as its (deliberately dark) diffuse with no sheen —
+                # the "loads too dark" report.  KOTOR drives that sheen from the
+                # alpha mask plus a default cube map (appearance.2da envmap=
+                # DEFAULT); mirror it here with the built-in metallic sphere-map.
+                # Gated to genuinely opaque, non-decal, non-punch-through nodes so
+                # transparency/cutout alphas are never turned into reflections.
+                _env_default = False
+                _raw_env_node_alpha = getattr(node, 'alpha', None)
+                _env_node_alpha = float(1.0 if _raw_env_node_alpha is None else _raw_env_node_alpha)
+                if (not env_name
+                        and _detail_texture_allowed
+                        and bool(self.show_environment_map)
+                        and txi_decal == 0
+                        and txi_blend == 0
+                        and int(getattr(node, 'transparency_hint', 0) or 0) == 0
+                        and _env_node_alpha >= 0.999
+                        and _diffuse_is_reflectivity_mask(diff_img)):
+                    _env_default = True
+                if _detail_texture_allowed and bool(self.show_environment_map) and (env_name or _env_default):
+                    if _env_default:
+                        gl_env = self._default_env_texture(ctx)
+                    else:
+                        env_img  = textures.get(env_name)
+                        gl_env   = self._tex_cache.get(env_img) if env_img else None
+                        if gl_env is None:
+                            # Use grey fallback: neutral env tint keeps surface opaque
+                            if self._grey_env_tex is None:
+                                # 128,128,128,255 → 50% grey → neutral metallic tint
+                                self._grey_env_tex = ctx.texture((1, 1), 4,
+                                                                  bytes([128, 128, 128, 255]))
+                            gl_env = self._grey_env_tex
+                    _bind_texture_exact(gl_env, 2)
                     _u['u_env_tex'].value = 2
                     _u['u_has_env'].value = 1
                 else:
@@ -2237,7 +3368,7 @@ class GpuRenderer:
                     spec_img = textures.get(spec_name)
                     gl_spec  = self._tex_cache.get(spec_img) if spec_img else None
                     if gl_spec is not None:
-                        gl_spec.use(location=3)
+                        _bind_texture_exact(gl_spec, 3)
                         _u['u_spec_tex'].value = 3
                         _u['u_has_spec'].value = 1
                     else:
@@ -2254,7 +3385,7 @@ class GpuRenderer:
                     bump_img = textures.get(bump_name)
                     gl_bump = self._tex_cache.get(bump_img) if bump_img else None
                     if gl_bump is not None:
-                        gl_bump.use(location=4)
+                        _bind_texture_exact(gl_bump, 4)
                         _u['u_bump_tex'].value = 4
                         _u['u_has_bump'].value = 1
                     else:
@@ -2270,17 +3401,18 @@ class GpuRenderer:
                 _feat_mask = 0
                 if gl_diff and diff_img: _feat_mask |= (1 << 0)   # FEAT_TEXTURE
                 if _detail_texture_allowed and bool(self.show_lightmap_map) and gl_lm: _feat_mask |= (1 << 1)   # FEAT_LIGHTMAP
-                if _detail_texture_allowed and bool(self.show_environment_map) and env_name: _feat_mask |= (1 << 2)   # FEAT_ENVMAP
+                if _detail_texture_allowed and bool(self.show_environment_map) and (env_name or _env_default): _feat_mask |= (1 << 2)   # FEAT_ENVMAP
                 if _detail_texture_allowed and bool(self.show_specular_map) and spec_name: _feat_mask |= (1 << 3)   # FEAT_SPECMAP
                 if _detail_texture_allowed and bool(self.show_normal_map) and bump_name: _feat_mask |= (1 << 4)   # FEAT_BUMPMAP
                 if _is_dangly:          _feat_mask |= (1 << 6)   # FEAT_DANGLY
-                if _is_saber:           _feat_mask |= (1 << 7)   # FEAT_SABER
+                if _is_blade_node:        _feat_mask |= (1 << 7)  # FEAT_SABER emission
                 if txi_decal:           _feat_mask |= (1 << 11)  # FEAT_DECAL
                 if txi_blend == 2:      _feat_mask |= (1 << 12)  # FEAT_PUNCHTHRU
                 if txi_blend == 1:      _feat_mask |= (1 << 13)  # FEAT_ADDITIVE
                 # Phase A: Set FEAT_SKIN bit only when this draw is actually
-                # palette-skinned. BAS attachment skins are socket followers,
-                # so their VBO data is already root-local and must pass through.
+                # palette-skinned. BAS attachment palettes are converted to
+                # attachment-root local space before upload, then the socket/root
+                # draw matrix places the skinned result on the body.
                 if _skin_can_lbs:
                     _feat_mask |= (1 << 10)  # FEAT_SKIN
                 _u['u_features'].value = _feat_mask
@@ -2305,13 +3437,42 @@ class GpuRenderer:
                         and 'u_skin_enabled' in _u
                         and 'u_bone_count' in _u):
                     try:
-                        _skin_uploader.compute_skin_node_palette(node, _skin_anim_pose)
-                        _skin_local_bone_count = len(getattr(node, 'bone_map', []) or [])
-                        _skin_local_bone_count = min(_skin_local_bone_count, _SKIN_MAX_BONES)
+                        (
+                            _skin_local_bone_count,
+                            _skin_palette_bytes,
+                            _skin_palette_cached,
+                        ) = self._skin_palette_bytes_for_draw(
+                            scope_key=_skin_palette_scope_key,
+                            skin_node=node,
+                            uploader=_skin_uploader,
+                            anim_pose=_skin_anim_pose,
+                            anim_base_pose=_skin_anim_base_pose,
+                            skin_signature=_skin_vbo_signature,
+                        )
                         if 'u_bones' in _u and _skin_local_bone_count > 0:
-                            _u['u_bones'].write(_skin_uploader.as_flat_bytes())
+                            _u['u_bones'].write(_skin_palette_bytes)
                         _u['u_skin_enabled'].value = 1 if _skin_local_bone_count > 0 else 0
                         _u['u_bone_count'].value = _skin_local_bone_count
+                        if (
+                            bool(getattr(node, "_gr_bound_to_kotor_skeleton", False))
+                            and _skin_local_bone_count > 0
+                        ):
+                            _palette_key = (_cur_model_id, node_id)
+                            if _palette_key not in self._skin_preview_palette_logged:
+                                self._skin_preview_palette_logged.add(_palette_key)
+                                log.info(
+                                    "GPU-SKINNING: Character Builder palette node=%s "
+                                    "u_skin=%s u_bones=%d formula=%s inv_bind=%s "
+                                    "anim_nodes=%d base_nodes=%d skin=%s",
+                                    getattr(node, "name", "?"),
+                                    1 if _skin_local_bone_count > 0 else 0,
+                                    _skin_local_bone_count,
+                                    str(getattr(_skin_uploader, "_skin_palette_formula", "") or ""),
+                                    str(getattr(_skin_uploader, "_skin_inverse_bind_source", "") or ""),
+                                    len(getattr(_skin_anim_pose, "nodes", {}) or {}),
+                                    len(getattr(_skin_anim_base_pose, "nodes", {}) or {}) if _skin_anim_base_pose is not None else 0,
+                                    _skin_influence_summary_for_log(node),
+                                )
                     except Exception as e:
                         log.debug(f"GPU-SKINNING: per-skin qBone/tBone palette upload failed: {e}")
                         _u['u_skin_enabled'].value = 0
@@ -2383,15 +3544,6 @@ class GpuRenderer:
                             'Skin parity dump',
                         )
 
-                draw_model_mat = model_mat
-                if _scene_animated_node_draw_mat is not None:
-                    draw_model_mat = _scene_animated_node_draw_mat
-                elif _bas_skin_draw_mat is not None:
-                    draw_model_mat = _bas_skin_draw_mat
-                    if scene_gpu_mat is not None:
-                        draw_model_mat = _mat4_mul(scene_gpu_mat, draw_model_mat)
-                elif scene_gpu_mat is not None:
-                    draw_model_mat = scene_gpu_mat
                 if (
                     scene_gpu_mat is not None
                     or _bas_skin_draw_mat is not None
@@ -2408,9 +3560,13 @@ class GpuRenderer:
                     ctx.disable(moderngl.CULL_FACE)
                     _blade_cull_disabled = True
                 _use_vao.render(moderngl.TRIANGLES)
+                _drawn_node_names.append(
+                    f"{str(pass_name or 'opaque')}:{str(getattr(node, 'name', '') or '<unnamed>')}"
+                )
                 if _blade_cull_disabled:
                     ctx.enable(moderngl.CULL_FACE)
                 total_tris += _use_tris
+                _draw_call_count += 1
 
             # Helper: draw a node with correct KotOR texture routing.
             def _draw_node_multitex(node, pass_name: str = 'opaque'):
@@ -2443,8 +3599,8 @@ class GpuRenderer:
             # ── Pass 1: Opaque geometry (depth write ON, no blending) ─────────────
             # Solid, fully-opaque surfaces with no alpha-test.
             # Cross-ref: Hayes (2025) §6.3; reone: GL_DEPTH_TEST + depth write ON.
-            ctx.depth_mask = True
-            ctx.disable(moderngl.BLEND)
+            _set_depth_write(ctx, True)
+            self._begin_draw_pass(ctx, blend_enabled=False)
             for node in opaque_nodes:
                 _draw_node_multitex(node, pass_name='opaque')
 
@@ -2455,6 +3611,7 @@ class GpuRenderer:
             # the alpha threshold (u_alpha_test, default 0.5).
             # Cross-ref: Hayes (2025) §8.2 alpha testing; Gregory (2024) §10.6.
             # ctx.depth_mask stays True; no blending needed for cutout.
+            self._begin_draw_pass(ctx, blend_enabled=False)
             for node in cutout_nodes:
                 _draw_node_multitex(node, pass_name='cutout')
 
@@ -2464,6 +3621,7 @@ class GpuRenderer:
             # transparent surfaces (glass visors, alpha-blended hair) produce incorrect
             # compositing because the painter's algorithm requires back-to-front order.
             if transparent_nodes:
+                self._begin_draw_pass(ctx, blend_enabled=None)
                 eye_arr = np.array(eye, dtype=np.float64)
 
                 def _node_sort_depth(nd):
@@ -2499,18 +3657,37 @@ class GpuRenderer:
                 # Sort farthest-first (painter's algorithm: draw back before front)
                 transparent_nodes_sorted = sorted(transparent_nodes,
                                                   key=_node_sort_depth, reverse=True)
-                ctx.depth_mask = False
+                _set_depth_write(ctx, False)
                 for node in transparent_nodes_sorted:
                     _draw_node_multitex(node, pass_name='transparent')
                 # Restore depth writes after transparent pass
-                ctx.depth_mask = True
-                ctx.disable(moderngl.BLEND)
+                _set_depth_write(ctx, True)
+                self._blend_submission.apply(ctx, enabled=False)
+
+            # ── Pass 4: Emitter particles (depth test ON, depth write OFF) ────
+            # KOTOR emitter nodes carry no geometry; their particles are
+            # simulated on the CPU (src.core.particles) and drawn as billboard
+            # batches after all scene geometry so blending composites over the
+            # already-resolved surfaces.
+            _particle_count = 0
+            _particle_draw_calls = 0
+            if self.show_particles and not self._wireframe_pass:
+                try:
+                    _particle_count, _particle_draw_calls = self._update_and_draw_particles(
+                        ctx, model, textures, mvp, eye, target, up,
+                        _get_world_transform, anim_pose, anim_time, anim_name,
+                    )
+                except Exception as _particle_exc:
+                    log.debug("Particle pass failed: %s", _particle_exc, exc_info=True)
+            self.perf['particles'] = _particle_count
+            self.perf['particle_draw_calls'] = _particle_draw_calls
+
             if self.show_solid and self.show_wireframe:
                 try:
                     self._wireframe_pass = True
                     ctx.wireframe = True
-                    ctx.depth_mask = False
-                    ctx.disable(moderngl.BLEND)
+                    _set_depth_write(ctx, False)
+                    self._begin_draw_pass(ctx, blend_enabled=False)
                     for node in opaque_nodes:
                         _draw_node_multitex(node, pass_name='opaque')
                     for node in cutout_nodes:
@@ -2519,7 +3696,7 @@ class GpuRenderer:
                         _draw_node_multitex(node, pass_name='transparent')
                 finally:
                     self._wireframe_pass = False
-                    ctx.depth_mask = True
+                    _set_depth_write(ctx, True)
             try:
                 ctx.wireframe = False
             except Exception:
@@ -2529,6 +3706,16 @@ class GpuRenderer:
 
             self.perf['draw_ms'] = (time.perf_counter() - t_draw) * 1000
             self.perf['tri_count'] = total_tris
+            self.perf['draw_calls'] = _draw_call_count
+            self.perf['drawn_node_names'] = tuple(_drawn_node_names)
+            self.perf['culled_actor_meshes'] = _culled_actor_meshes
+            self.perf['culled_meshes'] = _culled_actor_meshes + _culled_rigid_meshes
+            self.perf['visible_meshes'] = max(
+                0,
+                _classified_mesh_count - _culled_actor_meshes - _culled_rigid_meshes,
+            )
+            for _submission_key, _submission_value in self._submission_stats.items():
+                self.perf[_submission_key] = int(_submission_value)
 
             # ── MSAA Resolve (if multisampled FBO) ───────────────────────
             # FIX-MSAA: Blit the 4x MSAA renderbuffer to the single-sample
@@ -2545,6 +3732,37 @@ class GpuRenderer:
                     read_fbo = fbo
             else:
                 read_fbo = fbo
+
+            # ── Bloom post-process (retail-style glow) ────────────────────
+            # Runs on the resolved/simple framebuffer, whose color attachment
+            # is a sampleable texture.  MSAA-fallback frames (renderbuffer
+            # only) skip bloom rather than fail.
+            if self.bloom_enabled and _render_mode_int == 0:
+                bloom_tex = None
+                if read_fbo is self._fbo_resolve:
+                    bloom_tex = self._fbo_resolve_tex
+                elif read_fbo is self._fbo_simple:
+                    bloom_tex = self._fbo_simple_tex
+                if bloom_tex is not None:
+                    t_bloom = time.perf_counter()
+                    try:
+                        if self._bloom_pass is None:
+                            from src.adapters.rendering.moderngl_bloom import ModernGLBloomPass
+
+                            self._bloom_pass = ModernGLBloomPass()
+                        self._bloom_pass.apply(
+                            ctx,
+                            self._blend_submission,
+                            read_fbo,
+                            bloom_tex,
+                            W,
+                            H,
+                            threshold=float(self.bloom_threshold),
+                            strength=float(self.bloom_strength),
+                        )
+                    except Exception as _bloom_exc:
+                        log.debug("Bloom pass failed: %s", _bloom_exc, exc_info=True)
+                    self.perf['bloom_ms'] = (time.perf_counter() - t_bloom) * 1000
 
             # ── Read back framebuffer to PIL Image ────────────────────
             # PERF-FIX: Use dtype='f1' (RGBA8 UNorm) for fbo.read().
@@ -2609,6 +3827,13 @@ class GpuRenderer:
 
     # ── Invalidate node cache ─────────────────────────────────────────────────
 
+    def update_texture_regions(self, texture_name: str, image, regions, *, finalize: bool = True) -> bool:
+        """Patch one resident GL texture without touching scene resources."""
+        cache = self._tex_cache
+        if cache is None:
+            return False
+        return bool(cache.update_regions(image, regions, build_mipmaps=bool(finalize)))
+
     def invalidate_node(self, node) -> None:
         """Remove cached GPU buffers and world-transform for a node (call after mesh edits)."""
         nid = id(node)
@@ -2618,6 +3843,100 @@ class GpuRenderer:
         # Also evict from persistent world-transform cache so next render recomputes
         if nid in self._wt_cache:
             del self._wt_cache[nid]
+        stale_palette_keys = [
+            key for key in self._skin_palette_bytes_cache
+            if len(key) > 1 and key[1] == nid
+        ]
+        for key in stale_palette_keys:
+            del self._skin_palette_bytes_cache[key]
+        if bool(getattr(node, "is_emitter", False)):
+            self.invalidate_particles(node)
+
+    def invalidate_particles(self, node=None) -> None:
+        """Restart particle simulations after emitter parameter edits."""
+        systems = self._particle_systems
+        if systems is None:
+            return
+        if node is None:
+            systems.invalidate_all()
+        else:
+            systems.invalidate_node(node)
+
+    def _update_and_draw_particles(self, ctx, model, textures, mvp, eye, target, up,
+                                   get_world_transform, anim_pose, anim_time: float,
+                                   anim_name: str = '') -> tuple:
+        """Advance emitter simulations with wall-clock time and draw batches."""
+        self.particles_active = False
+        if model is None:
+            return (0, 0)
+
+        model_id = id(model)
+        systems = self._particle_systems
+        if systems is None or self._particle_model_id != model_id:
+            from src.core.particles.simulation import ModelParticleSystems
+
+            systems = ModelParticleSystems(model)
+            self._particle_systems = systems
+            self._particle_model_id = model_id
+            self._particle_last_wall = 0.0
+            self._particle_anim_cache = ("", None)
+        if not systems.has_emitters:
+            return (0, 0)
+
+        now = time.perf_counter()
+        last = self._particle_last_wall or now
+        dt = min(0.1, max(0.0, now - last))
+        self._particle_last_wall = now
+
+        # Resolve the active animation block so emitter channels keyed by the
+        # animation (birthrate/alpha gates like the Star Map "on") override the
+        # bind pose while it plays.  The AnimationEngine attaches the resolved
+        # block to each evaluated pose; viewport/scene models often carry an
+        # empty ``animations`` list (the Animation Browser resolves clips via
+        # source/supermodel chains), so the name lookup is only a fallback.
+        animation = getattr(anim_pose, "_gr_animation", None) if anim_pose is not None else None
+        wanted = str(anim_name or "").strip().lower()
+        if animation is None and wanted and anim_pose is not None:
+            cached_name, cached_anim = self._particle_anim_cache
+            if cached_name == wanted and cached_anim is not None:
+                animation = cached_anim
+            else:
+                for anim in getattr(model, "animations", None) or []:
+                    if str(getattr(anim, "name", "") or "").strip().lower() == wanted:
+                        animation = anim
+                        break
+                self._particle_anim_cache = (wanted, animation)
+
+        def _emitter_transform(nd):
+            return _strict_emitter_world_transform(nd, anim_pose)
+
+        systems.update(dt, _emitter_transform, animation, float(anim_time))
+        batches = systems.batches(_emitter_transform, tuple(eye))
+        # Only visible batches keep the viewport's continuous particle frames
+        # alive; a model whose emitters are all faded out costs nothing.
+        self.particles_active = bool(batches)
+        if not batches:
+            return (0, 0)
+
+        if self._particle_pass is None:
+            from src.adapters.rendering.moderngl_particles import ModernGLParticlePass
+
+            self._particle_pass = ModernGLParticlePass()
+        if self._white_tex is None:
+            self._white_tex = ctx.texture((1, 1), 4, bytes([255, 255, 255, 255]))
+        return self._particle_pass.draw(
+            ctx,
+            self._blend_submission,
+            self._tex_cache,
+            self._white_tex,
+            textures,
+            batches,
+            _mat4_tobytes(mvp),
+            tuple(eye),
+            tuple(target),
+            tuple(up),
+            restore_cull=bool(self.cull_faces and not self.show_wireframe),
+        )
 
     def invalidate_all(self) -> None:
         """Remove all cached GPU buffers and world-transform cache."""
@@ -2627,15 +3946,47 @@ class GpuRenderer:
         # Clear persistent world-transform cache; will be rebuilt next render
         self._wt_cache.clear()
         self._wt_model_id = 0
+        self._skin_uploaders_by_scope.clear()
+        self._skin_palette_bytes_cache.clear()
         self.invalidate_node_cache()
 
     def invalidate_node_cache(self) -> None:
         """Force node visibility/pass classification to rebuild next frame."""
+        self._node_classification_revision += 1
         self._node_cache_model_id = 0
         self._node_cache_opaque = []
         self._node_cache_cutout = []
         self._node_cache_transparent = []
         self._node_cache_signature = ()
+        self._scene_light_candidate_key = ()
+        self._scene_light_candidate_nodes = ()
+
+    def invalidate_transform_cache(self, reason: str = "transforms changed", node=None) -> None:
+        """Evict world transforms without discarding retained draw classification.
+
+        Runtime actors update their wrapper transform and pose every PIE frame,
+        but neither operation changes mesh membership, visibility, or material
+        pass.  Reclassifying the complete module here turns each actor tick into
+        an O(scene) pre-draw walk.  A supplied scene-object root therefore evicts
+        only its hierarchy; callers without a root retain the conservative full
+        transform-cache invalidation.
+        """
+
+        if node is None:
+            self._wt_cache.clear()
+            return
+        stack = [node]
+        visited: set[int] = set()
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            current_id = id(current)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+            self._wt_cache.pop(current_id, None)
+            stack.extend(getattr(current, "children", []) or [])
 
     @staticmethod
     def _sprite_text(node) -> str:

@@ -11,6 +11,7 @@ from pathlib import Path
 from src.adapters.rendering.moderngl_legacy_bridge import GpuRenderer, moderngl_runtime_available
 from src.core.rendering.renderer_backend import RendererBackend
 from src.core.rendering.renderer_capabilities import MODERNGL_DISPLAY_MODES, RendererCapabilities
+from src.core.rendering.renderer_settings import RendererSettings
 
 
 _NATIVE_MODERNGL_ENV = "GHOSTRIGGER_RENDERER_MODERNGL"
@@ -29,6 +30,17 @@ class ModernGLRenderer(GpuRenderer):
 
     name = "ModernGL"
     backend_id = RendererBackend.MODERNGL_GL330.value
+
+    def __init__(self, settings: RendererSettings | None = None) -> None:
+        super().__init__()
+        self.set_settings(settings or RendererSettings())
+
+    def set_settings(self, settings: RendererSettings) -> None:
+        """Apply quality controls while preserving retail-parity defaults."""
+
+        self.bloom_enabled = bool(settings.bloom_enabled)
+        self.bloom_threshold = max(0.0, min(2.0, float(settings.bloom_threshold)))
+        self.bloom_strength = max(0.0, min(1.0, float(settings.bloom_strength)))
 
     def is_available(self) -> bool:
         try:
@@ -57,6 +69,7 @@ class ModernGLRenderer(GpuRenderer):
             supports_gizmo_interaction=True,
             supports_marquee_selection=True,
             supports_subobject_selection=True,
+            supports_texture_streaming=True,
             supported_display_modes=MODERNGL_DISPLAY_MODES,
             supported_display_options=(
                 "show_grid",
@@ -97,7 +110,10 @@ class ModernGLRenderer(GpuRenderer):
         gpu = info.get("GL_RENDERER") if ctx is not None else None
         vendor = info.get("GL_VENDOR") if ctx is not None else None
         mesh_cache_size = len(getattr(self, "_mesh_cache", {}) or {})
-        texture_cache_size = len(getattr(getattr(self, "_tex_cache", None), "_cache", {}) or {})
+        texture_cache = getattr(self, "_tex_cache", None)
+        texture_cache_size = len(getattr(texture_cache, "_cache", {}) or {})
+        texture_region_updates = int(getattr(texture_cache, "region_update_count", 0) or 0)
+        texture_region_bytes = int(getattr(texture_cache, "region_update_bytes", 0) or 0)
         viewport_display = getattr(getattr(self, "display_options", None), "diagnostics", lambda: {})()
         try:
             frame_time_ms = float(perf.get("last_frame_ms") or 0.0)
@@ -181,6 +197,9 @@ class ModernGLRenderer(GpuRenderer):
                 diagnostics["name"] = self.name
                 diagnostics["backend_id"] = self.backend_id
                 diagnostics["viewport_display"] = viewport_display
+                diagnostics["texture_region_updates"] = texture_region_updates
+                diagnostics["texture_region_bytes"] = texture_region_bytes
+                diagnostics["supports_texture_streaming"] = True
                 return diagnostics
             except Exception:
                 pass
@@ -193,6 +212,7 @@ class ModernGLRenderer(GpuRenderer):
             "backend": "ModernGL",
             "viewport_display": viewport_display,
             "mature_material_path": True,
+            "supports_texture_streaming": True,
             "version_code": version_code,
             "gpu": gpu,
             "vendor": vendor,
@@ -205,4 +225,6 @@ class ModernGLRenderer(GpuRenderer):
             "triangle_count": triangle_count,
             "mesh_cache_size": mesh_cache_size,
             "texture_cache_size": texture_cache_size,
+            "texture_region_updates": texture_region_updates,
+            "texture_region_bytes": texture_region_bytes,
         }

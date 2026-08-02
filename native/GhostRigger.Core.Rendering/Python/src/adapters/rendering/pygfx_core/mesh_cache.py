@@ -69,6 +69,97 @@ class PygfxMeshCache:
         self.texture_maps.clear()
         self.begin_frame()
 
+    def update_texture_regions(self, texture_name: str, image, regions) -> bool:
+        """Patch resident pygfx texture pixels without rebuilding scene DTOs."""
+        clean = str(texture_name or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+        clean = clean.rsplit(".", 1)[0].lower()
+        if not clean or image is None:
+            return False
+        requested = tuple(regions or ())
+        matched = False
+        incoming_by_alpha_source: dict[int, Any] = {}
+        for key, texture_map in tuple(self.texture_maps.items()):
+            texture_id = str(key[0] if isinstance(key, tuple) and key else key).lower()
+            if texture_id != clean and not texture_id.startswith(clean + ":"):
+                continue
+            sprite_alpha_source = int(key[4] or 0) if isinstance(key, tuple) and len(key) > 4 else 0
+            incoming = incoming_by_alpha_source.get(sprite_alpha_source)
+            if incoming is None:
+                incoming = self._texture_pixels(image, sprite_alpha_source=sprite_alpha_source)
+                if incoming is None:
+                    continue
+                incoming_by_alpha_source[sprite_alpha_source] = incoming
+            texture = getattr(texture_map, "texture", None)
+            target = getattr(texture, "data", None)
+            if texture is None or target is None:
+                continue
+            try:
+                target_array = np.asarray(target)
+            except Exception:
+                continue
+            if target_array.shape != incoming.shape or not bool(target_array.flags.writeable):
+                continue
+            update_range = getattr(texture, "update_range", None)
+            update_full = getattr(texture, "update_full", None)
+            if not callable(update_range) and not callable(update_full):
+                continue
+            matched = True
+            for region in requested:
+                try:
+                    x, y, width, height = (int(value) for value in region)
+                except (TypeError, ValueError):
+                    continue
+                x0 = max(0, x)
+                y0 = max(0, y)
+                x1 = min(int(incoming.shape[1]), x + width)
+                y1 = min(int(incoming.shape[0]), y + height)
+                if width <= 0 or height <= 0 or x1 <= x0 or y1 <= y0:
+                    continue
+                np.copyto(
+                    target_array[y0:y1, x0:x1, :4],
+                    incoming[y0:y1, x0:x1, :4],
+                )
+                if callable(update_range):
+                    update_range((x0, y0, 0), (x1 - x0, y1 - y0, 1))
+                else:
+                    update_full()
+        return matched
+
+    def invalidate_texture(self, texture_name: str, image=None) -> bool:
+        """Evict one retained texture map and dirty only its mesh materials."""
+        clean = str(texture_name or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+        clean = clean.rsplit(".", 1)[0].lower()
+        if not clean:
+            return False
+        image_suffix = f":{id(image)}" if image is not None else ""
+
+        matching_keys = []
+        for key in tuple(self.texture_maps):
+            texture_id = str(key[0] if isinstance(key, tuple) and key else key).lower()
+            matches_name = texture_id == clean or texture_id.startswith(clean + ":")
+            matches_image = not image_suffix or texture_id == clean + image_suffix
+            if matches_name and matches_image:
+                matching_keys.append(key)
+        if not matching_keys and image_suffix:
+            matching_keys = [
+                key
+                for key in tuple(self.texture_maps)
+                if str(key[0] if isinstance(key, tuple) and key else key).lower() == clean
+                or str(key[0] if isinstance(key, tuple) and key else key).lower().startswith(clean + ":")
+            ]
+        removed_map_ids = {
+            id(self.texture_maps.pop(key))
+            for key in matching_keys
+            if key in self.texture_maps
+        }
+        if not removed_map_ids:
+            return False
+        for record in self.records.values():
+            if id(record.diffuse_map) in removed_map_ids or id(record.lightmap_map) in removed_map_ids:
+                record.material_dirty = True
+                record.view_style_key = ()
+        return True
+
     @staticmethod
     def _view_style_key(
         *,
@@ -378,7 +469,7 @@ class PygfxMeshCache:
         except Exception:
             return None
 
-    def update_skin_palette(self, record: PygfxMeshRecord, anim_pose, model=None) -> None:
+    def update_skin_palette(self, record: PygfxMeshRecord, anim_pose, model=None, anim_base_pose=None) -> None:
         is_bas_attachment = bool(getattr(getattr(record, "source", None), "_gr_bas_attachment_layer", False))
         if record is None or record.skeleton is None or (anim_pose is None and not is_bas_attachment):
             return
@@ -390,18 +481,25 @@ class PygfxMeshCache:
             )
             from src.core.rendering.mesh_render_data import (
                 animation_pose_applies_to_node,
+                animation_pose_for_node,
                 bas_attachment_palette_model_for_node,
+                runtime_source_model_for_node,
             )
 
-            source_model = model
+            source_model = runtime_source_model_for_node(record.source) or model
             if bool(getattr(record.source, "_gr_bas_attachment_layer", False)):
-                source_model = bas_attachment_palette_model_for_node(record.source) or model
+                source_model = bas_attachment_palette_model_for_node(record.source) or source_model
             if anim_pose is not None and not animation_pose_applies_to_node(record.source, anim_pose):
                 if not bool(getattr(record.source, "_gr_bas_attachment_layer", False)):
                     return
                 anim_pose = None
+            node_anim_base_pose = animation_pose_for_node(record.source, anim_base_pose) if anim_base_pose is not None else None
             uploader = _cached_matrix_palette_uploader(source_model, MAX_BONES, MatrixPaletteUploader)
-            uploader.compute_skin_node_palette(record.source, anim_pose)
+            uploader.compute_skin_node_palette(
+                record.source,
+                anim_pose,
+                anim_base_pose=node_anim_base_pose,
+            )
             palette = uploader.as_numpy_array()
             palette = bas_attachment_root_local_skin_palette(record.source, palette, anim_pose)
             buffer = getattr(record.skeleton, "bone_matrices_buffer", None)
@@ -582,20 +680,9 @@ class PygfxMeshCache:
         if cached is not None:
             return cached
         try:
-            image = source.convert("RGBA") if hasattr(source, "convert") else source
-            pixels = np.asarray(image, dtype=np.uint8)
-            if pixels.ndim != 3 or pixels.shape[2] < 4:
+            pixels = self._texture_pixels(source, sprite_alpha_source=sprite_alpha_source)
+            if pixels is None:
                 return None
-            pixels = np.ascontiguousarray(pixels[:, :, :4])
-            if sprite_alpha_source:
-                rgb = pixels[:, :, :3].astype(np.float32) / 255.0
-                peak = np.max(rgb, axis=2)
-                keyed = np.clip((peak - 0.08) / (0.40 - 0.08), 0.0, 1.0)
-                keyed = keyed * keyed * (3.0 - 2.0 * keyed)
-                existing_alpha = pixels[:, :, 3].astype(np.float32) / 255.0
-                alpha = np.where(existing_alpha < 0.999, np.minimum(existing_alpha, keyed), keyed)
-                pixels = pixels.copy()
-                pixels[:, :, 3] = np.clip(alpha * 255.0, 0.0, 255.0).astype(np.uint8)
             texture = gfx.Texture(
                 pixels,
                 dim=2,
@@ -613,6 +700,28 @@ class PygfxMeshCache:
             return texture_map
         except Exception:
             return None
+
+    @staticmethod
+    def _texture_pixels(source, *, sprite_alpha_source: int = 0):
+        try:
+            image = source.convert("RGBA") if hasattr(source, "convert") else source
+            # Own writable storage so Texture.update_range can stream paint
+            # into the retained pygfx resource in place.
+            pixels = np.array(image, dtype=np.uint8, copy=True, order="C")
+        except Exception:
+            return None
+        if pixels.ndim != 3 or pixels.shape[2] < 4:
+            return None
+        pixels = np.ascontiguousarray(pixels[:, :, :4])
+        if sprite_alpha_source:
+            rgb = pixels[:, :, :3].astype(np.float32) / 255.0
+            peak = np.max(rgb, axis=2)
+            keyed = np.clip((peak - 0.08) / (0.40 - 0.08), 0.0, 1.0)
+            keyed = keyed * keyed * (3.0 - 2.0 * keyed)
+            existing_alpha = pixels[:, :, 3].astype(np.float32) / 255.0
+            alpha = np.where(existing_alpha < 0.999, np.minimum(existing_alpha, keyed), keyed)
+            pixels[:, :, 3] = np.clip(alpha * 255.0, 0.0, 255.0).astype(np.uint8)
+        return pixels
 
     @staticmethod
     def _selection_color(base: tuple[float, float, float, float]) -> tuple[float, float, float, float]:

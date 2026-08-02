@@ -12,11 +12,11 @@ except ImportError as exc:  # pragma: no cover - import gate for Qt runtime
     raise RuntimeError("PySide6 is required for the Qt shell") from exc
 
 from src.gui.libtheme import ThemeManager
-from src.gui.libtheme.style_tokens import FALLBACK_STYLES, LEGACY_MATRIX_COLORS
+from src.gui.libtheme.style_tokens import FALLBACK_STYLES
+from src.gui.libtheme.theme_model import Theme
 from src.gui.qt_lib.windows.progress_toast import QtProgressPanel
 from src.gui.windows.application_core.application_core_lib.functions.qt_helpers import _primary_screen_available_geometry
 from src.gui.windows.application_core.application_core_lib.functions.splash_theme import (
-    C,
     _SPLASH_SURFACE_STYLES,
     _darken_hex,
     _lighten_hex,
@@ -27,6 +27,22 @@ from src.gui.windows.application_core.application_core_lib.functions.splash_them
 
 _GUI_DIR = Path(__file__).resolve().parents[3]
 
+# Default theme used to resolve colours *before* the real theme is
+# loaded.  It carries no colours of its own, so ``Theme.color()`` falls
+# back to the semantic ``FALLBACK_COLORS`` defaults -- the same values
+# ``LEGACY_MATRIX_COLORS`` was derived from.  This lets the splash
+# speak the token vocabulary (``accent.primary`` etc.) instead of
+# reading legacy keys directly.  (Issue #11 theme-token migration.)
+_SPLASH_FALLBACK_THEME = Theme(
+    id="matrix", name="Matrix", version="1", colors={}, source_path=""
+)
+
+# Dedicated splash palette.  The startup splash renders *before* the
+# ThemeManager has loaded/validated the active theme, so it cannot rely
+# on a resolved theme object the way other widgets can.  These values
+# are therefore kept as a self-contained brand palette; when a theme
+# *is* available they are layered on top of it via ``_ThemeColorOverride``
+# (see ``apply_ghost_theme``), so themes can still override them.
 BRANDED_SPLASH_COLORS = {
     "splash.background": "#030706",
     "splash.panel": "#07110D",
@@ -75,8 +91,8 @@ class _ThemeColorOverride:
 class QtStartupSplash(QtWidgets.QWidget):
     """Theme-aware startup splash with embedded progress panel."""
 
-    COPYRIGHT_TEXT = "GhostRigger (C) 2026 Shaolin (CrispyWonton). Co-developed by LordVaderCW."
-    PRODUCT_TEXT = "GhostRigger"
+    COPYRIGHT_TEXT = "GhostStudio (C) 2026 Shaolin (CrispyWonton). Co-developed by LordVaderCW."
+    PRODUCT_TEXT = "GhostStudio"
     SUBTITLE_TEXT = "Odyssey Engine Pipeline"
     STAGE_ROWS = (
         ("native", "Native runtime audit", ("native", "bootstrap", "runtime", "pre-python", "pre-launch worker", "startup threading")),
@@ -92,7 +108,11 @@ class QtStartupSplash(QtWidgets.QWidget):
         self._last_logged_status = ""
         self._stage_index = 0
         self._stage_labels: list[tuple[QtWidgets.QLabel, QtWidgets.QLabel]] = []
-        self._stage_colors = {"active": C["accent"], "done": C["accent"], "pending": C["text2"]}
+        self._stage_colors = {
+            "active": _SPLASH_FALLBACK_THEME.color("accent.primary"),
+            "done": _SPLASH_FALLBACK_THEME.color("accent.primary"),
+            "pending": _SPLASH_FALLBACK_THEME.color("text.secondary"),
+        }
         self.setObjectName("StartupSplash")
         self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self._build()
@@ -120,7 +140,7 @@ class QtStartupSplash(QtWidgets.QWidget):
         logo = self._load_logo_pixmap("")
         if not logo.isNull():
             self.logo_label.setPixmap(logo.scaled(220, 220, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-        self.product_label = QtWidgets.QLabel("GhostRigger")
+        self.product_label = QtWidgets.QLabel("GhostStudio")
         self.product_label.setObjectName("StartupSplashProduct")
         self.product_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.product_label.setWordWrap(True)
@@ -143,7 +163,7 @@ class QtStartupSplash(QtWidgets.QWidget):
         accent_line.setObjectName("StartupSplashAccentLine")
         accent_line.setFixedHeight(2)
         content_layout.addWidget(accent_line)
-        self.header_label = QtWidgets.QLabel("Preparing GhostRigger")
+        self.header_label = QtWidgets.QLabel("Preparing GhostStudio")
         self.header_label.setObjectName("StartupSplashHeader")
         self.header_label.setWordWrap(True)
         self.stage_list = QtWidgets.QWidget()
@@ -227,14 +247,15 @@ class QtStartupSplash(QtWidgets.QWidget):
         if theme is not None and use_branded_palette:
             style_theme = _ThemeColorOverride(style_theme, BRANDED_SPLASH_COLORS)
         if theme is None:
-            window = C["bg"]
-            panel = C["panel"]
-            panel_alt = C["panel2"]
-            border = C["accent"]
-            text = C["text"]
-            subtext = C["text2"]
-            accent = C["accent"]
-            log_bg = C["bg"]
+            t = _SPLASH_FALLBACK_THEME
+            window = t.color("window.background")
+            panel = t.color("panel.background")
+            panel_alt = t.color("panel.backgroundAlt", t.color("panel.altBackground"))
+            border = t.color("accent.primary")
+            text = t.color("text.primary")
+            subtext = t.color("text.secondary")
+            accent = t.color("accent.primary")
+            log_bg = t.color("input.background", panel)
             surface_style = "matte"
         else:
             window = style_theme.color("splash.background", style_theme.color("window.background"))

@@ -36,7 +36,14 @@ from .character_export_preflight import (
     preflight_character_mdl_export,
 )
 from .kotor_constants import CHARACTER_EXPORT_EVIDENCE
-from .native_skeleton import NativeSkeletonSnapshot, native_skeleton_fingerprint
+from .native_skeleton import (
+    CHARACTER_BUILDER_ROOT_IDENTITY_KEY,
+    CHARACTER_BUILDER_ROOT_IDENTITY_STATUS,
+    NativeSkeletonSnapshot,
+    character_builder_root_identity_alias,
+    native_skeleton_fingerprint,
+    normalize_model_path_to_native_snapshot,
+)
 from .character_validation_report import (
     CharacterBuilderValidationReport,
     validation_report_paths,
@@ -187,6 +194,22 @@ def export_character_mdl_mdx_transaction(
             )
             return report
 
+        root_alias = character_builder_root_identity_alias(
+            native_snapshot,
+            request.model,
+        ) if native_snapshot is not None else None
+        if root_alias is not None:
+            source_root, target_root = root_alias
+            loaded_metadata = getattr(loaded, "metadata", None)
+            if not isinstance(loaded_metadata, dict):
+                loaded_metadata = {}
+                setattr(loaded, "metadata", loaded_metadata)
+            loaded_metadata[CHARACTER_BUILDER_ROOT_IDENTITY_KEY] = {
+                "status": CHARACTER_BUILDER_ROOT_IDENTITY_STATUS,
+                "source_root": source_root,
+                "target_root": target_root,
+            }
+
         reload_preflight = preflight_character_mdl_export(
             loaded,
             native_snapshot=native_snapshot,
@@ -297,9 +320,23 @@ def _verify_reloaded_native_dag_contract(
         )
 
     current_nodes = _model_nodes(model)
-    current_paths = {_node_path(node): node for node in current_nodes}
+    current_paths = {
+        normalize_model_path_to_native_snapshot(
+            native_snapshot,
+            model,
+            _node_path(node),
+        ): node
+        for node in current_nodes
+    }
     current_paths_lower = {
-        tuple(part.lower() for part in _node_path(node)): node
+        tuple(
+            part.lower()
+            for part in normalize_model_path_to_native_snapshot(
+                native_snapshot,
+                model,
+                _node_path(node),
+            )
+        ): node
         for node in current_nodes
     }
     current_names: dict[str, Any] = {}
@@ -449,6 +486,9 @@ def _verify_reloaded_payload_contract(
             ("faces", "character.export.reload_payload_face_count_changed", "face count"),
             ("bone_map_count", "character.export.reload_payload_bone_map_count_changed", "bone-map count"),
             ("skin_rows", "character.export.reload_payload_skin_rows_changed", "skin row count"),
+            ("uv_count", "character.export.reload_payload_uv_count_changed", "UV count"),
+            ("uv_digest", "character.export.reload_payload_uv_rows_changed", "UV rows"),
+            ("texture_digest", "character.export.reload_payload_textures_changed", "texture references"),
         ):
             if expected.get(key) == actual.get(key):
                 continue
@@ -476,7 +516,7 @@ def _verify_reloaded_payload_contract(
             code="character.export.reload_payload_verified",
             message=(
                 "Reloaded MDL/MDX preserved imported Character Builder payload "
-                "mesh geometry and skin binding counts."
+                "mesh geometry, UV rows, textures, and skin binding counts."
             ),
             details=_json_safe({
                 "payload_names": payload_names,
@@ -600,15 +640,80 @@ def _payload_summaries_by_name(
 
 
 def _payload_summary(node: Any) -> dict[str, Any]:
+    # T2518: count only real bone-map entries.  The MDL loader materializes the
+    # engine's fixed 16-slot bonemap with blank trailing padding, so comparing
+    # raw lengths between a builder-shaped live node (exact count) and its
+    # reloaded twin (padded to 16) would flag every <16-bone skin node as
+    # "bone-map count changed" during writer/readback verification.
+    bone_map = list(getattr(node, "bone_map", []) or [])
+    while bone_map and not str(bone_map[-1] or "").strip():
+        bone_map.pop()
+    uvs = _payload_uvs_for_reload_contract(node)
+    textures = _payload_texture_refs(node)
     return {
         "name": str(getattr(node, "name", "") or ""),
         "is_mesh": bool(getattr(node, "is_mesh", False)),
         "is_skin": bool(getattr(node, "is_skin", False)),
         "vertices": len(list(getattr(node, "vertices", []) or [])),
         "faces": len(list(getattr(node, "faces", []) or [])),
-        "bone_map_count": len(list(getattr(node, "bone_map", []) or [])),
+        "bone_map_count": len(bone_map),
         "skin_rows": len(list(getattr(node, "skin_data", []) or [])),
+        "uv_count": len(uvs),
+        "uv_digest": _digest_float_pairs(uvs),
+        "texture_refs": textures,
+        "texture_digest": _digest_strings(textures),
     }
+
+
+def _payload_uvs_for_reload_contract(node: Any) -> list[tuple[float, float]]:
+    """Return expected reloaded UV rows in KOTOR MDX orientation."""
+
+    result: list[tuple[float, float]] = []
+    flip_v = getattr(node, "uv_v_flip", True) is False
+    for raw in list(getattr(node, "uvs", []) or []):
+        try:
+            u = float(raw[0])
+            v = float(raw[1])
+        except Exception:
+            continue
+        if flip_v:
+            v = 1.0 - v
+        result.append((u, v))
+    return result
+
+
+def _payload_texture_refs(node: Any) -> list[str]:
+    refs: list[str] = []
+    for attr in (
+        "texture",
+        "lightmap",
+        "bump_map",
+        "txi_envmaptexture",
+        "txi_bumpmaptexture",
+    ):
+        text = str(getattr(node, attr, "") or "").strip()
+        if text and text.upper() not in {"NULL", "NONE"}:
+            refs.append(text.lower())
+    for value in list(getattr(node, "texture_names", []) or []):
+        text = str(value or "").strip()
+        if text and text.upper() not in {"NULL", "NONE"}:
+            refs.append(text.lower())
+    return sorted(set(refs))
+
+
+def _digest_float_pairs(values: list[tuple[float, float]]) -> str:
+    digest = hashlib.sha256()
+    for u, v in values:
+        digest.update(f"{u:.7f},{v:.7f};".encode("ascii"))
+    return digest.hexdigest()
+
+
+def _digest_strings(values: list[str]) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(str(value).encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _write_validation_artifacts(

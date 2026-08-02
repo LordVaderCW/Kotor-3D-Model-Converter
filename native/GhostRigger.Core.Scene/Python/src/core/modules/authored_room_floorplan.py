@@ -42,7 +42,10 @@ class FloorPlanRoomPrimitive:
     wall_height: float = 3.0
     floor_surface_id: int | str = 4
     material: PrimitiveMaterial = field(default_factory=PrimitiveMaterial)
+    wall_material: PrimitiveMaterial | None = None
+    ceiling_material: PrimitiveMaterial | None = None
     include_walls: bool = True
+    include_ceiling: bool = False
     openings: tuple[FloorPlanWallOpening, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -176,11 +179,116 @@ def _fan_faces(point_count: int) -> tuple[Face, ...]:
     return tuple((0, index, index + 1) for index in range(1, point_count - 1))
 
 
-def _mesh_uvs(points: tuple[Vec2, ...]) -> tuple[Vec2, ...]:
+def _orientation(a: Vec2, b: Vec2, c: Vec2) -> float:
+    return ((b[0] - a[0]) * (c[1] - a[1])) - ((b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _point_on_segment(point: Vec2, start: Vec2, end: Vec2) -> bool:
+    if abs(_orientation(start, end, point)) > 1.0e-8:
+        return False
+    return (
+        min(start[0], end[0]) - 1.0e-8 <= point[0] <= max(start[0], end[0]) + 1.0e-8
+        and min(start[1], end[1]) - 1.0e-8 <= point[1] <= max(start[1], end[1]) + 1.0e-8
+    )
+
+
+def _segments_intersect(first_a: Vec2, first_b: Vec2, second_a: Vec2, second_b: Vec2) -> bool:
+    o1 = _orientation(first_a, first_b, second_a)
+    o2 = _orientation(first_a, first_b, second_b)
+    o3 = _orientation(second_a, second_b, first_a)
+    o4 = _orientation(second_a, second_b, first_b)
+    if ((o1 > 1.0e-8 and o2 < -1.0e-8) or (o1 < -1.0e-8 and o2 > 1.0e-8)) and (
+        (o3 > 1.0e-8 and o4 < -1.0e-8) or (o3 < -1.0e-8 and o4 > 1.0e-8)
+    ):
+        return True
+    return any(
+        (
+            abs(value) <= 1.0e-8
+            and _point_on_segment(point, start, end)
+        )
+        for value, point, start, end in (
+            (o1, second_a, first_a, first_b),
+            (o2, second_b, first_a, first_b),
+            (o3, first_a, second_a, second_b),
+            (o4, first_b, second_a, second_b),
+        )
+    )
+
+
+def _has_self_intersections(points: tuple[Vec2, ...]) -> bool:
+    count = len(points)
+    for first_index in range(count):
+        first_next = (first_index + 1) % count
+        for second_index in range(first_index + 1, count):
+            second_next = (second_index + 1) % count
+            if first_index in {second_index, second_next} or first_next in {second_index, second_next}:
+                continue
+            if _segments_intersect(
+                points[first_index],
+                points[first_next],
+                points[second_index],
+                points[second_next],
+            ):
+                return True
+    return False
+
+
+def _point_in_triangle(point: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool:
+    first = _orientation(a, b, point)
+    second = _orientation(b, c, point)
+    third = _orientation(c, a, point)
+    return first >= -1.0e-8 and second >= -1.0e-8 and third >= -1.0e-8
+
+
+def triangulate_floor_plan_points(points: tuple[Vec2, ...]) -> tuple[Face, ...]:
+    """Ear-clip one simple footprint into engine-safe floor triangles."""
+
+    source = _ccw_points(_normalise_points(points))
+    if len(source) < 3:
+        return ()
+    remaining = list(range(len(source)))
+    faces: list[Face] = []
+    guard = len(source) * len(source)
+    while len(remaining) > 3 and guard > 0:
+        guard -= 1
+        clipped = False
+        for offset, current in enumerate(tuple(remaining)):
+            previous = remaining[(offset - 1) % len(remaining)]
+            following = remaining[(offset + 1) % len(remaining)]
+            a, b, c = source[previous], source[current], source[following]
+            if _orientation(a, b, c) <= 1.0e-8:
+                continue
+            if any(
+                _point_in_triangle(source[candidate], a, b, c)
+                for candidate in remaining
+                if candidate not in {previous, current, following}
+            ):
+                continue
+            faces.append((previous, current, following))
+            remaining.pop(offset)
+            clipped = True
+            break
+        if not clipped:
+            raise ValueError("Floor-plan footprint could not be triangulated; remove crossing or overlapping wall segments.")
+    if len(remaining) == 3:
+        faces.append((remaining[0], remaining[1], remaining[2]))
+    return tuple(faces)
+
+
+def _mesh_uvs(
+    points: tuple[Vec2, ...],
+    *,
+    repeat_metres: float | None = None,
+) -> tuple[Vec2, ...]:
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
     min_x = min(xs)
     min_y = min(ys)
+    if repeat_metres is not None:
+        repeat = float(repeat_metres)
+        if not math.isfinite(repeat) or repeat <= 1.0e-7:
+            raise ValueError("Floor-plan UV repeat distance must be a positive finite value.")
+        return tuple(((x - min_x) / repeat, (y - min_y) / repeat) for x, y in points)
     width = max(max(xs) - min_x, 1.0e-7)
     depth = max(max(ys) - min_y, 1.0e-7)
     return tuple(((x - min_x) / width, (y - min_y) / depth) for x, y in points)
@@ -240,6 +348,131 @@ def _quad_mesh(
     )
 
 
+_VANILLA_ARCHITECTURE_UV_METRES: dict[str, float] = {
+    # Median world-metres per UV repeat measured from the serialized K1
+    # Korriban tomb corpus.  Keeping these values here prevents authored walls
+    # from stretching one 256/512 px stock texture over an entire room.
+    "lko_flr01": 3.0,
+    "lko_flr03": 3.0,
+    "lko_rocks": 7.071,
+    "lko_tirm01": 4.591,
+    "lko_wal07": 3.0,
+    "lko_wal08": 3.0,
+    "lko_wal09": 2.709,
+    # K2's Secret Tomb reuses the same Odyssey modelling grid under renamed
+    # textures; the K1 measurements are therefore the correct repeat scale.
+    "kor_flr01": 3.0,
+    "kor_flr03": 3.0,
+    "kor_rocks": 7.071,
+    "kor_tr01": 4.591,
+    "kor_wal06": 3.0,
+    "kor_wal07a": 3.0,
+    "kor_wal08": 3.0,
+    "kor_wal09": 2.709,
+    # Citadel Station's wall/floor families are authored on the same roughly
+    # three-metre Odyssey module cadence. Generated rooms project them in world
+    # space so enlarging a concourse adds repeats instead of stretching one
+    # texture across the complete wall.
+    "tel_fl01": 3.0,
+    "tel_fl05": 3.0,
+    "tel_fl06": 3.0,
+    "tel_hcl1": 3.0,
+    "tel_hw10": 3.0,
+    "tel_lt02": 3.0,
+    "tel_tr04": 3.0,
+    "tel_wl03": 3.0,
+    "tel_wl06": 3.0,
+    "tel_wl07": 3.0,
+    # Ghost Studio's Rhen Var materials are authored for world-space tiling.
+    # Explicit repeat sizes keep large landing pads and eight-metre wall
+    # modules crisp instead of stretching one texture over a complete room.
+    "gr_rvsnow": 4.0,
+    "gr_rvstone": 2.0,
+    "gr_rvfloor": 4.0,
+}
+
+
+def _planar_uvs(
+    vertices: tuple[Vec3, ...],
+    *,
+    repeat_metres: float | None = None,
+) -> tuple[Vec2, ...]:
+    """Project one planar helper mesh onto its two widest local axes.
+
+    ``repeat_metres`` preserves retail texel density by allowing UVs beyond
+    0..1.  The Odyssey material sampler repeats those coordinates, exactly as
+    it does for the stock Korriban room meshes.
+    """
+
+    spans = []
+    for axis in range(3):
+        values = [float(vertex[axis]) for vertex in vertices]
+        spans.append((max(values) - min(values), axis))
+    axes = [axis for _span, axis in sorted(spans, reverse=True)[:2]]
+    first = [float(vertex[axes[0]]) for vertex in vertices]
+    second = [float(vertex[axes[1]]) for vertex in vertices]
+    min_first, min_second = min(first), min(second)
+    first_span = max(max(first) - min_first, 1.0e-7)
+    second_span = max(max(second) - min_second, 1.0e-7)
+    scale = float(repeat_metres or 0.0)
+    tiled = math.isfinite(scale) and scale > 1.0e-7
+    return tuple(
+        (
+            (value_first - min_first) / scale if tiled else (value_first - min_first) / first_span,
+            (value_second - min_second) / scale if tiled else (value_second - min_second) / second_span,
+        )
+        for value_first, value_second in zip(first, second)
+    )
+
+
+def _planar_surface_mesh(
+    *,
+    name: str,
+    vertices: tuple[Vec3, ...],
+    faces: tuple[Face, ...],
+    material: PrimitiveMaterial,
+    metadata: dict[str, Any],
+) -> PrimitiveMesh:
+    """Build one flat-shaded roof panel with a geometry-derived normal."""
+
+    if not faces or len(vertices) < 3:
+        raise ValueError("A roof surface requires at least one triangle.")
+    first_face = faces[0]
+    a, b, c = (vertices[index] for index in first_face)
+    ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+    normal = (
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    )
+    length = math.sqrt(sum(component * component for component in normal))
+    if length <= 1.0e-9:
+        raise ValueError(f"{name} cannot contain a degenerate triangle.")
+    unit = tuple(component / length for component in normal)
+    texture = str(material.texture or "").strip().lower()
+    repeat_metres = (
+        _VANILLA_ARCHITECTURE_UV_METRES.get(texture, 3.0)
+        if bool(metadata.get("vanilla_derived"))
+        else None
+    )
+    return PrimitiveMesh(
+        name=name,
+        vertices=vertices,
+        faces=faces,
+        normals=(unit,) * len(vertices),
+        uvs=_planar_uvs(vertices, repeat_metres=repeat_metres),
+        texture=material.texture,
+        diffuse=material.diffuse,
+        ambient=material.ambient,
+        metadata=metadata,
+    )
+
+
+def _roof_type(primitive: FloorPlanRoomPrimitive) -> str:
+    return str(primitive.metadata.get("building_roof_type", "none") or "none").strip().lower()
+
+
 def _opening_span(opening: FloorPlanWallOpening, edge_length: float) -> tuple[float, float]:
     half_fraction = (float(opening.width) * 0.5) / max(edge_length, 1.0e-7)
     center = float(opening.center_fraction)
@@ -261,20 +494,39 @@ def validate_floor_plan_room_primitive(primitive: FloorPlanRoomPrimitive) -> Flo
     area = abs(polygon_signed_area(points))
     if area <= 1.0e-7:
         blocking.append("Floor-plan room footprint must have non-zero area.")
-    if points and not _is_convex(points):
-        blocking.append("Floor-plan room currently supports convex footprints only; split concave rooms into multiple primitives.")
+    if len(points) >= 4 and _has_self_intersections(points):
+        blocking.append("Floor-plan walls cannot cross or overlap; move the crossing corner before closing the room.")
+    elif len(points) >= 3:
+        try:
+            triangulate_floor_plan_points(points)
+        except ValueError as exc:
+            blocking.append(str(exc))
     if float(primitive.wall_height) <= 0.0:
         blocking.append("Floor-plan room wall height must be positive.")
-    openings_by_edge: set[int] = set()
+    roof_type = _roof_type(primitive)
+    if roof_type not in {"none", "flat", "hip", "gable"}:
+        blocking.append(f"Unsupported building roof preset: {roof_type}.")
+    if roof_type == "gable" and _rect_bounds(points) is None:
+        blocking.append("Gable roofs currently require a rectangular room footprint.")
+    if roof_type != "none":
+        try:
+            roof_pitch = float(primitive.metadata.get("building_roof_pitch_degrees", 30.0) or 30.0)
+            roof_overhang = float(primitive.metadata.get("building_roof_overhang", 0.25) or 0.0)
+        except (TypeError, ValueError):
+            blocking.append("Roof pitch and overhang must be numeric.")
+        else:
+            if not math.isfinite(roof_pitch) or roof_pitch < 5.0 or roof_pitch > 70.0:
+                blocking.append("Roof pitch must be between 5 and 70 degrees.")
+            if not math.isfinite(roof_overhang) or roof_overhang < 0.0 or roof_overhang > 5.0:
+                blocking.append("Roof overhang must be between 0 and 5 metres.")
+    openings_by_edge: dict[int, list[FloorPlanWallOpening]] = {}
     for opening in primitive.openings:
         opening_name = str(opening.name or "").strip() or f"edge {opening.edge_index}"
         edge_index = int(opening.edge_index)
         if edge_index < 0 or edge_index >= max(len(points), 1):
             blocking.append(f"Opening {opening_name} references missing wall edge {edge_index}.")
             continue
-        if edge_index in openings_by_edge:
-            blocking.append(f"Only one floor-plan opening per wall edge is supported for now: edge {edge_index}.")
-        openings_by_edge.add(edge_index)
+        openings_by_edge.setdefault(edge_index, []).append(opening)
         if float(opening.width) <= 0.0:
             blocking.append(f"Opening {opening_name} width must be positive.")
         if float(opening.height) <= 0.0:
@@ -288,6 +540,24 @@ def validate_floor_plan_room_primitive(primitive: FloorPlanRoomPrimitive) -> Flo
             start_fraction, end_fraction = _opening_span(opening, edge_len)
             if start_fraction <= 0.0 or end_fraction >= 1.0:
                 blocking.append(f"Opening {opening_name} does not fit within wall edge {edge_index}.")
+    for edge_index, edge_openings in openings_by_edge.items():
+        if edge_index < 0 or edge_index >= len(points):
+            continue
+        edge_len = _edge_length(points[edge_index], points[(edge_index + 1) % len(points)])
+        for opening_index, first in enumerate(edge_openings):
+            first_start, first_end = _opening_span(first, edge_len)
+            first_bottom = float(first.bottom)
+            first_top = first_bottom + float(first.height)
+            for second in edge_openings[opening_index + 1 :]:
+                second_start, second_end = _opening_span(second, edge_len)
+                second_bottom = float(second.bottom)
+                second_top = second_bottom + float(second.height)
+                horizontal_overlap = min(first_end, second_end) - max(first_start, second_start)
+                vertical_overlap = min(first_top, second_top) - max(first_bottom, second_bottom)
+                if horizontal_overlap > 1.0e-7 and vertical_overlap > 1.0e-7:
+                    blocking.append(
+                        f"Openings {str(first.name or 'opening')} and {str(second.name or 'opening')} overlap on wall edge {edge_index}."
+                    )
     try:
         require_walkable_walkmesh_surface(primitive.floor_surface_id, context=f"{primitive.room_resref} floor plan")
     except ValueError as exc:
@@ -333,6 +603,15 @@ def inset_floor_plan_points(points: tuple[Vec2, ...], distance: float) -> tuple[
         prev_point, prev_dir = lines[index - 1]
         intersection = _line_intersection(prev_point, prev_dir, line_point, line_dir)
         if intersection is None:
+            original_previous = ccw[index - 1]
+            original_current = ccw[index]
+            original_next = ccw[(index + 1) % len(ccw)]
+            if abs(_orientation(original_previous, original_current, original_next)) <= 1.0e-8:
+                # Wall graph planarization inserts vertices at portal boundaries.
+                # Adjacent segments on the same wall should inset as one straight
+                # edge while preserving the inserted vertex for WOK portal cuts.
+                inset.append(line_point)
+                continue
             raise ValueError("Floor-plan inset cannot resolve parallel adjacent edges.")
         inset.append(intersection)
     if abs(polygon_signed_area(tuple(inset))) <= 1.0e-7:
@@ -359,7 +638,10 @@ def apply_floor_plan_inset(primitive: FloorPlanRoomPrimitive, operation: FloorPl
         wall_height=primitive.wall_height,
         floor_surface_id=primitive.floor_surface_id,
         material=primitive.material,
+        wall_material=primitive.wall_material,
+        ceiling_material=primitive.ceiling_material,
         include_walls=primitive.include_walls,
+        include_ceiling=primitive.include_ceiling,
         openings=(),
         metadata=metadata,
     )
@@ -423,7 +705,10 @@ def apply_floor_plan_bevel(primitive: FloorPlanRoomPrimitive, operation: FloorPl
         wall_height=primitive.wall_height,
         floor_surface_id=primitive.floor_surface_id,
         material=primitive.material,
+        wall_material=primitive.wall_material,
+        ceiling_material=primitive.ceiling_material,
         include_walls=primitive.include_walls,
+        include_ceiling=primitive.include_ceiling,
         openings=(),
         metadata=metadata,
     )
@@ -492,7 +777,10 @@ def apply_floor_plan_edge_extrude(
         wall_height=primitive.wall_height,
         floor_surface_id=primitive.floor_surface_id,
         material=primitive.material,
+        wall_material=primitive.wall_material,
+        ceiling_material=primitive.ceiling_material,
         include_walls=primitive.include_walls,
+        include_ceiling=primitive.include_ceiling,
         openings=(),
         metadata=metadata,
     )
@@ -532,8 +820,12 @@ def _require_union_compatible_primitives(first: FloorPlanRoomPrimitive, second: 
         raise ValueError("Floor-plan rectangular union requires matching walkmesh surface types.")
     if first.material != second.material:
         raise ValueError("Floor-plan rectangular union requires matching room materials.")
+    if first.wall_material != second.wall_material or first.ceiling_material != second.ceiling_material:
+        raise ValueError("Floor-plan rectangular union requires matching wall and ceiling materials.")
     if bool(first.include_walls) != bool(second.include_walls):
         raise ValueError("Floor-plan rectangular union requires matching wall generation settings.")
+    if bool(first.include_ceiling) != bool(second.include_ceiling):
+        raise ValueError("Floor-plan rectangular union requires matching ceiling generation settings.")
 
 
 def apply_floor_plan_rectangular_union(
@@ -577,7 +869,10 @@ def apply_floor_plan_rectangular_union(
         wall_height=first.wall_height,
         floor_surface_id=first.floor_surface_id,
         material=first.material,
+        wall_material=first.wall_material,
+        ceiling_material=first.ceiling_material,
         include_walls=first.include_walls,
+        include_ceiling=first.include_ceiling,
         openings=(),
         metadata=metadata,
     )
@@ -652,7 +947,10 @@ def apply_floor_plan_rectangular_cut(
                 wall_height=primitive.wall_height,
                 floor_surface_id=primitive.floor_surface_id,
                 material=primitive.material,
+                wall_material=primitive.wall_material,
+                ceiling_material=primitive.ceiling_material,
                 include_walls=primitive.include_walls,
+                include_ceiling=primitive.include_ceiling,
                 openings=(),
                 metadata=metadata,
             )
@@ -721,7 +1019,10 @@ def apply_floor_plan_axis_split(
                 wall_height=primitive.wall_height,
                 floor_surface_id=primitive.floor_surface_id,
                 material=primitive.material,
+                wall_material=primitive.wall_material,
+                ceiling_material=primitive.ceiling_material,
                 include_walls=primitive.include_walls,
+                include_ceiling=primitive.include_ceiling,
                 openings=(),
                 metadata=metadata,
             )
@@ -730,7 +1031,7 @@ def apply_floor_plan_axis_split(
 
 
 def build_floor_plan_floor_mesh(primitive: FloorPlanRoomPrimitive) -> PrimitiveMesh:
-    """Build a triangulated floor mesh from a convex floor-plan footprint."""
+    """Build a triangulated floor mesh from a simple floor-plan footprint."""
 
     validation = validate_floor_plan_room_primitive(primitive)
     if not validation.ok:
@@ -740,12 +1041,14 @@ def build_floor_plan_floor_mesh(primitive: FloorPlanRoomPrimitive) -> PrimitiveM
     vertices: tuple[Vec3, ...] = tuple((x, y, z) for x, y in points)
     surface_id = resolve_walkmesh_surface_id(primitive.floor_surface_id)
     room_resref = _normalise_resref(primitive.room_resref)
+    floor_texture = str(primitive.material.texture or "").strip().lower()
+    floor_repeat_metres = _VANILLA_ARCHITECTURE_UV_METRES.get(floor_texture, 3.0)
     return PrimitiveMesh(
         name=f"{room_resref}_floor",
         vertices=vertices,
-        faces=_fan_faces(len(points)),
+        faces=triangulate_floor_plan_points(points),
         normals=((0.0, 0.0, 1.0),) * len(vertices),
-        uvs=_mesh_uvs(points),
+        uvs=_mesh_uvs(points, repeat_metres=floor_repeat_metres),
         texture=primitive.material.texture,
         diffuse=primitive.material.diffuse,
         ambient=primitive.material.ambient,
@@ -756,6 +1059,9 @@ def build_floor_plan_floor_mesh(primitive: FloorPlanRoomPrimitive) -> PrimitiveM
             "surface_name": walkmesh_surface_name(surface_id),
             "polygon_area": validation.area,
             "point_count": len(points),
+            "uv_projection": "world_xy_tiled",
+            "uv_repeat_metres": floor_repeat_metres,
+            "texture_stretching_prevented": True,
             **dict(primitive.material.metadata),
         },
     )
@@ -768,15 +1074,171 @@ def build_floor_plan_wok(primitive: FloorPlanRoomPrimitive) -> WOKData:
     if not validation.ok:
         raise ValueError("; ".join(validation.blocking_issues))
     points = _ccw_points(_normalise_points(primitive.points))
-    vertices: list[Vec3] = [(x, y, float(primitive.z)) for x, y in points]
+    floor_z = float(primitive.z)
+    openings_by_edge: dict[int, list[FloorPlanWallOpening]] = {}
+    for opening in tuple(primitive.openings or ()):
+        metadata = dict(opening.metadata or {})
+        kind = str(metadata.get("opening_kind") or metadata.get("kind") or "door").strip().lower()
+        if float(opening.bottom) > 1.0e-5 or kind in {"window", "backdrop", "view"}:
+            continue
+        if not (
+            metadata.get("connected_room_resref")
+            or metadata.get("connection_room")
+            or metadata.get("walkmesh_portal")
+        ):
+            continue
+        openings_by_edge.setdefault(int(opening.edge_index), []).append(opening)
+
+    # A vanilla room doorway transition edge often sits a few centimetres
+    # inside the adjoining generated room rather than on the visible wall
+    # plane.  Carve that narrow threshold notch directly into the generated
+    # floor WOK so the two reciprocal perimeter edges occupy the same module-
+    # space segment.  The render floor remains uncut and the stock threshold
+    # geometry covers the overlap, matching the retail construction pattern.
+    outline: list[Vec2] = []
+    zero_depth_portals: list[tuple[Vec2, Vec2]] = []
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        if not outline or math.dist(outline[-1], start) > 1.0e-8:
+            outline.append(start)
+        dx = float(end[0]) - float(start[0])
+        dy = float(end[1]) - float(start[1])
+        edge_length = math.hypot(dx, dy)
+        if edge_length <= 1.0e-8:
+            continue
+        inward = (-dy / edge_length, dx / edge_length)
+        rows = sorted(
+            openings_by_edge.get(edge_index, ()),
+            key=lambda item: float(item.center_fraction),
+        )
+        for opening in rows:
+            metadata = dict(opening.metadata or {})
+            portal_width = min(
+                max(0.02, float(metadata.get("walkmesh_portal_width_m", opening.width) or opening.width)),
+                max(0.02, edge_length - 0.02),
+            )
+            center = max(0.0, min(edge_length, float(opening.center_fraction) * edge_length))
+            half = portal_width * 0.5
+            start_distance = max(0.01, min(edge_length - 0.01, center - half))
+            end_distance = max(start_distance + 0.01, min(edge_length - 0.01, center + half))
+            wall_start = (
+                float(start[0]) + (dx / edge_length) * start_distance,
+                float(start[1]) + (dy / edge_length) * start_distance,
+            )
+            wall_end = (
+                float(start[0]) + (dx / edge_length) * end_distance,
+                float(start[1]) + (dy / edge_length) * end_distance,
+            )
+            inset = max(0.0, float(metadata.get("walkmesh_portal_inset_m", 0.0) or 0.0))
+            if inset <= 1.0e-7:
+                zero_depth_portals.append((wall_start, wall_end))
+                continue
+            if math.dist(outline[-1], wall_start) > 1.0e-8:
+                outline.append(wall_start)
+            outline.extend(
+                (
+                    (wall_start[0] + inward[0] * inset, wall_start[1] + inward[1] * inset),
+                    (wall_end[0] + inward[0] * inset, wall_end[1] + inward[1] * inset),
+                    wall_end,
+                )
+            )
+
+    vertices: list[Vec3] = [(x, y, floor_z) for x, y in outline]
     surface_id = resolve_walkmesh_surface_id(primitive.floor_surface_id)
-    faces: list[WOKFace] = []
-    triangle_count = len(points) - 2
-    for index in range(triangle_count):
-        prev_adj = index - 1 if index > 0 else -1
-        next_adj = index + 1 if index < triangle_count - 1 else -1
-        faces.append(WOKFace(0, index + 1, index + 2, surface=surface_id, adj1=prev_adj, adj2=-1, adj3=next_adj))
-    return WOKData(verts=vertices, faces=faces)
+    triangles = list(triangulate_floor_plan_points(tuple(outline)))
+
+    def split_boundary_at(portal_start: Vec2, portal_end: Vec2) -> None:
+        """Insert one exact portal segment into the current boundary fan."""
+
+        edge_counts: dict[tuple[int, int], int] = {}
+        owners: dict[tuple[int, int], tuple[int, int]] = {}
+        for face_index, face in enumerate(triangles):
+            for local_edge, pair in enumerate(((face[0], face[1]), (face[1], face[2]), (face[2], face[0]))):
+                key = tuple(sorted(pair))
+                edge_counts[key] = edge_counts.get(key, 0) + 1
+                owners[key] = (face_index, local_edge)
+        candidate: tuple[int, int] | None = None
+        for key, count in edge_counts.items():
+            if count != 1:
+                continue
+            face_index, local_edge = owners[key]
+            face = triangles[face_index]
+            first = face[local_edge]
+            second = face[(local_edge + 1) % 3]
+            a = (vertices[first][0], vertices[first][1])
+            b = (vertices[second][0], vertices[second][1])
+            if _point_on_segment(portal_start, a, b) and _point_on_segment(portal_end, a, b):
+                candidate = (face_index, local_edge)
+                break
+        if candidate is None:
+            raise ValueError("Connected doorway could not be inserted into the generated WOK perimeter.")
+        face_index, local_edge = candidate
+        face = triangles[face_index]
+        first = face[local_edge]
+        second = face[(local_edge + 1) % 3]
+        third = face[(local_edge + 2) % 3]
+        a = (vertices[first][0], vertices[first][1])
+        b = (vertices[second][0], vertices[second][1])
+        length_squared = max(1.0e-16, (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+
+        def parameter(point: Vec2) -> float:
+            return ((point[0] - a[0]) * (b[0] - a[0]) + (point[1] - a[1]) * (b[1] - a[1])) / length_squared
+
+        inserts = sorted(((parameter(portal_start), portal_start), (parameter(portal_end), portal_end)))
+        sequence = [first]
+        for value, point in inserts:
+            if value <= 1.0e-8 or value >= 1.0 - 1.0e-8:
+                continue
+            existing = next(
+                (
+                    index
+                    for index, vertex in enumerate(vertices)
+                    if math.dist((vertex[0], vertex[1]), point) <= 1.0e-8
+                ),
+                None,
+            )
+            if existing is None:
+                existing = len(vertices)
+                vertices.append((point[0], point[1], floor_z))
+            if sequence[-1] != existing:
+                sequence.append(existing)
+        if sequence[-1] != second:
+            sequence.append(second)
+        replacement = [
+            (sequence[index], sequence[index + 1], third)
+            for index in range(len(sequence) - 1)
+            if sequence[index] != sequence[index + 1]
+        ]
+        triangles[face_index : face_index + 1] = replacement
+
+    for portal_start, portal_end in zero_depth_portals:
+        split_boundary_at(portal_start, portal_end)
+
+    adjacency = [[-1, -1, -1] for _face in triangles]
+    edge_owners: dict[tuple[int, int], tuple[int, int]] = {}
+    for face_index, (a, b, c) in enumerate(triangles):
+        for edge_index, edge in enumerate(((a, b), (b, c), (c, a))):
+            key = tuple(sorted(edge))
+            previous = edge_owners.get(key)
+            if previous is None:
+                edge_owners[key] = (face_index, edge_index)
+                continue
+            other_face, other_edge = previous
+            adjacency[face_index][edge_index] = other_face
+            adjacency[other_face][other_edge] = face_index
+    faces = [
+        WOKFace(
+            a,
+            b,
+            c,
+            surface=surface_id,
+            adj1=adjacency[index][0],
+            adj2=adjacency[index][1],
+            adj3=adjacency[index][2],
+        )
+        for index, (a, b, c) in enumerate(triangles)
+    ]
+    return WOKData(verts=vertices, faces=faces, adjacency_domain_count=len(faces))
 
 
 def build_floor_plan_wall_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[PrimitiveMesh, ...]:
@@ -791,11 +1253,17 @@ def build_floor_plan_wall_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[Pri
     room_resref = _normalise_resref(primitive.room_resref)
     z = float(primitive.z)
     top_z = z + float(primitive.wall_height)
-    openings_by_edge = {int(opening.edge_index): opening for opening in primitive.openings}
+    wall_material = primitive.wall_material or primitive.material
+    openings_by_edge: dict[int, list[FloorPlanWallOpening]] = {}
+    for opening in primitive.openings:
+        openings_by_edge.setdefault(int(opening.edge_index), []).append(opening)
     meshes: list[PrimitiveMesh] = []
     for index, (x0, y0) in enumerate(points):
         x1, y1 = points[(index + 1) % len(points)]
-        opening = openings_by_edge.get(index)
+        edge_openings = sorted(
+            openings_by_edge.get(index, ()),
+            key=lambda item: (float(item.center_fraction), float(item.bottom), str(item.name or "")),
+        )
         base_metadata = {
             "primitive": "floor_plan_wall",
             "source": "map_studio:t2611",
@@ -803,17 +1271,76 @@ def build_floor_plan_wall_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[Pri
             "wall_height": float(primitive.wall_height),
             **dict(primitive.material.metadata),
         }
-        if opening is None:
+        if not edge_openings:
             meshes.append(
                 _quad_mesh(
                     name=f"{room_resref}_wall_{index + 1:02d}",
                     vertices=((x0, y0, z), (x1, y1, z), (x1, y1, top_z), (x0, y0, top_z)),
-                    material=primitive.material,
+                    material=wall_material,
                     metadata=base_metadata,
                 )
             )
             continue
         edge_len = _edge_length((x0, y0), (x1, y1))
+        if len(edge_openings) > 1:
+            # Split the wall plane at every opening boundary. Each resulting
+            # vertical strip is filled only outside active opening intervals,
+            # producing any number of non-overlapping rectangular cut-outs.
+            horizontal_bounds = {0.0, 1.0}
+            spans: list[tuple[FloorPlanWallOpening, float, float, float, float]] = []
+            for item in edge_openings:
+                start_fraction, end_fraction = _opening_span(item, edge_len)
+                horizontal_bounds.update((start_fraction, end_fraction))
+                spans.append(
+                    (
+                        item,
+                        start_fraction,
+                        end_fraction,
+                        float(item.bottom),
+                        float(item.bottom) + float(item.height),
+                    )
+                )
+            ordered_x = sorted(horizontal_bounds)
+            panel_ordinal = 0
+            for start_fraction, end_fraction in zip(ordered_x, ordered_x[1:]):
+                if end_fraction - start_fraction <= 1.0e-8:
+                    continue
+                midpoint = (start_fraction + end_fraction) * 0.5
+                active = [span for span in spans if span[1] < midpoint < span[2]]
+                blocked_z = sorted((span[3], span[4]) for span in active)
+                visible_z: list[tuple[float, float]] = []
+                cursor_z = 0.0
+                for blocked_bottom, blocked_top in blocked_z:
+                    if blocked_bottom > cursor_z + 1.0e-8:
+                        visible_z.append((cursor_z, blocked_bottom))
+                    cursor_z = max(cursor_z, blocked_top)
+                if cursor_z < float(primitive.wall_height) - 1.0e-8:
+                    visible_z.append((cursor_z, float(primitive.wall_height)))
+                start = _lerp_point((x0, y0), (x1, y1), start_fraction)
+                end = _lerp_point((x0, y0), (x1, y1), end_fraction)
+                for lower, upper in visible_z:
+                    if upper - lower <= 1.0e-8:
+                        continue
+                    panel_ordinal += 1
+                    meshes.append(
+                        _quad_mesh(
+                            name=f"{room_resref}_wall_{index + 1:02d}_panel_{panel_ordinal:02d}",
+                            vertices=(
+                                (start[0], start[1], z + lower),
+                                (end[0], end[1], z + lower),
+                                (end[0], end[1], z + upper),
+                                (start[0], start[1], z + upper),
+                            ),
+                            material=wall_material,
+                            metadata={
+                                **base_metadata,
+                                "wall_panel": "multi_opening_fill",
+                                "opening_names": tuple(str(span[0].name or "") for span in active),
+                            },
+                        )
+                    )
+            continue
+        opening = edge_openings[0]
         start_fraction, end_fraction = _opening_span(opening, edge_len)
         start = _lerp_point((x0, y0), (x1, y1), start_fraction)
         end = _lerp_point((x0, y0), (x1, y1), end_fraction)
@@ -833,7 +1360,7 @@ def build_floor_plan_wall_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[Pri
                 _quad_mesh(
                     name=f"{room_resref}_wall_{index + 1:02d}_left",
                     vertices=((x0, y0, z), (start[0], start[1], z), (start[0], start[1], top_z), (x0, y0, top_z)),
-                    material=primitive.material,
+                    material=wall_material,
                     metadata={**opening_metadata, "wall_panel": "opening_left"},
                 )
             )
@@ -842,7 +1369,7 @@ def build_floor_plan_wall_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[Pri
                 _quad_mesh(
                     name=f"{room_resref}_wall_{index + 1:02d}_sill",
                     vertices=((start[0], start[1], z), (end[0], end[1], z), (end[0], end[1], opening_bottom), (start[0], start[1], opening_bottom)),
-                    material=primitive.material,
+                    material=wall_material,
                     metadata={**opening_metadata, "wall_panel": "opening_sill"},
                 )
             )
@@ -850,7 +1377,7 @@ def build_floor_plan_wall_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[Pri
             _quad_mesh(
                 name=f"{room_resref}_wall_{index + 1:02d}_lintel",
                 vertices=((start[0], start[1], opening_top), (end[0], end[1], opening_top), (end[0], end[1], top_z), (start[0], start[1], top_z)),
-                material=primitive.material,
+                material=wall_material,
                 metadata={**opening_metadata, "wall_panel": "opening_lintel"},
             )
         )
@@ -859,10 +1386,5374 @@ def build_floor_plan_wall_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[Pri
                 _quad_mesh(
                     name=f"{room_resref}_wall_{index + 1:02d}_right",
                     vertices=((end[0], end[1], z), (x1, y1, z), (x1, y1, top_z), (end[0], end[1], top_z)),
-                    material=primitive.material,
+                    material=wall_material,
                     metadata={**opening_metadata, "wall_panel": "opening_right"},
                 )
             )
+    return tuple(meshes)
+
+
+def _architecture_material(texture: str, *, luminous: bool = False) -> PrimitiveMaterial:
+    """Build one material used by a vanilla-derived architecture profile."""
+
+    metadata: dict[str, Any] = {
+        "surface_role": "architectural_detail",
+        "vanilla_derived": True,
+    }
+    if luminous:
+        metadata.update({"selfillum": (0.7, 0.82, 1.0), "has_shadow": False})
+    return PrimitiveMaterial(
+        texture=str(texture or "default").strip().lower(),
+        diffuse=(1.0, 1.0, 1.0),
+        ambient=(0.5, 0.5, 0.5),
+        metadata=metadata,
+    )
+
+
+def _subtract_interval(
+    intervals: list[tuple[float, float]],
+    blocked_start: float,
+    blocked_end: float,
+) -> list[tuple[float, float]]:
+    result: list[tuple[float, float]] = []
+    for start, end in intervals:
+        if blocked_end <= start + 1.0e-8 or blocked_start >= end - 1.0e-8:
+            result.append((start, end))
+            continue
+        if blocked_start > start + 1.0e-8:
+            result.append((start, min(end, blocked_start)))
+        if blocked_end < end - 1.0e-8:
+            result.append((max(start, blocked_end), end))
+    return result
+
+
+def _architecture_visible_intervals(
+    edge_length: float,
+    openings: tuple[FloorPlanWallOpening, ...],
+    *,
+    z0: float,
+    z1: float,
+) -> tuple[tuple[float, float], ...]:
+    """Return wall-local spans not occupied by a door/window at this height."""
+
+    intervals = [(0.0, float(edge_length))]
+    for opening in openings:
+        opening_bottom = float(opening.bottom)
+        opening_top = opening_bottom + float(opening.height)
+        if opening_top <= z0 + 1.0e-8 or opening_bottom >= z1 - 1.0e-8:
+            continue
+        center = float(opening.center_fraction) * float(edge_length)
+        half = float(opening.width) * 0.5
+        intervals = _subtract_interval(intervals, max(0.0, center - half), min(edge_length, center + half))
+    return tuple((start, end) for start, end in intervals if end - start > 0.015)
+
+
+def _architecture_intersections(
+    first: tuple[tuple[float, float], ...],
+    second: tuple[float, float],
+) -> tuple[tuple[float, float], ...]:
+    start, end = second
+    return tuple(
+        (max(a, start), min(b, end))
+        for a, b in first
+        if min(b, end) - max(a, start) > 0.015
+    )
+
+
+def _architecture_wall_mesh(
+    *,
+    name: str,
+    start: Vec2,
+    end: Vec2,
+    span_bottom: tuple[float, float],
+    span_top: tuple[float, float] | None,
+    depth_bottom: float,
+    depth_top: float,
+    z_bottom: float,
+    z_top: float,
+    material: PrimitiveMaterial,
+    metadata: dict[str, Any],
+) -> PrimitiveMesh:
+    """Create one flat wall-local panel, including trapezoids and coves."""
+
+    length = _edge_length(start, end)
+    tx = (end[0] - start[0]) / max(length, 1.0e-8)
+    ty = (end[1] - start[1]) / max(length, 1.0e-8)
+    # Footprints are CCW, so their interior lies to the left of each edge.
+    nx, ny = -ty, tx
+    top_span = span_bottom if span_top is None else span_top
+
+    def point(distance: float, depth: float, z: float) -> Vec3:
+        return (
+            start[0] + tx * distance + nx * depth,
+            start[1] + ty * distance + ny * depth,
+            z,
+        )
+
+    vertices = (
+        point(span_bottom[0], depth_bottom, z_bottom),
+        point(span_bottom[1], depth_bottom, z_bottom),
+        point(top_span[1], depth_top, z_top),
+        point(top_span[0], depth_top, z_top),
+    )
+    return _planar_surface_mesh(
+        name=name,
+        vertices=vertices,
+        faces=((0, 1, 2), (0, 2, 3)),
+        material=material,
+        metadata={**dict(material.metadata), **metadata},
+    )
+
+
+def _architecture_closed_wall_prism_meshes(
+    *,
+    name: str,
+    start: Vec2,
+    end: Vec2,
+    span: tuple[float, float],
+    depth_back: float,
+    depth_front: float,
+    z_bottom: float,
+    z_top: float,
+    material: PrimitiveMaterial,
+    metadata: dict[str, Any],
+) -> tuple[PrimitiveMesh, ...]:
+    """Build a closed wall-local prism with world-tiled UVs on every face."""
+
+    length = _edge_length(start, end)
+    if length <= 1.0e-8 or span[1] - span[0] <= 0.015:
+        return ()
+    if depth_front - depth_back <= 0.015 or z_top - z_bottom <= 0.015:
+        return ()
+    tx = (end[0] - start[0]) / length
+    ty = (end[1] - start[1]) / length
+    nx, ny = -ty, tx
+
+    def point(distance: float, depth: float, z: float) -> Vec3:
+        return (
+            start[0] + tx * distance + nx * depth,
+            start[1] + ty * distance + ny * depth,
+            z,
+        )
+
+    back_bottom_start = point(span[0], depth_back, z_bottom)
+    back_bottom_end = point(span[1], depth_back, z_bottom)
+    back_top_start = point(span[0], depth_back, z_top)
+    back_top_end = point(span[1], depth_back, z_top)
+    front_bottom_start = point(span[0], depth_front, z_bottom)
+    front_bottom_end = point(span[1], depth_front, z_bottom)
+    front_top_start = point(span[0], depth_front, z_top)
+    front_top_end = point(span[1], depth_front, z_top)
+    faces = {
+        "front": (front_bottom_start, front_bottom_end, front_top_end, front_top_start),
+        "back": (back_bottom_end, back_bottom_start, back_top_start, back_top_end),
+        "bottom": (back_bottom_start, back_bottom_end, front_bottom_end, front_bottom_start),
+        "top": (back_top_start, front_top_start, front_top_end, back_top_end),
+        "start": (back_bottom_start, front_bottom_start, front_top_start, back_top_start),
+        "end": (front_bottom_end, back_bottom_end, back_top_end, front_top_end),
+    }
+    common = {**dict(material.metadata), **metadata, "closed_geometry": True}
+    return tuple(
+        _planar_surface_mesh(
+            name=f"{name}_{part}",
+            vertices=vertices,
+            faces=((0, 1, 2), (0, 2, 3)),
+            material=material,
+            metadata={**common, "prism_part": part},
+        )
+        for part, vertices in faces.items()
+    )
+
+
+def _korriban_chamber_corner_buttress_meshes(
+    *,
+    room_resref: str,
+    points: tuple[Vec2, ...],
+    floor_z: float,
+    wall_height: float,
+    base_material: PrimitiveMaterial,
+    capital_material: PrimitiveMaterial,
+    common: dict[str, Any],
+    base_role: str = "sith_chamber_corner_buttress",
+    capital_role: str = "sith_chamber_vault_capital",
+    base_height_fraction: float = 3.6375 / 10.35,
+    maximum_base_width: float = 3.45,
+    maximum_capital_width: float = 4.20,
+    source_measurement: str = "m39aa_07",
+) -> tuple[PrimitiveMesh, ...]:
+    """Build the massive two-stage corner supports measured in m39aa_07.
+
+    The stock chamber uses 3.45 m lower corner blocks followed by larger
+    corbelled capitals that carry the high vault.  The authored version keeps
+    that measured maximum but scales down for smaller legal chamber footprints;
+    it never stretches one texture island over the generated support.
+    """
+
+    span_x = max(point[0] for point in points) - min(point[0] for point in points)
+    span_y = max(point[1] for point in points) - min(point[1] for point in points)
+    minimum_span = min(span_x, span_y)
+    base_width = min(maximum_base_width, max(1.35, minimum_span * 0.16))
+    base_top = floor_z + wall_height * base_height_fraction
+    capital_top = floor_z + wall_height
+    layers = (
+        (
+            base_role,
+            floor_z,
+            base_top,
+            base_width,
+            base_material,
+            f"{source_measurement} lower corner support",
+            maximum_base_width,
+        ),
+        (
+            capital_role,
+            base_top - min(0.08, wall_height * 0.01),
+            capital_top,
+            min(maximum_capital_width, base_width * 1.28),
+            capital_material,
+            f"{source_measurement} upper corner capital",
+            maximum_capital_width,
+        ),
+    )
+    meshes: list[PrimitiveMesh] = []
+    for corner_index, point in enumerate(points):
+        previous = points[(corner_index - 1) % len(points)]
+        following = points[(corner_index + 1) % len(points)]
+        previous_length = max(_edge_length(point, previous), 1.0e-8)
+        following_length = max(_edge_length(point, following), 1.0e-8)
+        to_previous = (
+            (previous[0] - point[0]) / previous_length,
+            (previous[1] - point[1]) / previous_length,
+        )
+        to_following = (
+            (following[0] - point[0]) / following_length,
+            (following[1] - point[1]) / following_length,
+        )
+        for role, z_bottom, z_top, width, material, source_label, measured_width in layers:
+            chamfer = width * 0.35
+            base_points = (
+                point,
+                (
+                    point[0] + to_following[0] * width,
+                    point[1] + to_following[1] * width,
+                ),
+                (
+                    point[0] + to_following[0] * width + to_previous[0] * chamfer,
+                    point[1] + to_following[1] * width + to_previous[1] * chamfer,
+                ),
+                (
+                    point[0] + to_following[0] * chamfer + to_previous[0] * width,
+                    point[1] + to_following[1] * chamfer + to_previous[1] * width,
+                ),
+                (
+                    point[0] + to_previous[0] * width,
+                    point[1] + to_previous[1] * width,
+                ),
+            )
+            bottom = tuple((x, y, z_bottom) for x, y in base_points)
+            top = tuple((x, y, z_top) for x, y in base_points)
+            metadata = {
+                **dict(material.metadata),
+                **common,
+                "architecture_role": role,
+                "surface_role": "wall",
+                "corner_index": corner_index,
+                "beveled_geometry": True,
+                "source_measurement": source_label,
+                "measured_maximum_width_m": measured_width,
+            }
+            cap_faces = tuple((0, index, index + 1) for index in range(1, len(base_points) - 1))
+            meshes.append(
+                _planar_surface_mesh(
+                    name=f"{room_resref}_{role}_c{corner_index + 1:02d}_top",
+                    vertices=top,
+                    faces=cap_faces,
+                    material=material,
+                    metadata={**metadata, "buttress_part": "top"},
+                )
+            )
+            meshes.append(
+                _planar_surface_mesh(
+                    name=f"{room_resref}_{role}_c{corner_index + 1:02d}_bottom",
+                    vertices=bottom,
+                    faces=tuple((c, b, a) for a, b, c in cap_faces),
+                    material=material,
+                    metadata={**metadata, "buttress_part": "bottom"},
+                )
+            )
+            for face_index in range(len(base_points)):
+                next_index = (face_index + 1) % len(base_points)
+                meshes.append(
+                    _planar_surface_mesh(
+                        name=f"{room_resref}_{role}_c{corner_index + 1:02d}_side{face_index + 1:02d}",
+                        vertices=(
+                            bottom[face_index],
+                            bottom[next_index],
+                            top[next_index],
+                            top[face_index],
+                        ),
+                        faces=((0, 1, 2), (0, 2, 3)),
+                        material=material,
+                        metadata={**metadata, "buttress_part": "side", "buttress_face": face_index},
+                    )
+                )
+    return tuple(meshes)
+
+
+def _korriban_burial_niche_meshes(
+    *,
+    room_resref: str,
+    points: tuple[Vec2, ...],
+    openings_by_edge: dict[int, tuple[FloorPlanWallOpening, ...]],
+    floor_z: float,
+    wall_height: float,
+    wall_material: PrimitiveMaterial,
+    accent_material: PrimitiveMaterial,
+    trim_material: PrimitiveMaterial,
+    common: dict[str, Any],
+) -> tuple[PrimitiveMesh, ...]:
+    """Build opening-aware burial niches and sarcophagus plinths."""
+
+    meshes: list[PrimitiveMesh] = []
+    z0 = floor_z
+    niche_top = floor_z + min(wall_height - 0.5, 5.15)
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        edge_length = _edge_length(start, end)
+        if edge_length < 2.0:
+            continue
+        openings = openings_by_edge.get(edge_index, ())
+        bay_count = max(1, int(math.ceil(edge_length / 4.5)))
+        bay_width = edge_length / bay_count
+        for bay_index in range(bay_count):
+            bay_start = bay_index * bay_width + min(0.35, bay_width * 0.10)
+            bay_end = (bay_index + 1) * bay_width - min(0.35, bay_width * 0.10)
+            if bay_end - bay_start < 1.2:
+                continue
+            if any(
+                max(bay_start, float(opening.center_fraction) * edge_length - float(opening.width) * 0.5)
+                < min(bay_end, float(opening.center_fraction) * edge_length + float(opening.width) * 0.5)
+                and float(opening.bottom) < 5.2
+                and float(opening.bottom) + float(opening.height) > 0.5
+                for opening in openings
+            ):
+                continue
+            width = bay_end - bay_start
+            jamb = min(0.28, width * 0.10)
+            niche_metadata = {
+                **common,
+                "edge_index": edge_index,
+                "burial_bay": bay_index,
+                "beveled_geometry": True,
+                "source_measurement": "m38aa_11 3 m relief/dead-end burial cadence",
+            }
+            meshes.append(
+                _architecture_wall_mesh(
+                    name=f"{room_resref}_burial_niche_back_e{edge_index + 1:02d}_b{bay_index + 1:02d}",
+                    start=start,
+                    end=end,
+                    span_bottom=(bay_start + jamb, bay_end - jamb),
+                    span_top=None,
+                    depth_bottom=0.76,
+                    depth_top=0.82,
+                    z_bottom=z0 + 0.72,
+                    z_top=niche_top - 0.38,
+                    material=accent_material,
+                    metadata={**niche_metadata, "architecture_role": "burial_niche_back"},
+                )
+            )
+            for side, span in (
+                ("left", (bay_start, bay_start + jamb)),
+                ("right", (bay_end - jamb, bay_end)),
+            ):
+                meshes.extend(
+                    _architecture_closed_wall_prism_meshes(
+                        name=f"{room_resref}_burial_niche_{side}_e{edge_index + 1:02d}_b{bay_index + 1:02d}",
+                        start=start,
+                        end=end,
+                        span=span,
+                        depth_back=0.72,
+                        depth_front=1.08,
+                        z_bottom=z0 + 0.58,
+                        z_top=niche_top,
+                        material=trim_material,
+                        metadata={**niche_metadata, "architecture_role": "burial_niche_jamb"},
+                    )
+                )
+            meshes.extend(
+                _architecture_closed_wall_prism_meshes(
+                    name=f"{room_resref}_burial_niche_lintel_e{edge_index + 1:02d}_b{bay_index + 1:02d}",
+                    start=start,
+                    end=end,
+                    span=(bay_start, bay_end),
+                    depth_back=0.70,
+                    depth_front=1.12,
+                    z_bottom=niche_top - 0.42,
+                    z_top=niche_top,
+                    material=trim_material,
+                    metadata={**niche_metadata, "architecture_role": "burial_niche_lintel"},
+                )
+            )
+            plinth_margin = width * 0.18
+            meshes.extend(
+                _architecture_closed_wall_prism_meshes(
+                    name=f"{room_resref}_burial_plinth_e{edge_index + 1:02d}_b{bay_index + 1:02d}",
+                    start=start,
+                    end=end,
+                    span=(bay_start + plinth_margin, bay_end - plinth_margin),
+                    depth_back=0.70,
+                    depth_front=1.55,
+                    z_bottom=z0 + 0.16,
+                    z_top=z0 + 0.68,
+                    material=wall_material,
+                    metadata={**niche_metadata, "architecture_role": "burial_sarcophagus_plinth"},
+                )
+            )
+    return tuple(meshes)
+
+
+def _korriban_monumental_pylon_meshes(
+    *,
+    room_resref: str,
+    points: tuple[Vec2, ...],
+    openings_by_edge: dict[int, tuple[FloorPlanWallOpening, ...]],
+    floor_z: float,
+    wall_height: float,
+    wall_material: PrimitiveMaterial,
+    accent_material: PrimitiveMaterial,
+    common: dict[str, Any],
+) -> tuple[PrimitiveMesh, ...]:
+    """Build the giant 10.5 m-cadence wall pylons measured in m39aa_07."""
+
+    meshes: list[PrimitiveMesh] = []
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        edge_length = _edge_length(start, end)
+        openings = openings_by_edge.get(edge_index, ())
+        bay_count = max(1, int(math.ceil(edge_length / 10.5)))
+        bay_width = edge_length / bay_count
+        for bay_index in range(bay_count):
+            center = (bay_index + 0.5) * bay_width
+            half = min(1.20, bay_width * 0.16)
+            span = (max(0.0, center - half), min(edge_length, center + half))
+            if any(
+                max(span[0], float(opening.center_fraction) * edge_length - float(opening.width) * 0.5)
+                < min(span[1], float(opening.center_fraction) * edge_length + float(opening.width) * 0.5)
+                for opening in openings
+            ):
+                continue
+            pylon_metadata = {
+                **common,
+                "edge_index": edge_index,
+                "monumental_bay": bay_index,
+                "beveled_geometry": True,
+                "source_measurement": "m39aa_07 10.5 m wall module and 22.08 m vault rise",
+            }
+            meshes.extend(
+                _architecture_closed_wall_prism_meshes(
+                    name=f"{room_resref}_monumental_pylon_e{edge_index + 1:02d}_b{bay_index + 1:02d}",
+                    start=start,
+                    end=end,
+                    span=span,
+                    depth_back=0.80,
+                    depth_front=2.80,
+                    z_bottom=floor_z + 0.22,
+                    z_top=floor_z + wall_height * 0.56,
+                    material=accent_material,
+                    metadata={**pylon_metadata, "architecture_role": "monumental_tomb_pylon"},
+                )
+            )
+            capital_half = min(2.10, bay_width * 0.28)
+            meshes.extend(
+                _architecture_closed_wall_prism_meshes(
+                    name=f"{room_resref}_monumental_capital_e{edge_index + 1:02d}_b{bay_index + 1:02d}",
+                    start=start,
+                    end=end,
+                    span=(max(0.0, center - capital_half), min(edge_length, center + capital_half)),
+                    depth_back=1.20,
+                    depth_front=4.20,
+                    z_bottom=floor_z + wall_height * 0.56,
+                    z_top=floor_z + wall_height * 0.82,
+                    material=wall_material,
+                    metadata={**pylon_metadata, "architecture_role": "monumental_corbel_capital"},
+                )
+            )
+    return tuple(meshes)
+
+
+def _korriban_junction_crown_meshes(
+    *,
+    room_resref: str,
+    points: tuple[Vec2, ...],
+    floor_z: float,
+    wall_height: float,
+    material: PrimitiveMaterial,
+    common: dict[str, Any],
+) -> tuple[PrimitiveMesh, ...]:
+    """Add a recessed cross-vault crown above three- and four-way junctions."""
+
+    minimum_span = min(
+        max(point[0] for point in points) - min(point[0] for point in points),
+        max(point[1] for point in points) - min(point[1] for point in points),
+    )
+    outer_depth = min(1.10, minimum_span * 0.08)
+    inner_depth = min(2.40, minimum_span * 0.18)
+    rings, _scale = _architecture_profile_rings(points, (outer_depth, inner_depth))
+    meshes: list[PrimitiveMesh] = []
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        edge_length = _edge_length(start, end)
+        meshes.append(
+            _architecture_profile_segment_mesh(
+                name=f"{room_resref}_junction_cross_vault_e{edge_index + 1:02d}",
+                bottom_ring=rings[outer_depth],
+                top_ring=rings[inner_depth],
+                edge_index=edge_index,
+                span=(0.0, edge_length),
+                source_start=start,
+                source_end=end,
+                edge_length=edge_length,
+                z_bottom=floor_z + wall_height - 1.35,
+                z_top=floor_z + wall_height - 0.20,
+                material=material,
+                metadata={
+                    **common,
+                    "architecture_role": "junction_cross_vault_keystone",
+                    "edge_index": edge_index,
+                    "beveled_geometry": True,
+                    "source_measurement": "m38aa_06/m38aa_08 central cross-vault",
+                },
+            )
+        )
+    cap_points = rings[inner_depth]
+    vertices = tuple((x, y, floor_z + wall_height - 0.20) for x, y in cap_points)
+    meshes.append(
+        _planar_surface_mesh(
+            name=f"{room_resref}_junction_cross_vault_cap",
+            vertices=vertices,
+            faces=tuple((c, b, a) for a, b, c in triangulate_floor_plan_points(cap_points)),
+            material=material,
+            metadata={
+                **common,
+                "architecture_role": "junction_cross_vault_cap",
+                "surface_role": "ceiling",
+                "beveled_geometry": True,
+            },
+        )
+    )
+    return tuple(meshes)
+
+
+def _module_transition_shell_meshes(
+    *,
+    room_resref: str,
+    edge_index: int,
+    start: Vec2,
+    tangent: Vec2,
+    inward_normal: Vec2,
+    edge_length: float,
+    opening: FloorPlanWallOpening,
+    floor_z: float,
+    architecture_profile: str,
+) -> tuple[PrimitiveMesh, ...]:
+    """Fit a supplied visual module-transition shell to one connected opening."""
+
+    metadata = dict(opening.metadata or {})
+    asset_id = str(metadata.get("module_transition_asset_id") or "").strip().lower()
+    connected_room = str(metadata.get("connected_room_resref") or "").strip().lower()
+    if not asset_id or not connected_room:
+        return ()
+    center_distance = max(
+        0.0,
+        min(float(edge_length), float(opening.center_fraction) * float(edge_length)),
+    )
+    center = (
+        float(start[0]) + float(tangent[0]) * center_distance,
+        float(start[1]) + float(tangent[1]) * center_distance,
+        float(floor_z) + float(opening.bottom),
+    )
+    from .map_studio_terrain_kit import build_module_transition_shell_meshes
+
+    return build_module_transition_shell_meshes(
+        asset_id,
+        room_resref=room_resref,
+        edge_index=edge_index,
+        opening_name=str(opening.name or ""),
+        center=center,
+        tangent=tangent,
+        inward_normal=inward_normal,
+        opening_width=float(opening.width),
+        connected_room_resref=connected_room,
+        opening_height=float(opening.height),
+        transition_length_m=float(
+            metadata.get("module_transition_length_m")
+            or metadata.get("transition_length_m")
+            or 0.0
+        ),
+        game=(
+            "K2"
+            if str(architecture_profile or "").strip().lower().endswith("_k2")
+            or str(architecture_profile or "").strip().lower() == "rhen_var"
+            else "K1"
+        ),
+    )
+
+
+def _architecture_door_transition_meshes(
+    *,
+    room_resref: str,
+    profile: str,
+    edge_index: int,
+    start: Vec2,
+    end: Vec2,
+    edge_length: float,
+    floor_z: float,
+    wall_height: float,
+    openings: tuple[FloorPlanWallOpening, ...],
+    infill_material: PrimitiveMaterial,
+    trim_material: PrimitiveMaterial,
+    light_material: PrimitiveMaterial,
+    common: dict[str, Any],
+) -> tuple[PrimitiveMesh, ...]:
+    """Blend a generated wall into the authentic DOR_LHR01 outer frame."""
+
+    meshes: list[PrimitiveMesh] = []
+    for opening in openings:
+        metadata = dict(opening.metadata or {})
+        # A reciprocal Pascal-room connection owns one shared door actor and
+        # one shared transition shell.  Rebuilding the same surround from the
+        # non-owning room produced coincident lintels and thresholds at the
+        # seam, which appeared as dark flicker in PIE.
+        if bool(metadata.get("shared_connection_door")) and str(
+            metadata.get("shared_door_placement_id") or ""
+        ).strip():
+            continue
+        door_model = str(metadata.get("door_model_resref") or "").strip().lower()
+        if door_model == "dor_lko04":
+            # K1/K2 tomb rooms supply a deep carved surround around the
+            # DOR_LKO04 actor. The door model is only the moving assembly; a
+            # bare boolean cut therefore exposes every profiled-wall course as
+            # a row of jagged ends when the panels retract. Rebuild the
+            # measured 6.802 m outer frame as three stepped stone tiers plus a
+            # closed reveal and threshold. These are visual surfaces only:
+            # the exact retail WOK threshold remains the room portal.
+            center = max(0.0, min(edge_length, float(opening.center_fraction) * edge_length))
+            half_width = min(edge_length * 0.5, float(opening.width) * 0.5)
+            inner_start = max(0.0, center - half_width)
+            inner_end = min(edge_length, center + half_width)
+            requested_outer_width = float(
+                metadata.get("door_outer_width_m")
+                or metadata.get("door_frame_width_m")
+                or (float(opening.width) + 1.552)
+            )
+            outer_half = min(edge_length * 0.5, max(half_width + 0.24, requested_outer_width * 0.5))
+            outer_start = max(0.0, center - outer_half)
+            outer_end = min(edge_length, center + outer_half)
+            opening_bottom = max(0.0, float(opening.bottom))
+            opening_top = min(wall_height - 0.01, opening_bottom + float(opening.height))
+            requested_outer_height = float(
+                metadata.get("door_outer_height_m")
+                or metadata.get("door_frame_height_m")
+                or wall_height
+            )
+            outer_top = min(
+                wall_height - 0.005,
+                max(opening_top + 0.08, requested_outer_height),
+            )
+            jamb_width = max(0.0, min(inner_start - outer_start, outer_end - inner_end))
+            frame_metadata = {
+                **common,
+                "opening_name": str(opening.name or ""),
+                "door_model_resref": "dor_lko04",
+                "door_aperture_width_m": float(opening.width),
+                "door_outer_width_m": (outer_end - outer_start),
+                "architecture_role": "korriban_door_frame",
+                "surface_role": "architectural_detail",
+                "vanilla_measurement_source": "DOR_LKO04 + m38aa_02 WOK threshold",
+            }
+            structural_depth_back = -0.58
+            structural_depth_front = 0.30
+            for part, span, z0, z1 in (
+                ("left", (outer_start, inner_start), floor_z + opening_bottom, floor_z + outer_top),
+                ("right", (inner_end, outer_end), floor_z + opening_bottom, floor_z + outer_top),
+                ("lintel", (outer_start, outer_end), floor_z + opening_top, floor_z + outer_top),
+            ):
+                meshes.extend(
+                    _architecture_closed_wall_prism_meshes(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_korriban_door_structural_{part}",
+                        start=start,
+                        end=end,
+                        span=span,
+                        depth_back=structural_depth_back,
+                        depth_front=structural_depth_front,
+                        z_bottom=z0,
+                        z_top=z1,
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "door_frame_part": part,
+                            "architecture_role": "korriban_door_structural_return",
+                            "door_wall_depth_m": structural_depth_front - structural_depth_back,
+                        },
+                    )
+                )
+            tiers = (
+                ("outer", 0.835, trim_material),
+                ("middle", 0.935, infill_material),
+                ("inner", 1.035, trim_material),
+            )
+            for tier_index, (tier_name, depth, material) in enumerate(tiers):
+                lateral_inset = min(jamb_width * 0.58, jamb_width * 0.22 * tier_index)
+                tier_start = min(inner_start, outer_start + lateral_inset)
+                tier_end = max(inner_end, outer_end - lateral_inset)
+                tier_top = max(
+                    opening_top + 0.025,
+                    outer_top - min(0.075, lateral_inset * 0.16),
+                )
+                parts = (
+                    ("left", (tier_start, inner_start), floor_z + opening_bottom, floor_z + tier_top),
+                    ("right", (inner_end, tier_end), floor_z + opening_bottom, floor_z + tier_top),
+                    ("lintel", (tier_start, tier_end), floor_z + opening_top, floor_z + tier_top),
+                )
+                for part, span, z0, z1 in parts:
+                    if span[1] - span[0] <= 0.012 or z1 - z0 <= 0.012:
+                        continue
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=(
+                                f"{room_resref}_{profile}_e{edge_index + 1:02d}_"
+                                f"korriban_door_{tier_name}_{part}"
+                            ),
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=depth,
+                            depth_top=depth,
+                            z_bottom=z0,
+                            z_top=z1,
+                            material=material,
+                            metadata={
+                                **frame_metadata,
+                                "architecture_role": f"korriban_door_frame_{tier_name}",
+                                "door_frame_tier": tier_index,
+                                "door_frame_part": part,
+                                "beveled_geometry": True,
+                            },
+                        )
+                    )
+
+            tx = (float(end[0]) - float(start[0])) / max(edge_length, 1.0e-8)
+            ty = (float(end[1]) - float(start[1])) / max(edge_length, 1.0e-8)
+            nx, ny = -ty, tx
+
+            def portal_point(distance: float, depth: float, z_value: float) -> Vec3:
+                return (
+                    float(start[0]) + tx * float(distance) + nx * float(depth),
+                    float(start[1]) + ty * float(distance) + ny * float(depth),
+                    float(z_value),
+                )
+
+            reveal_start = structural_depth_front
+            reveal_depth = tiers[-1][1]
+            reveal_rows = (
+                (
+                    "left",
+                    (
+                        portal_point(inner_start, reveal_start, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_start, reveal_start, floor_z + opening_top),
+                    ),
+                ),
+                (
+                    "right",
+                    (
+                        portal_point(inner_end, reveal_start, floor_z + opening_bottom),
+                        portal_point(inner_end, reveal_start, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_bottom),
+                    ),
+                ),
+                (
+                    "lintel",
+                    (
+                        portal_point(inner_start, reveal_start, floor_z + opening_top),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_start, floor_z + opening_top),
+                    ),
+                ),
+            )
+            for reveal, vertices in reveal_rows:
+                meshes.append(
+                    _planar_surface_mesh(
+                        name=(
+                            f"{room_resref}_{profile}_e{edge_index + 1:02d}_"
+                            f"korriban_door_reveal_{reveal}"
+                        ),
+                        vertices=vertices,
+                        faces=((0, 1, 2), (0, 2, 3), (2, 1, 0), (3, 2, 0)),
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "architecture_role": "korriban_door_transition_reveal",
+                            "door_frame_part": reveal,
+                            "sealed_transition_reveal": True,
+                        },
+                    )
+                )
+            continue
+        if door_model == "dor_tel14":
+            # Citadel residential portals are compact rectangular moving doors
+            # carried inside a deep architectural reveal. Rhen Var deliberately
+            # reuses that proven K2 moving-door aperture inside a wider carved
+            # frost-stone surround. Reconstruct the surround and threshold as
+            # solid geometry so a snapped room never meets a paper-thin opening.
+            is_rhen_var = str(profile or "").strip().lower() == "rhen_var"
+            center = max(0.0, min(edge_length, float(opening.center_fraction) * edge_length))
+            half_width = min(edge_length * 0.5, float(opening.width) * 0.5)
+            inner_start = max(0.0, center - half_width)
+            inner_end = min(edge_length, center + half_width)
+            requested_outer_width = float(
+                metadata.get("door_outer_width_m")
+                or metadata.get("door_frame_width_m")
+                or (float(opening.width) + 0.44)
+            )
+            outer_half = min(edge_length * 0.5, max(half_width + 0.16, requested_outer_width * 0.5))
+            outer_start = max(0.0, center - outer_half)
+            outer_end = min(edge_length, center + outer_half)
+            opening_bottom = max(0.0, float(opening.bottom))
+            opening_top = min(wall_height - 0.01, opening_bottom + float(opening.height))
+            outer_top = min(
+                wall_height - 0.005,
+                max(
+                    opening_top + 0.18,
+                    float(metadata.get("door_outer_height_m") or metadata.get("door_frame_height_m") or 3.31),
+                ),
+            )
+            frame_metadata = {
+                **common,
+                "opening_name": str(opening.name or ""),
+                "door_model_resref": "dor_tel14",
+                "door_aperture_width_m": float(opening.width),
+                "architecture_role": (
+                    "rhen_var_temple_door_frame"
+                    if is_rhen_var
+                    else "telos_citadel_door_frame"
+                ),
+                "surface_role": "architectural_detail",
+                "vanilla_measurement_source": (
+                    "DOR_TEL14 K2 aperture + 261TEL/Rhen Var frost-stone reveal"
+                    if is_rhen_var
+                    else "DOR_TEL14 + 203TEL/204TEL door hooks"
+                ),
+            }
+            for tier, depth, lateral, material in (
+                ("outer", 0.18, 0.0, trim_material),
+                ("inner", 0.28, 0.09, infill_material),
+            ):
+                tier_start = min(inner_start, outer_start + lateral)
+                tier_end = max(inner_end, outer_end - lateral)
+                tier_top = max(opening_top + 0.04, outer_top - lateral * 0.35)
+                for part, span, z0, z1 in (
+                    ("left", (tier_start, inner_start), floor_z + opening_bottom, floor_z + tier_top),
+                    ("right", (inner_end, tier_end), floor_z + opening_bottom, floor_z + tier_top),
+                    ("lintel", (tier_start, tier_end), floor_z + opening_top, floor_z + tier_top),
+                ):
+                    if span[1] - span[0] <= 0.012 or z1 - z0 <= 0.012:
+                        continue
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=(
+                                f"{room_resref}_{profile}_e{edge_index + 1:02d}_"
+                                f"{'rhen_var' if is_rhen_var else 'telos'}_door_{tier}_{part}"
+                            ),
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=depth,
+                            depth_top=depth,
+                            z_bottom=z0,
+                            z_top=z1,
+                            material=material,
+                            metadata={
+                                **frame_metadata,
+                                "door_frame_tier": tier,
+                                "door_frame_part": part,
+                                "beveled_geometry": True,
+                            },
+                        )
+                    )
+
+            tx = (float(end[0]) - float(start[0])) / max(edge_length, 1.0e-8)
+            ty = (float(end[1]) - float(start[1])) / max(edge_length, 1.0e-8)
+            nx, ny = -ty, tx
+
+            def portal_point(distance: float, depth: float, z_value: float) -> Vec3:
+                return (
+                    float(start[0]) + tx * float(distance) + nx * float(depth),
+                    float(start[1]) + ty * float(distance) + ny * float(depth),
+                    float(z_value),
+                )
+
+            reveal_depth = 0.31
+            for reveal, vertices in (
+                (
+                    "left",
+                    (
+                        portal_point(inner_start, 0.0, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_start, 0.0, floor_z + opening_top),
+                    ),
+                ),
+                (
+                    "right",
+                    (
+                        portal_point(inner_end, 0.0, floor_z + opening_bottom),
+                        portal_point(inner_end, 0.0, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_bottom),
+                    ),
+                ),
+                (
+                    "lintel",
+                    (
+                        portal_point(inner_start, 0.0, floor_z + opening_top),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, 0.0, floor_z + opening_top),
+                    ),
+                ),
+                (
+                    "threshold",
+                    (
+                        portal_point(inner_start, 0.0, floor_z + opening_bottom + 0.012),
+                        portal_point(inner_end, 0.0, floor_z + opening_bottom + 0.012),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_bottom + 0.012),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_bottom + 0.012),
+                    ),
+                ),
+            ):
+                meshes.append(
+                    _planar_surface_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_telos_door_reveal_{reveal}",
+                        vertices=vertices,
+                        faces=((0, 1, 2), (0, 2, 3), (2, 1, 0), (3, 2, 0)),
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "door_frame_part": reveal,
+                            "sealed_transition_reveal": True,
+                        },
+                    )
+                )
+            light_width = min(0.075, max(0.045, (outer_end - inner_end) * 0.35))
+            for side, edge_distance in (("left", inner_start), ("right", inner_end)):
+                span = (
+                    (max(outer_start, edge_distance - light_width), edge_distance)
+                    if side == "left"
+                    else (edge_distance, min(outer_end, edge_distance + light_width))
+                )
+                if span[1] - span[0] > 0.012:
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_telos_door_light_{side}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.295,
+                            depth_top=0.295,
+                            z_bottom=floor_z + opening_bottom + 0.10,
+                            z_top=floor_z + opening_top - 0.10,
+                            material=light_material,
+                            metadata={**frame_metadata, "door_frame_part": side, "architecture_role": "telos_door_light"},
+                        )
+                    )
+            continue
+        if door_model in {"dor_ond01", "dor_ond02", "dor_ond03", "dor_ond06"}:
+            # Iziz doors sit inside substantial masonry portals. Rebuild a
+            # closed two-tier surround and reveal so authored walls meet the
+            # retail moving door as solid architecture rather than a paper
+            # cut-out. The exact UTD appearance remains profile-specific.
+            center = max(0.0, min(edge_length, float(opening.center_fraction) * edge_length))
+            half_width = min(edge_length * 0.5, float(opening.width) * 0.5)
+            inner_start = max(0.0, center - half_width)
+            inner_end = min(edge_length, center + half_width)
+            requested_outer_width = float(
+                metadata.get("door_outer_width_m")
+                or metadata.get("door_frame_width_m")
+                or (float(opening.width) + 0.55)
+            )
+            outer_half = min(edge_length * 0.5, max(half_width + 0.20, requested_outer_width * 0.5))
+            outer_start = max(0.0, center - outer_half)
+            outer_end = min(edge_length, center + outer_half)
+            opening_bottom = max(0.0, float(opening.bottom))
+            opening_top = min(wall_height - 0.01, opening_bottom + float(opening.height))
+            outer_top = min(
+                wall_height - 0.005,
+                max(
+                    opening_top + 0.20,
+                    float(metadata.get("door_outer_height_m") or metadata.get("door_frame_height_m") or (opening_top + 0.40)),
+                ),
+            )
+            frame_metadata = {
+                **common,
+                "opening_name": str(opening.name or ""),
+                "door_model_resref": door_model,
+                "door_aperture_width_m": float(opening.width),
+                "architecture_role": "onderon_door_portal",
+                "surface_role": "architectural_detail",
+                "vanilla_measurement_source": "502OND/504OND/506OND/512OND retail door hooks",
+            }
+            # The retail Onderon moving assemblies occupy as much as 0.617 m
+            # through the wall (DOR_OND01..03 measured model bounds).  A front
+            # surround alone lets that actor intersect or float outside a
+            # paper-thin authored facade.  Enclose it in a nearly one-metre
+            # masonry return, with the majority of that depth behind the room
+            # edge just as the stock Iziz modules do.
+            structural_depth_back = -0.68
+            structural_depth_front = 0.30
+            structural_spans = (
+                ("left", (outer_start, inner_start), floor_z + opening_bottom, floor_z + outer_top),
+                ("right", (inner_end, outer_end), floor_z + opening_bottom, floor_z + outer_top),
+                ("lintel", (outer_start, outer_end), floor_z + opening_top, floor_z + outer_top),
+            )
+            for part, span, z0, z1 in structural_spans:
+                meshes.extend(
+                    _architecture_closed_wall_prism_meshes(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_onderon_door_structural_{part}",
+                        start=start,
+                        end=end,
+                        span=span,
+                        depth_back=structural_depth_back,
+                        depth_front=structural_depth_front,
+                        z_bottom=z0,
+                        z_top=z1,
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "door_frame_part": part,
+                            "architecture_role": "onderon_door_structural_return",
+                            "door_wall_depth_m": structural_depth_front - structural_depth_back,
+                        },
+                    )
+                )
+            for tier, depth, lateral, material in (
+                ("outer", 0.32, 0.0, trim_material),
+                ("inner", 0.45, 0.11, infill_material),
+            ):
+                tier_start = min(inner_start, outer_start + lateral)
+                tier_end = max(inner_end, outer_end - lateral)
+                tier_top = max(opening_top + 0.05, outer_top - lateral * 0.30)
+                for part, span, z0, z1 in (
+                    ("left", (tier_start, inner_start), floor_z + opening_bottom, floor_z + tier_top),
+                    ("right", (inner_end, tier_end), floor_z + opening_bottom, floor_z + tier_top),
+                    ("lintel", (tier_start, tier_end), floor_z + opening_top, floor_z + tier_top),
+                ):
+                    if span[1] - span[0] <= 0.012 or z1 - z0 <= 0.012:
+                        continue
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_onderon_door_{tier}_{part}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=depth,
+                            depth_top=depth,
+                            z_bottom=z0,
+                            z_top=z1,
+                            material=material,
+                            metadata={
+                                **frame_metadata,
+                                "door_frame_tier": tier,
+                                "door_frame_part": part,
+                                "beveled_geometry": True,
+                            },
+                        )
+                    )
+
+            tx = (float(end[0]) - float(start[0])) / max(edge_length, 1.0e-8)
+            ty = (float(end[1]) - float(start[1])) / max(edge_length, 1.0e-8)
+            nx, ny = -ty, tx
+
+            def portal_point(distance: float, depth: float, z_value: float) -> Vec3:
+                return (
+                    float(start[0]) + tx * float(distance) + nx * float(depth),
+                    float(start[1]) + ty * float(distance) + ny * float(depth),
+                    float(z_value),
+                )
+
+            # The structural prism owns the reveal up to 0.30 m.  Continue
+            # from that boundary instead of drawing a second coplanar reveal
+            # across it.  The continuous room/stock floor is the authoritative
+            # threshold surface, so no raised duplicate floor plane is emitted.
+            reveal_start = structural_depth_front
+            reveal_depth = 0.48
+            for reveal, vertices in (
+                (
+                    "left",
+                    (
+                        portal_point(inner_start, reveal_start, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_start, reveal_start, floor_z + opening_top),
+                    ),
+                ),
+                (
+                    "right",
+                    (
+                        portal_point(inner_end, reveal_start, floor_z + opening_bottom),
+                        portal_point(inner_end, reveal_start, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_bottom),
+                    ),
+                ),
+                (
+                    "lintel",
+                    (
+                        portal_point(inner_start, reveal_start, floor_z + opening_top),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_start, floor_z + opening_top),
+                    ),
+                ),
+            ):
+                meshes.append(
+                    _planar_surface_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_onderon_door_reveal_{reveal}",
+                        vertices=vertices,
+                        faces=((0, 1, 2), (0, 2, 3), (2, 1, 0), (3, 2, 0)),
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "door_frame_part": reveal,
+                            "sealed_transition_reveal": True,
+                        },
+                    )
+                )
+            continue
+        if door_model == "dor_lts02":
+            # Taris apartment doors are carried by a shallow but complete
+            # service-wall cassette.  Treating the aperture as a boolean cut
+            # left every profiled panel course exposed at the jambs.  Build a
+            # closed return first, then layer the familiar trim/light surround
+            # in front of it so the result remains clean from either room.
+            center = max(0.0, min(edge_length, float(opening.center_fraction) * edge_length))
+            half_width = min(edge_length * 0.5, float(opening.width) * 0.5)
+            inner_start = max(0.0, center - half_width)
+            inner_end = min(edge_length, center + half_width)
+            requested_outer_width = float(
+                metadata.get("door_outer_width_m")
+                or metadata.get("door_frame_width_m")
+                or (float(opening.width) + 0.42)
+            )
+            outer_half = min(edge_length * 0.5, max(half_width + 0.16, requested_outer_width * 0.5))
+            outer_start = max(0.0, center - outer_half)
+            outer_end = min(edge_length, center + outer_half)
+            opening_bottom = max(0.0, float(opening.bottom))
+            opening_top = min(wall_height - 0.01, opening_bottom + float(opening.height))
+            outer_top = min(
+                wall_height - 0.005,
+                max(
+                    opening_top + 0.12,
+                    float(metadata.get("door_outer_height_m") or metadata.get("door_frame_height_m") or 2.65),
+                ),
+            )
+            frame_metadata = {
+                **common,
+                "opening_name": str(opening.name or ""),
+                "door_model_resref": "dor_lts02",
+                "door_aperture_width_m": float(opening.width),
+                "architecture_role": "taris_door_portal",
+                "surface_role": "architectural_detail",
+                "vanilla_measurement_source": "DOR_LTS02 + m02aa_01a WOK threshold",
+            }
+            structural_depth_back = -0.34
+            structural_depth_front = 0.18
+            for part, span, z0, z1 in (
+                ("left", (outer_start, inner_start), floor_z + opening_bottom, floor_z + outer_top),
+                ("right", (inner_end, outer_end), floor_z + opening_bottom, floor_z + outer_top),
+                ("lintel", (outer_start, outer_end), floor_z + opening_top, floor_z + outer_top),
+            ):
+                meshes.extend(
+                    _architecture_closed_wall_prism_meshes(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_taris_door_structural_{part}",
+                        start=start,
+                        end=end,
+                        span=span,
+                        depth_back=structural_depth_back,
+                        depth_front=structural_depth_front,
+                        z_bottom=z0,
+                        z_top=z1,
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "door_frame_part": part,
+                            "architecture_role": "taris_door_structural_return",
+                            "door_wall_depth_m": structural_depth_front - structural_depth_back,
+                        },
+                    )
+                )
+            for tier, depth, lateral, material in (
+                ("outer", 0.205, 0.0, trim_material),
+                ("inner", 0.275, 0.065, infill_material),
+            ):
+                tier_start = min(inner_start, outer_start + lateral)
+                tier_end = max(inner_end, outer_end - lateral)
+                tier_top = max(opening_top + 0.025, outer_top - lateral * 0.25)
+                for part, span, z0, z1 in (
+                    ("left", (tier_start, inner_start), floor_z + opening_bottom, floor_z + tier_top),
+                    ("right", (inner_end, tier_end), floor_z + opening_bottom, floor_z + tier_top),
+                    ("lintel", (tier_start, tier_end), floor_z + opening_top, floor_z + tier_top),
+                ):
+                    if span[1] - span[0] <= 0.012 or z1 - z0 <= 0.012:
+                        continue
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_taris_door_{tier}_{part}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=depth,
+                            depth_top=depth,
+                            z_bottom=z0,
+                            z_top=z1,
+                            material=material,
+                            metadata={
+                                **frame_metadata,
+                                "architecture_role": f"taris_door_frame_{tier}",
+                                "door_frame_tier": tier,
+                                "door_frame_part": part,
+                                "beveled_geometry": True,
+                            },
+                        )
+                    )
+
+            tx = (float(end[0]) - float(start[0])) / max(edge_length, 1.0e-8)
+            ty = (float(end[1]) - float(start[1])) / max(edge_length, 1.0e-8)
+            nx, ny = -ty, tx
+
+            def portal_point(distance: float, depth: float, z_value: float) -> Vec3:
+                return (
+                    float(start[0]) + tx * float(distance) + nx * float(depth),
+                    float(start[1]) + ty * float(distance) + ny * float(depth),
+                    float(z_value),
+                )
+
+            reveal_start = structural_depth_front
+            reveal_depth = 0.30
+            for reveal, vertices in (
+                (
+                    "left",
+                    (
+                        portal_point(inner_start, reveal_start, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_bottom),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_start, reveal_start, floor_z + opening_top),
+                    ),
+                ),
+                (
+                    "right",
+                    (
+                        portal_point(inner_end, reveal_start, floor_z + opening_bottom),
+                        portal_point(inner_end, reveal_start, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_bottom),
+                    ),
+                ),
+                (
+                    "lintel",
+                    (
+                        portal_point(inner_start, reveal_start, floor_z + opening_top),
+                        portal_point(inner_start, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_depth, floor_z + opening_top),
+                        portal_point(inner_end, reveal_start, floor_z + opening_top),
+                    ),
+                ),
+            ):
+                meshes.append(
+                    _planar_surface_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_taris_door_reveal_{reveal}",
+                        vertices=vertices,
+                        faces=((0, 1, 2), (0, 2, 3), (2, 1, 0), (3, 2, 0)),
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "architecture_role": "taris_door_transition_reveal",
+                            "door_frame_part": reveal,
+                            "sealed_transition_reveal": True,
+                        },
+                    )
+                )
+            for side, edge_distance in (("left", inner_start), ("right", inner_end)):
+                light_width = min(0.07, max(0.035, (outer_end - inner_end) * 0.35))
+                span = (
+                    (max(outer_start, edge_distance - light_width), edge_distance)
+                    if side == "left"
+                    else (edge_distance, min(outer_end, edge_distance + light_width))
+                )
+                if span[1] - span[0] <= 0.012:
+                    continue
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_taris_door_light_{side}",
+                        start=start,
+                        end=end,
+                        span_bottom=span,
+                        span_top=None,
+                        depth_bottom=0.29,
+                        depth_top=0.29,
+                        z_bottom=floor_z + opening_bottom + 0.08,
+                        z_top=floor_z + opening_top - 0.08,
+                        material=light_material,
+                        metadata={
+                            **frame_metadata,
+                            "architecture_role": "taris_door_light",
+                            "door_frame_part": side,
+                        },
+                    )
+                )
+            continue
+        if door_model != "dor_lhr01":
+            continue
+        center = max(0.0, min(edge_length, float(opening.center_fraction) * edge_length))
+        half_width = min(edge_length * 0.5, float(opening.width) * 0.5)
+        inner_start = max(0.0, center - half_width)
+        inner_end = min(edge_length, center + half_width)
+        requested_outer_width = float(
+            metadata.get("door_outer_width_m")
+            or metadata.get("door_frame_width_m")
+            or (float(opening.width) + 0.44)
+        )
+        outer_half = min(edge_length * 0.5, max(half_width + 0.12, requested_outer_width * 0.5))
+        outer_start = max(0.0, center - outer_half)
+        outer_end = min(edge_length, center + outer_half)
+        trim_width = max(0.12, min(inner_start - outer_start, outer_end - inner_end))
+        opening_bottom = max(0.0, float(opening.bottom))
+        opening_top = min(wall_height - 0.015, opening_bottom + float(opening.height))
+        outer_top = min(
+            wall_height - 0.015,
+            max(
+                opening_top + trim_width,
+                float(metadata.get("door_outer_height_m") or metadata.get("door_frame_height_m") or 3.60),
+            ),
+        )
+        frame_metadata = {
+            **common,
+            "opening_name": str(opening.name or ""),
+            "door_model_resref": "dor_lhr01",
+            "architecture_role": "endar_door_frame",
+            "surface_role": "architectural_detail",
+            "vanilla_measurement_source": "DOR_LHR01 + m01aa_08c bulkhead contour",
+            "visible_aperture_profile": "chamfered_octagon",
+        }
+        parts = (
+            ("left", (outer_start, inner_start), floor_z + opening_bottom, floor_z + outer_top),
+            ("right", (inner_end, outer_end), floor_z + opening_bottom, floor_z + outer_top),
+            ("lintel", (outer_start, outer_end), floor_z + opening_top, floor_z + outer_top),
+        )
+        structural_depth_back = -0.52
+        structural_depth_front = 0.13
+        for part, span, z0, z1 in parts:
+            meshes.extend(
+                _architecture_closed_wall_prism_meshes(
+                    name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_endar_door_structural_{part}",
+                    start=start,
+                    end=end,
+                    span=span,
+                    depth_back=structural_depth_back,
+                    depth_front=structural_depth_front,
+                    z_bottom=z0,
+                    z_top=z1,
+                    material=infill_material,
+                    metadata={
+                        **frame_metadata,
+                        "door_frame_part": part,
+                        "architecture_role": "endar_door_structural_return",
+                        "bulkhead_surface_family": "lhr_wall01",
+                        "door_wall_depth_m": structural_depth_front - structural_depth_back,
+                    },
+                )
+            )
+        for part, span, z0, z1 in parts:
+            if span[1] - span[0] <= 0.015 or z1 - z0 <= 0.015:
+                continue
+            meshes.append(
+                _architecture_wall_mesh(
+                    name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_door_frame_{part}",
+                    start=start,
+                    end=end,
+                    span_bottom=span,
+                    span_top=None,
+                    depth_bottom=0.145,
+                    depth_top=0.145,
+                    z_bottom=z0,
+                    z_top=z1,
+                    material=infill_material,
+                    metadata={
+                        **frame_metadata,
+                        "door_frame_part": part,
+                        "architecture_role": "endar_door_bulkhead_backing",
+                        "bulkhead_surface_family": "lhr_wall01",
+                    },
+                )
+            )
+        # DOR_LHR01's ``trans`` mesh is a rectangular 6.160 x 3.010 collision
+        # envelope, but the visible door and the m01aa_08c wall aperture are
+        # chamfered octagons. A rectangular authored reveal is therefore
+        # visibly wrong even though its gameplay bounds are correct. Fill the
+        # four collision-envelope corners with the white bulkhead material and
+        # continue every diagonal through the wall depth.
+        tx = (float(end[0]) - float(start[0])) / max(edge_length, 1.0e-8)
+        ty = (float(end[1]) - float(start[1])) / max(edge_length, 1.0e-8)
+        nx, ny = -ty, tx
+
+        def portal_point(distance: float, depth: float, z_value: float) -> Vec3:
+            return (
+                float(start[0]) + tx * float(distance) + nx * float(depth),
+                float(start[1]) + ty * float(distance) + ny * float(depth),
+                float(z_value),
+            )
+
+        face_depth = 0.142
+        chamfer = min(0.62, max(0.28, float(opening.height) * 0.17), float(opening.width) * 0.14)
+        corner_rows = (
+            (
+                "upper_left",
+                (
+                    portal_point(inner_start, face_depth, floor_z + opening_top),
+                    portal_point(inner_start + chamfer, face_depth, floor_z + opening_top),
+                    portal_point(inner_start, face_depth, floor_z + opening_top - chamfer),
+                ),
+            ),
+            (
+                "upper_right",
+                (
+                    portal_point(inner_end, face_depth, floor_z + opening_top),
+                    portal_point(inner_end, face_depth, floor_z + opening_top - chamfer),
+                    portal_point(inner_end - chamfer, face_depth, floor_z + opening_top),
+                ),
+            ),
+            (
+                "lower_left",
+                (
+                    portal_point(inner_start, face_depth, floor_z + opening_bottom),
+                    portal_point(inner_start, face_depth, floor_z + opening_bottom + chamfer),
+                    portal_point(inner_start + chamfer, face_depth, floor_z + opening_bottom),
+                ),
+            ),
+            (
+                "lower_right",
+                (
+                    portal_point(inner_end, face_depth, floor_z + opening_bottom),
+                    portal_point(inner_end - chamfer, face_depth, floor_z + opening_bottom),
+                    portal_point(inner_end, face_depth, floor_z + opening_bottom + chamfer),
+                ),
+            ),
+        )
+        for corner, vertices in corner_rows:
+            meshes.append(
+                _planar_surface_mesh(
+                    name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_door_transition_{corner}",
+                    vertices=vertices,
+                    faces=((0, 1, 2), (2, 1, 0)),
+                    material=infill_material,
+                    metadata={
+                        **frame_metadata,
+                        "architecture_role": "endar_door_transition_infill",
+                        "door_frame_part": corner,
+                        "sealed_transition_corner": True,
+                    },
+                )
+            )
+
+        reveal_start = structural_depth_front
+        reveal_depth = 0.26
+        reveal_rows = (
+            (
+                "left",
+                (
+                    portal_point(inner_start, reveal_start, floor_z + opening_bottom + chamfer),
+                    portal_point(inner_start, reveal_depth, floor_z + opening_bottom + chamfer),
+                    portal_point(inner_start, reveal_depth, floor_z + opening_top - chamfer),
+                    portal_point(inner_start, reveal_start, floor_z + opening_top - chamfer),
+                ),
+            ),
+            (
+                "right",
+                (
+                    portal_point(inner_end, reveal_start, floor_z + opening_bottom + chamfer),
+                    portal_point(inner_end, reveal_start, floor_z + opening_top - chamfer),
+                    portal_point(inner_end, reveal_depth, floor_z + opening_top - chamfer),
+                    portal_point(inner_end, reveal_depth, floor_z + opening_bottom + chamfer),
+                ),
+            ),
+            (
+                "lintel",
+                (
+                    portal_point(inner_start + chamfer, reveal_start, floor_z + opening_top),
+                    portal_point(inner_start + chamfer, reveal_depth, floor_z + opening_top),
+                    portal_point(inner_end - chamfer, reveal_depth, floor_z + opening_top),
+                    portal_point(inner_end - chamfer, reveal_start, floor_z + opening_top),
+                ),
+            ),
+            (
+                "upper_left_diagonal",
+                (
+                    portal_point(inner_start, reveal_start, floor_z + opening_top - chamfer),
+                    portal_point(inner_start, reveal_depth, floor_z + opening_top - chamfer),
+                    portal_point(inner_start + chamfer, reveal_depth, floor_z + opening_top),
+                    portal_point(inner_start + chamfer, reveal_start, floor_z + opening_top),
+                ),
+            ),
+            (
+                "upper_right_diagonal",
+                (
+                    portal_point(inner_end - chamfer, reveal_start, floor_z + opening_top),
+                    portal_point(inner_end - chamfer, reveal_depth, floor_z + opening_top),
+                    portal_point(inner_end, reveal_depth, floor_z + opening_top - chamfer),
+                    portal_point(inner_end, reveal_start, floor_z + opening_top - chamfer),
+                ),
+            ),
+            (
+                "lower_left_diagonal",
+                (
+                    portal_point(inner_start + chamfer, reveal_start, floor_z + opening_bottom),
+                    portal_point(inner_start + chamfer, reveal_depth, floor_z + opening_bottom),
+                    portal_point(inner_start, reveal_depth, floor_z + opening_bottom + chamfer),
+                    portal_point(inner_start, reveal_start, floor_z + opening_bottom + chamfer),
+                ),
+            ),
+            (
+                "lower_right_diagonal",
+                (
+                    portal_point(inner_end, reveal_start, floor_z + opening_bottom + chamfer),
+                    portal_point(inner_end, reveal_depth, floor_z + opening_bottom + chamfer),
+                    portal_point(inner_end - chamfer, reveal_depth, floor_z + opening_bottom),
+                    portal_point(inner_end - chamfer, reveal_start, floor_z + opening_bottom),
+                ),
+            ),
+        )
+        for reveal, vertices in reveal_rows:
+            meshes.append(
+                _planar_surface_mesh(
+                    name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_door_reveal_{reveal}",
+                    vertices=vertices,
+                    faces=((0, 1, 2), (0, 2, 3), (2, 1, 0), (3, 2, 0)),
+                    material=trim_material,
+                    metadata={
+                        **frame_metadata,
+                        "architecture_role": "endar_door_transition_reveal",
+                        "door_frame_part": reveal,
+                        "sealed_transition_reveal": True,
+                        "octagonal_reveal": True,
+                    },
+                )
+            )
+        light_width = min(0.055, trim_width * 0.33)
+        for side, edge_distance in (("left", inner_start), ("right", inner_end)):
+            span = (
+                max(outer_start, edge_distance - light_width)
+                if side == "left"
+                else edge_distance,
+                edge_distance
+                if side == "left"
+                else min(outer_end, edge_distance + light_width),
+            )
+            if span[1] - span[0] <= 0.012:
+                continue
+            meshes.append(
+                _architecture_wall_mesh(
+                    name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_door_frame_light_{side}",
+                    start=start,
+                    end=end,
+                    span_bottom=span,
+                    span_top=None,
+                    depth_bottom=0.158,
+                    depth_top=0.158,
+                    z_bottom=floor_z + opening_bottom + chamfer + 0.03,
+                    z_top=floor_z + opening_top - chamfer - 0.03,
+                    material=light_material,
+                    metadata={
+                        **frame_metadata,
+                        "architecture_role": "endar_door_frame_light",
+                        "door_frame_part": side,
+                    },
+                )
+            )
+    return tuple(meshes)
+
+
+def architecture_shell_profile(primitive: FloorPlanRoomPrimitive) -> str:
+    """Return the structural cross-section used by an architecture recipe."""
+
+    explicit = str(primitive.metadata.get("architecture_shell_profile", "") or "").strip().lower()
+    if explicit:
+        return explicit
+    architecture = str(primitive.metadata.get("architecture_profile", "") or "").strip().lower()
+    if architecture == "endar_spire":
+        return "endar_corridor"
+    if architecture == "harbinger":
+        return "harbinger_corridor"
+    if architecture == "telos_citadel":
+        return "telos_citadel_residential"
+    if architecture == "rhen_var":
+        return "rhen_var_landing_courtyard"
+    if architecture == "onderon_city":
+        return "onderon_city_courtyard"
+    if architecture == "onderon_cantina":
+        return "onderon_cantina_gallery"
+    if architecture == "onderon_sky_ramp":
+        return "onderon_sky_ramp_court"
+    if architecture == "onderon_palace":
+        return "onderon_palace_gallery"
+    if architecture == "taris_apartments":
+        return "taris_apartment"
+    if architecture == "shadowlands":
+        return "shadowlands_root_wall"
+    if architecture == "korriban_tombs":
+        return "korriban_tomb"
+    if architecture == "korriban_tombs_k2":
+        return "korriban_tomb_ruined"
+    if architecture in {"korriban_caves_k1", "korriban_caves_k2"}:
+        return "korriban_cave"
+    return ""
+
+
+def _architecture_profile_rings(
+    points: tuple[Vec2, ...],
+    depths: tuple[float, ...],
+) -> tuple[dict[float, tuple[Vec2, ...]], float]:
+    """Inset a convex footprint at every cross-section depth.
+
+    Narrow rooms scale the complete profile uniformly instead of allowing one
+    band to fold through another.  This keeps the silhouette recognisable while
+    preserving valid, consistently wound topology for arbitrary convex plans.
+    """
+
+    unique = tuple(sorted({max(0.0, float(depth)) for depth in depths}))
+    scale = 1.0
+    while scale >= 0.18:
+        try:
+            rings = {
+                depth: points if depth <= 1.0e-8 else inset_floor_plan_points(points, depth * scale)
+                for depth in unique
+            }
+            return rings, scale
+        except ValueError:
+            scale *= 0.75
+    raise ValueError("This room is too narrow for the selected architecture contour.")
+
+
+def _architecture_profile_segment_mesh(
+    *,
+    name: str,
+    bottom_ring: tuple[Vec2, ...],
+    top_ring: tuple[Vec2, ...],
+    edge_index: int,
+    span: tuple[float, float],
+    source_start: Vec2,
+    source_end: Vec2,
+    edge_length: float,
+    z_bottom: float,
+    z_top: float,
+    material: PrimitiveMaterial,
+    metadata: dict[str, Any],
+    floor_facing: bool = False,
+) -> PrimitiveMesh:
+    """Create one opening-aware quad between two inset footprint rings."""
+
+    next_index = (edge_index + 1) % len(bottom_ring)
+    tx = (source_end[0] - source_start[0]) / max(edge_length, 1.0e-8)
+    ty = (source_end[1] - source_start[1]) / max(edge_length, 1.0e-8)
+
+    def ring_point(ring: tuple[Vec2, ...], distance: float) -> Vec2:
+        if distance <= 1.0e-8:
+            return ring[edge_index]
+        if distance >= edge_length - 1.0e-8:
+            return ring[next_index]
+        ring_start = ring[edge_index]
+        start_shift = (ring_start[0] - source_start[0]) * tx + (ring_start[1] - source_start[1]) * ty
+        along = distance - start_shift
+        return (ring_start[0] + tx * along, ring_start[1] + ty * along)
+
+    bottom_start = ring_point(bottom_ring, span[0])
+    bottom_end = ring_point(bottom_ring, span[1])
+    top_start = ring_point(top_ring, span[0])
+    top_end = ring_point(top_ring, span[1])
+    if floor_facing:
+        vertices = (
+            (bottom_start[0], bottom_start[1], z_bottom),
+            (bottom_end[0], bottom_end[1], z_bottom),
+            (top_end[0], top_end[1], z_top),
+            (top_start[0], top_start[1], z_top),
+        )
+    else:
+        # With a CCW footprint, bottom -> top -> top-next winds toward the
+        # room interior.  The floor shoulder uses the opposite winding so its
+        # normal remains predominantly upward.
+        vertices = (
+            (bottom_start[0], bottom_start[1], z_bottom),
+            (top_start[0], top_start[1], z_top),
+            (top_end[0], top_end[1], z_top),
+            (bottom_end[0], bottom_end[1], z_bottom),
+        )
+    return _planar_surface_mesh(
+        name=name,
+        vertices=vertices,
+        faces=((0, 1, 2), (0, 2, 3)),
+        material=material,
+        metadata={**dict(material.metadata), **metadata},
+    )
+
+
+def build_floor_plan_profiled_shell_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[PrimitiveMesh, ...]:
+    """Compile the actual room envelope for a vanilla architecture profile.
+
+    Endar corridors are a faceted tunnel, not a decorated box. Taris apartment
+    rooms use their own lower service plinth, low wall-panel field, illuminated
+    utility belt, inset ceiling shoulder, and recessed 2.55 m ceiling. The
+    selected measured cross-section is swept around the user's convex
+    footprint, and modular ribs follow the same contour so the style remains
+    readable with neutral materials.
+    """
+
+    shell_profile = architecture_shell_profile(primitive)
+    if shell_profile not in {
+        "endar_corridor",
+        "endar_command_deck",
+        "endar_crew_quarters",
+        "harbinger_corridor",
+        "telos_citadel_residential",
+        "telos_citadel_civic",
+        "telos_citadel_concourse",
+        "rhen_var_landing_courtyard",
+        "rhen_var_temple_interior",
+        "rhen_var_catacomb_tunnel",
+        "onderon_city_courtyard",
+        "onderon_city_square",
+        "onderon_city_spaceport",
+        "onderon_cantina_gallery",
+        "onderon_cantina_lounge",
+        "onderon_sky_ramp_court",
+        "onderon_sky_ramp_terrace",
+        "onderon_palace_gallery",
+        "onderon_palace_state_hall",
+        "onderon_palace_museum",
+        "taris_apartment",
+        "taris_residential_corridor",
+        "taris_living_suite",
+        "korriban_tomb",
+        "korriban_tomb_chamber",
+        "korriban_tomb_junction",
+        "korriban_tomb_burial",
+        "korriban_tomb_monumental",
+        "korriban_tomb_ruined",
+    } or not primitive.include_walls:
+        return ()
+    validation = validate_floor_plan_room_primitive(primitive)
+    if not validation.ok:
+        raise ValueError("; ".join(validation.blocking_issues))
+    height = float(primitive.wall_height)
+    minimum_height = {
+        "taris_apartment": 2.10,
+        "taris_residential_corridor": 2.10,
+        "taris_living_suite": 2.10,
+        "endar_command_deck": 3.75,
+        "endar_crew_quarters": 3.20,
+        "telos_citadel_residential": 3.50,
+        "telos_citadel_civic": 5.40,
+        "telos_citadel_concourse": 6.10,
+        "rhen_var_landing_courtyard": 5.80,
+        "rhen_var_temple_interior": 7.20,
+        "rhen_var_catacomb_tunnel": 4.20,
+        "onderon_city_courtyard": 7.50,
+        "onderon_city_square": 9.25,
+        "onderon_city_spaceport": 8.00,
+        "onderon_cantina_gallery": 6.80,
+        "onderon_cantina_lounge": 6.00,
+        "onderon_sky_ramp_court": 11.25,
+        "onderon_sky_ramp_terrace": 14.00,
+        "onderon_palace_gallery": 5.40,
+        "onderon_palace_state_hall": 11.50,
+        "onderon_palace_museum": 5.40,
+        "korriban_tomb": 3.85,
+        "korriban_tomb_chamber": 9.75,
+        "korriban_tomb_junction": 9.75,
+        "korriban_tomb_burial": 9.75,
+        "korriban_tomb_monumental": 20.0,
+        "korriban_tomb_ruined": 5.25,
+    }.get(shell_profile, 2.35)
+    if height < minimum_height:
+        label = (
+            "Taris apartment"
+            if shell_profile.startswith("taris_")
+            else "Telos Citadel room"
+            if shell_profile.startswith("telos_citadel_")
+            else "Rhen Var ruin or temple room"
+            if shell_profile.startswith("rhen_var_")
+            else "Onderon exterior court"
+            if shell_profile.startswith(("onderon_city_", "onderon_sky_ramp_"))
+            else "Onderon interior"
+            if shell_profile.startswith(("onderon_cantina_", "onderon_palace_"))
+            else "Korriban monumental tomb hall"
+            if shell_profile == "korriban_tomb_monumental"
+            else "Korriban tomb room"
+            if shell_profile
+            in {
+                "korriban_tomb_chamber",
+                "korriban_tomb_junction",
+                "korriban_tomb_burial",
+            }
+            else "Korriban tomb"
+            if shell_profile in {"korriban_tomb", "korriban_tomb_ruined"}
+            else "Republic-warship corridor"
+        )
+        raise ValueError(f"The {label} contour requires a wall height of at least {minimum_height:.2f} m.")
+    points = _ccw_points(_normalise_points(primitive.points))
+    room_resref = _normalise_resref(primitive.room_resref)
+    floor_z = float(primitive.z)
+    accents = tuple(
+        str(value or "").strip().lower()
+        for value in tuple(primitive.metadata.get("architecture_accent_textures") or ())
+        if str(value or "").strip()
+    )
+    architecture_profile = str(primitive.metadata.get("architecture_profile", "") or "").strip().lower()
+    if architecture_profile == "harbinger":
+        defaults = ("har_wl01", "har_tr02", "har_lt01", "har_wl09")
+    elif architecture_profile == "taris_apartments":
+        defaults = ("lts_pwall04", "lts_trim01", "lts_lite08", "lts_gwall01")
+    elif architecture_profile == "telos_citadel":
+        defaults = ("tel_wl03", "tel_tr04", "tel_lt02", "tel_hcl1")
+    elif architecture_profile == "rhen_var":
+        defaults = ("gr_rvstone", "gr_rvfloor", "gr_rvsnow", "gr_rvstone")
+    elif architecture_profile == "onderon_city":
+        defaults = ("ond_tr04", "ond_wl08", "ond_lt02", "ond_wl06")
+    elif architecture_profile == "onderon_cantina":
+        defaults = ("ond_wl11", "ond_tr03", "ond_lt03", "ond_wl06")
+    elif architecture_profile == "onderon_sky_ramp":
+        defaults = ("ond_tr05", "ond_wl10", "ond_lt02", "ond_wl05")
+    elif architecture_profile == "onderon_palace":
+        defaults = ("ond_tr06", "ond_wl10", "ond_lt03", "ond_orn")
+    elif architecture_profile == "korriban_tombs":
+        defaults = ("lko_wal09", "lko_wal08", "lko_rocks", "lko_wal07")
+    elif architecture_profile == "korriban_tombs_k2":
+        defaults = ("kor_wal09", "kor_tr01", "kor_rocks", "kor_wal07a")
+    else:
+        defaults = ("lhr_red02", "lhr_trim01", "lhr_lit01", "lhr_wall06")
+    textures = tuple((accents + defaults)[:4])
+    if len(textures) < 4:
+        textures = defaults
+    floor_edge_texture = (
+        "har_fl01"
+        if architecture_profile == "harbinger"
+        else "tel_fl05"
+        if architecture_profile == "telos_citadel"
+        else "gr_rvfloor"
+        if architecture_profile == "rhen_var"
+        else "ond_fl02"
+        if architecture_profile == "onderon_city"
+        else "ond_fl08"
+        if architecture_profile == "onderon_cantina"
+        else "ond_fl03"
+        if architecture_profile == "onderon_sky_ramp"
+        else "ond_fl07"
+        if architecture_profile == "onderon_palace"
+        else "lts_floor01"
+        if architecture_profile == "taris_apartments"
+        else "lko_flr03"
+        if architecture_profile == "korriban_tombs"
+        else "kor_flr03"
+        if architecture_profile == "korriban_tombs_k2"
+        else "lhr_flr02"
+    )
+    floor_edge_material = _architecture_material(floor_edge_texture)
+    accent_material = _architecture_material(textures[0])
+    trim_material = _architecture_material(textures[1])
+    light_material = _architecture_material(textures[2], luminous=True)
+    utility_material = _architecture_material(textures[3])
+    wall_material = primitive.wall_material or primitive.material
+    ceiling_material = primitive.ceiling_material or wall_material
+
+    korriban_profiles = {
+        "korriban_tomb",
+        "korriban_tomb_chamber",
+        "korriban_tomb_junction",
+        "korriban_tomb_burial",
+        "korriban_tomb_monumental",
+        "korriban_tomb_ruined",
+    }
+    if shell_profile in korriban_profiles:
+        is_ruined = shell_profile == "korriban_tomb_ruined"
+        if shell_profile == "korriban_tomb_chamber":
+            # The playable chambers in m37aa_12/m38aa_08 are roughly
+            # 27.266 × 30.0 m with a 10.35 m floor-to-vault rise. m38aa_11
+            # confirms a 3.0 m relief cadence, while m39aa_07 contributes
+            # 3.45 m corner supports and the corbelled high-vault silhouette.
+            span_x = max(point[0] for point in points) - min(point[0] for point in points)
+            span_y = max(point[1] for point in points) - min(point[1] for point in points)
+            if min(span_x, span_y) < 9.0 or abs(polygon_signed_area(points)) < 81.0:
+                raise ValueError(
+                    "The Korriban reliquary chamber contour needs a footprint at least "
+                    "9 m wide and 81 m²; choose Carved tomb corridor for narrower plans."
+                )
+            nominal_height = 10.35
+            wall_material = _architecture_material("lko_wal07")
+            accent_material = _architecture_material("lko_wal09")
+            trim_material = _architecture_material("lko_wal08")
+            ceiling_material = _architecture_material("lko_rocks")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.08, 0.180 / nominal_height, "chamber_floor_plinth", floor_edge_material, False),
+                (0.22, 0.750 / nominal_height, "chamber_lower_masonry", wall_material, False),
+                (0.38, 1.875 / nominal_height, "chamber_relief_dado", accent_material, False),
+                (0.55, 5.100 / nominal_height, "chamber_relief_wall", accent_material, False),
+                (0.82, 6.300 / nominal_height, "chamber_corbel_course", trim_material, True),
+                (1.15, 7.800 / nominal_height, "chamber_vault_shoulder", wall_material, False),
+                (1.60, 9.150 / nominal_height, "chamber_upper_vault", accent_material, False),
+                (2.10, 1.000, "chamber_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.30
+            bay_target = 3.00
+            rib_role = "sith_chamber_relief_pilaster"
+        elif shell_profile == "korriban_tomb_junction":
+            span_x = max(point[0] for point in points) - min(point[0] for point in points)
+            span_y = max(point[1] for point in points) - min(point[1] for point in points)
+            if min(span_x, span_y) < 10.0 or abs(polygon_signed_area(points)) < 100.0:
+                raise ValueError(
+                    "The Korriban cross-vault junction contour needs a footprint at least "
+                    "10 m wide and 100 m²."
+                )
+            # m38aa_06 measures 10.239 m from its 6.043 m floor to the
+            # 16.282 m cross-vault crown. Its major wall blocks repeat at 4.5 m.
+            nominal_height = 10.24
+            wall_material = _architecture_material("lko_wal07")
+            accent_material = _architecture_material("lko_wal09")
+            trim_material = _architecture_material("lko_wal08")
+            ceiling_material = _architecture_material("lko_rocks")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.10, 0.180 / nominal_height, "junction_floor_plinth", floor_edge_material, False),
+                (0.26, 0.750 / nominal_height, "junction_lower_masonry", wall_material, False),
+                (0.46, 2.100 / nominal_height, "junction_pier_base", accent_material, False),
+                (0.72, 5.250 / nominal_height, "junction_relief_wall", accent_material, False),
+                (1.05, 6.900 / nominal_height, "junction_vault_spring", trim_material, True),
+                (1.55, 8.850 / nominal_height, "junction_cross_vault_shoulder", wall_material, False),
+                (2.25, 1.000, "junction_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.36
+            bay_target = 4.50
+            rib_role = "sith_junction_vault_pier"
+        elif shell_profile == "korriban_tomb_burial":
+            span_x = max(point[0] for point in points) - min(point[0] for point in points)
+            span_y = max(point[1] for point in points) - min(point[1] for point in points)
+            if min(span_x, span_y) < 8.0 or abs(polygon_signed_area(points)) < 64.0:
+                raise ValueError(
+                    "The Korriban burial alcove contour needs a footprint at least "
+                    "8 m wide and 64 m²."
+                )
+            # m38aa_11 measures 10.275 m from the 0.750 m floor to its
+            # 11.025 m vault and uses compact 3 m relief/niche stations.
+            nominal_height = 10.275
+            wall_material = _architecture_material("lko_wal07")
+            accent_material = _architecture_material("lko_wal09")
+            trim_material = _architecture_material("lko_wal08")
+            ceiling_material = _architecture_material("lko_rocks")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.08, 0.180 / nominal_height, "burial_floor_plinth", floor_edge_material, False),
+                (0.22, 0.750 / nominal_height, "burial_lower_masonry", wall_material, False),
+                (0.42, 1.500 / nominal_height, "burial_niche_dado", trim_material, False),
+                (0.60, 5.400 / nominal_height, "burial_niche_wall", accent_material, False),
+                (0.90, 6.600 / nominal_height, "burial_corbel_course", trim_material, True),
+                (1.25, 8.700 / nominal_height, "burial_vault_shoulder", wall_material, False),
+                (1.80, 1.000, "burial_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.26
+            bay_target = 3.00
+            rib_role = "sith_burial_niche_pier"
+        elif shell_profile == "korriban_tomb_monumental":
+            span_x = max(point[0] for point in points) - min(point[0] for point in points)
+            span_y = max(point[1] for point in points) - min(point[1] for point in points)
+            if min(span_x, span_y) < 18.0 or abs(polygon_signed_area(points)) < 324.0:
+                raise ValueError(
+                    "The Korriban monumental tomb hall contour needs a footprint at least "
+                    "18 m wide and 324 m²."
+                )
+            # m39aa_07 measures a 42.0 × 31.5 m principal floor and a
+            # 22.080 m floor-to-vault rise, with 10.5 m wall modules.
+            nominal_height = 22.08
+            wall_material = _architecture_material("lko_wal07")
+            accent_material = _architecture_material("lko_wal09")
+            trim_material = _architecture_material("lko_wal08")
+            ceiling_material = _architecture_material("lko_rocks")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.15, 0.180 / nominal_height, "monumental_floor_plinth", floor_edge_material, False),
+                (0.40, 0.750 / nominal_height, "monumental_lower_masonry", wall_material, False),
+                (0.75, 3.000 / nominal_height, "monumental_pylon_base", accent_material, False),
+                (1.30, 8.000 / nominal_height, "monumental_relief_wall", accent_material, False),
+                (2.00, 12.000 / nominal_height, "monumental_corbel_course", trim_material, True),
+                (3.20, 16.500 / nominal_height, "monumental_upper_pylon", wall_material, False),
+                (4.20, 19.800 / nominal_height, "monumental_vault_shoulder", accent_material, False),
+                (5.40, 1.000, "monumental_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.65
+            bay_target = 10.50
+            rib_role = "sith_monumental_section_pier"
+        elif not is_ruined:
+            # Object1806/Object1753 in m37aa_02 contain the repeated K1 tomb
+            # corridor section.  Their *outside* mesh reaches 10.35 m, but the
+            # walkable interior aperture is only 3.900 m high and 5.400 m
+            # across, with exact lower stations at 0.675 and 1.1625 m.  The
+            # previous shell used the outside rock-cap bounds as headroom,
+            # producing the oversized box reported in visible testing.
+            nominal_height = 3.90
+            wall_material = _architecture_material("lko_wal07")
+            accent_material = _architecture_material("lko_wal09")
+            trim_material = _architecture_material("lko_wal08")
+            ceiling_material = _architecture_material("lko_wal07")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.05, 0.180 / nominal_height, "tomb_floor_plinth", floor_edge_material, False),
+                (0.18, 0.180 / nominal_height, "tomb_floor_plinth_cap", trim_material, True),
+                (0.18, 0.675 / nominal_height, "lower_tomb_masonry", wall_material, False),
+                (0.32, 0.675 / nominal_height, "lower_tomb_step", trim_material, True),
+                (0.32, 1.1625 / nominal_height, "sith_relief_base", accent_material, False),
+                (0.46, 1.1625 / nominal_height, "sith_relief_shelf", trim_material, True),
+                (0.46, 3.300 / nominal_height, "sith_relief_wall", accent_material, False),
+                (0.64, 3.300 / nominal_height, "upper_tomb_step", trim_material, True),
+                (0.64, 3.750 / nominal_height, "upper_tomb_masonry", wall_material, False),
+                (0.82, 3.750 / nominal_height, "tomb_door_crown", trim_material, True),
+                (0.82, 1.000, "recessed_tomb_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.16
+            # The retail corridor shell repeats on a 1.5 m modelling grid.
+            bay_target = 1.50
+            rib_role = "sith_tomb_section_rib"
+        else:
+            # 711KOR is a larger ruined chamber family.  Its usable interiors
+            # cluster around a 6.25 m floor-to-crown range; the much taller
+            # bounds belong to buried rock shells and cloud backdrops.
+            nominal_height = 6.25
+            wall_material = _architecture_material("kor_wal07a")
+            accent_material = _architecture_material("kor_wal09")
+            trim_material = _architecture_material("kor_tr01")
+            ceiling_material = _architecture_material("kor_wal07a")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.10, 0.220 / nominal_height, "ruined_floor_plinth", floor_edge_material, False),
+                (0.24, 0.220 / nominal_height, "broken_floor_course", trim_material, True),
+                (0.24, 0.850 / nominal_height, "ruined_lower_masonry", wall_material, False),
+                (0.42, 0.850 / nominal_height, "ruined_relief_step", trim_material, True),
+                (0.42, 3.900 / nominal_height, "eroded_sith_relief", accent_material, False),
+                (0.72, 3.900 / nominal_height, "broken_vault_shelf", trim_material, True),
+                (0.72, 5.250 / nominal_height, "broken_vault_shoulder", wall_material, False),
+                (1.10, 5.250 / nominal_height, "eroded_sith_crown", accent_material, True),
+                (1.10, 1.000, "ruined_tomb_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.22
+            bay_target = 3.00
+            rib_role = "ruined_sith_tomb_pilaster"
+    elif shell_profile in {
+        "telos_citadel_residential",
+        "telos_citadel_civic",
+        "telos_citadel_concourse",
+    }:
+        wall_material = _architecture_material("tel_wl06")
+        accent_material = _architecture_material("tel_wl03")
+        trim_material = _architecture_material("tel_tr04")
+        light_material = _architecture_material("tel_lt02", luminous=True)
+        ceiling_material = _architecture_material("tel_fl01")
+        if shell_profile == "telos_citadel_residential":
+            # 203TEL/204TEL reusable galleries measure 3.985 m to the upper
+            # wall datum and 5.095 m to the recessed ceiling/light tray.
+            nominal_height = 3.985
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.08, 0.160 / nominal_height, "citadel_floor_edge", floor_edge_material, True),
+                (0.10, 0.650 / nominal_height, "citadel_lower_service_plinth", utility_material, False),
+                (0.18, 2.400 / nominal_height, "citadel_luminous_wall_field", light_material, False),
+                (0.28, 3.247 / nominal_height, "citadel_framed_wall_panel", accent_material, False),
+                (0.62, 3.620 / nominal_height, "citadel_canted_ceiling_shoulder", trim_material, False),
+                (1.10, 1.000, "citadel_recessed_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.10
+            bay_target = 4.00
+            rib_role = "citadel_residential_frame"
+        elif shell_profile == "telos_citadel_civic":
+            # 202TEL/222TEL passages use the same materials at a taller public
+            # scale, with 4.8 m structural crowns below a 5.995 m ceiling.
+            nominal_height = 5.995
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.10, 0.180 / nominal_height, "citadel_civic_floor_edge", floor_edge_material, True),
+                (0.14, 0.800 / nominal_height, "citadel_civic_lower_wall", utility_material, False),
+                (0.24, 2.402 / nominal_height, "citadel_civic_light_belt", light_material, False),
+                (0.36, 3.560 / nominal_height, "citadel_civic_panel_field", accent_material, False),
+                (0.78, 4.800 / nominal_height, "citadel_civic_canted_crown", trim_material, False),
+                (1.38, 1.000, "citadel_civic_ceiling_coffer", ceiling_material, False),
+            )
+            rib_projection = 0.14
+            bay_target = 5.00
+            rib_role = "citadel_civic_frame"
+        else:
+            # Docking and residential hub rooms widen the same section to a
+            # 6.739 m concourse shell with deeper returns and seven-metre bays.
+            nominal_height = 6.739
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.12, 0.200 / nominal_height, "citadel_concourse_floor_edge", floor_edge_material, True),
+                (0.18, 0.900 / nominal_height, "citadel_concourse_lower_wall", utility_material, False),
+                (0.30, 2.650 / nominal_height, "citadel_concourse_light_belt", light_material, False),
+                (0.48, 4.200 / nominal_height, "citadel_concourse_panel_field", accent_material, False),
+                (0.95, 5.450 / nominal_height, "citadel_concourse_upper_return", trim_material, False),
+                (1.62, 1.000, "citadel_concourse_ceiling_coffer", ceiling_material, False),
+            )
+            rib_projection = 0.18
+            bay_target = 7.00
+            rib_role = "citadel_concourse_frame"
+    elif shell_profile.startswith("rhen_var_"):
+        # Rhen Var uses an eight-metre kit rhythm across exterior ruins,
+        # enclosed temple rooms, and compact catacomb links. These are swept
+        # structural sections: the depth changes form real canted shoulders,
+        # corbels, and parapets instead of decorating a flat rectangle.
+        wall_material = _architecture_material("gr_rvstone")
+        accent_material = _architecture_material("gr_rvstone")
+        trim_material = _architecture_material("gr_rvfloor")
+        light_material = _architecture_material("gr_rvsnow")
+        utility_material = _architecture_material("gr_rvfloor")
+        ceiling_material = _architecture_material("gr_rvstone")
+        if shell_profile == "rhen_var_landing_courtyard":
+            nominal_height = 6.40
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.18, 0.220 / nominal_height, "rhen_snow_buried_curb", floor_edge_material, True),
+                (0.34, 0.850 / nominal_height, "rhen_heavy_ruin_plinth", utility_material, False),
+                (0.55, 2.450 / nominal_height, "rhen_battered_lower_wall", wall_material, False),
+                (0.76, 4.650 / nominal_height, "rhen_recessed_frost_stone_field", accent_material, False),
+                (1.06, 5.650 / nominal_height, "rhen_canted_parapet_shoulder", trim_material, True),
+                (1.34, 1.000, "rhen_broken_ruin_parapet", wall_material, False),
+            )
+            rib_projection = 0.34
+            bay_target = 8.00
+            rib_role = "rhen_landing_monumental_buttress"
+        elif shell_profile == "rhen_var_temple_interior":
+            nominal_height = 8.00
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.14, 0.200 / nominal_height, "rhen_temple_floor_plinth", floor_edge_material, True),
+                (0.30, 0.720 / nominal_height, "rhen_temple_carved_dado", utility_material, False),
+                (0.46, 2.300 / nominal_height, "rhen_temple_recessed_relief", accent_material, False),
+                (0.68, 4.900 / nominal_height, "rhen_temple_faceted_wall", wall_material, False),
+                (1.02, 6.250 / nominal_height, "rhen_temple_corbel_course", trim_material, True),
+                (1.42, 7.250 / nominal_height, "rhen_temple_canted_vault_shoulder", accent_material, False),
+                (1.82, 1.000, "rhen_temple_faceted_vault", ceiling_material, False),
+            )
+            rib_projection = 0.42
+            bay_target = 8.00
+            rib_role = "rhen_temple_octagonal_pier"
+        else:
+            nominal_height = 4.80
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.12, 0.160 / nominal_height, "rhen_catacomb_frost_curb", floor_edge_material, True),
+                (0.28, 0.650 / nominal_height, "rhen_catacomb_heavy_plinth", utility_material, False),
+                (0.44, 2.650 / nominal_height, "rhen_catacomb_recessed_stone_field", accent_material, False),
+                (0.76, 3.750 / nominal_height, "rhen_catacomb_canted_vault", wall_material, False),
+                (1.16, 1.000, "rhen_catacomb_corbelled_ceiling", ceiling_material, False),
+            )
+            rib_projection = 0.28
+            bay_target = 8.00
+            rib_role = "rhen_catacomb_module_pier"
+    elif shell_profile.startswith("onderon_"):
+        # The Onderon profiles are measured as architectural sections rather
+        # than texture swaps. Iziz exteriors use a battered masonry base and
+        # stepped parapet; hospitality and palace interiors retain the same
+        # beveled stone language at different bay/ceiling scales.
+        if shell_profile.startswith("onderon_city_"):
+            nominal_height = (
+                10.50
+                if shell_profile == "onderon_city_square"
+                else 9.00
+                if shell_profile == "onderon_city_spaceport"
+                else 8.50
+            )
+            wall_material = _architecture_material("ond_wl05")
+            accent_material = _architecture_material("ond_wl08")
+            trim_material = _architecture_material("ond_tr04")
+            light_material = _architecture_material("ond_lt02", luminous=True)
+            utility_material = _architecture_material("ond_wl06")
+            ceiling_material = _architecture_material("ond_rk01")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.16, 0.240 / nominal_height, "iziz_court_floor_curb", floor_edge_material, True),
+                (0.28, 1.050 / nominal_height, "iziz_battered_stone_dado", utility_material, False),
+                (0.42, 2.850 / nominal_height, "iziz_recessed_facade_field", wall_material, False),
+                (0.58, 3.220 / nominal_height, "iziz_civic_light_belt", light_material, False),
+                (0.74, 5.850 / nominal_height, "iziz_upper_facade_panel", accent_material, False),
+                (1.05, 7.050 / nominal_height, "iziz_canted_parapet_shoulder", trim_material, False),
+                (1.42, 1.000, "iziz_stepped_parapet_crown", wall_material, False),
+            )
+            if shell_profile == "onderon_city_square":
+                bay_target = 6.50
+                rib_projection = 0.30
+                rib_role = "iziz_monumental_square_buttress"
+            elif shell_profile == "onderon_city_spaceport":
+                bay_target = 7.50
+                rib_projection = 0.26
+                rib_role = "iziz_spaceport_facade_pier"
+            else:
+                bay_target = 5.50
+                rib_projection = 0.24
+                rib_role = "iziz_merchant_facade_pilaster"
+        elif shell_profile.startswith("onderon_cantina_"):
+            nominal_height = 6.80 if shell_profile == "onderon_cantina_lounge" else 7.70
+            wall_material = _architecture_material("ond_wl12")
+            accent_material = _architecture_material("ond_wl11")
+            trim_material = _architecture_material("ond_tr03")
+            light_material = _architecture_material("ond_lt03", luminous=True)
+            utility_material = _architecture_material("ond_wl06")
+            ceiling_material = _architecture_material("ond_wl02")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.10, 0.180 / nominal_height, "cantina_floor_edge", floor_edge_material, True),
+                (0.20, 0.900 / nominal_height, "cantina_service_plinth", utility_material, False),
+                (0.32, 2.250 / nominal_height, "cantina_recessed_booth_field", accent_material, False),
+                (0.46, 2.620 / nominal_height, "cantina_luminous_hospitality_belt", light_material, False),
+                (0.58, 4.850 / nominal_height, "cantina_faceted_wall_panel", wall_material, False),
+                (0.92, 5.850 / nominal_height, "cantina_beveled_crown", trim_material, False),
+                (1.36, 1.000, "cantina_ceiling_coffer", ceiling_material, False),
+            )
+            rib_projection = 0.18
+            bay_target = 4.25 if shell_profile == "onderon_cantina_gallery" else 3.50
+            rib_role = "cantina_octagonal_bay_frame"
+        elif shell_profile.startswith("onderon_sky_ramp_"):
+            nominal_height = 16.00 if shell_profile == "onderon_sky_ramp_terrace" else 12.70
+            wall_material = _architecture_material("ond_wl08")
+            accent_material = _architecture_material("ond_wl10")
+            trim_material = _architecture_material("ond_tr05")
+            light_material = _architecture_material("ond_lt02", luminous=True)
+            utility_material = _architecture_material("ond_wl05")
+            ceiling_material = _architecture_material("ond_rk02")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.22, 0.300 / nominal_height, "sky_ramp_terrace_curb", floor_edge_material, True),
+                (0.42, 1.800 / nominal_height, "sky_ramp_fortified_base", utility_material, False),
+                (0.64, 5.200 / nominal_height, "sky_ramp_recessed_civic_wall", wall_material, False),
+                (0.82, 5.650 / nominal_height, "sky_ramp_light_course", light_material, False),
+                (1.18, 9.100 / nominal_height, "sky_ramp_monumental_panel", accent_material, False),
+                (1.64, 10.900 / nominal_height, "sky_ramp_battered_crown", trim_material, False),
+                (2.15, 1.000, "sky_ramp_stepped_parapet", wall_material, False),
+            )
+            rib_projection = 0.44 if shell_profile == "onderon_sky_ramp_terrace" else 0.36
+            bay_target = 10.00 if shell_profile == "onderon_sky_ramp_terrace" else 8.00
+            rib_role = "sky_ramp_monumental_buttress"
+        else:
+            is_state_hall = shell_profile == "onderon_palace_state_hall"
+            nominal_height = 12.70 if is_state_hall else 6.00
+            wall_material = _architecture_material("ond_wl12")
+            accent_material = _architecture_material("ond_wl10")
+            trim_material = _architecture_material("ond_tr06")
+            light_material = _architecture_material("ond_lt03", luminous=True)
+            utility_material = _architecture_material("ond_orn")
+            ceiling_material = _architecture_material("ond_wl02")
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.12, 0.200 / nominal_height, "palace_floor_plinth", floor_edge_material, True),
+                (0.24, 0.900 / nominal_height, "palace_carved_dado", utility_material, False),
+                (0.38, 2.500 / nominal_height, "palace_recessed_relief_panel", accent_material, False),
+                (0.52, 2.850 / nominal_height, "palace_gold_light_course", light_material, False),
+                (0.68, 4.650 / nominal_height, "palace_upper_wall_field", wall_material, False),
+                (1.00, 5.350 / nominal_height, "palace_entablature", trim_material, False),
+                (1.45, 1.000, "palace_coffered_vault", ceiling_material, False),
+            )
+            rib_projection = 0.36 if is_state_hall else 0.20
+            bay_target = 7.50 if is_state_hall else 3.75 if shell_profile == "onderon_palace_museum" else 4.50
+            rib_role = "palace_monumental_pylon" if is_state_hall else "palace_beveled_column"
+    elif shell_profile in {
+        "taris_apartment",
+        "taris_residential_corridor",
+        "taris_living_suite",
+    }:
+        # Repeated m02aa_03a/m02aa_06a and m02ad counterparts establish the
+        # Taris apartment interior stations: 0.187 m skirting, 0.45 m lower
+        # service return, 1.35..1.50 m luminous belt, 1.65 m upper panel datum,
+        # 1.95/2.10 m shoulder, 2.396 m cove, and 2.55 m inner ceiling. The
+        # surrounding stock shell rises to 2.896..3.075 m, which is retained as
+        # the recommended floor-to-floor dimension rather than wasted interior
+        # headroom. Scaling the station ratios keeps edited heights coherent.
+        nominal_height = 2.55
+        if shell_profile == "taris_residential_corridor":
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.07, 0.187 / nominal_height, "taris_corridor_floor_edge", floor_edge_material, True),
+                (0.05, 0.450 / nominal_height, "taris_corridor_service_plinth", utility_material, False),
+                (0.08, 1.350 / nominal_height, "taris_corridor_panel_field", wall_material, False),
+                (0.12, 1.500 / nominal_height, "integrated_light", light_material, False),
+                (0.10, 1.650 / nominal_height, "taris_corridor_light_return", accent_material, False),
+                (0.18, 1.950 / nominal_height, "taris_corridor_upper_panel", wall_material, False),
+                (0.30, 2.100 / nominal_height, "taris_corridor_door_crown", trim_material, False),
+                (0.40, 2.396 / nominal_height, "taris_corridor_ceiling_cove", ceiling_material, False),
+                (0.40, 1.000, "recessed_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.085
+            bay_target = 1.80
+            rib_role = "taris_corridor_door_station"
+        elif shell_profile == "taris_living_suite":
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.04, 0.187 / nominal_height, "taris_suite_floor_edge", floor_edge_material, True),
+                (0.10, 0.450 / nominal_height, "taris_suite_service_recess", utility_material, False),
+                (0.15, 1.350 / nominal_height, "taris_suite_broad_panel_field", wall_material, False),
+                (0.09, 1.500 / nominal_height, "integrated_light", light_material, False),
+                (0.16, 1.650 / nominal_height, "taris_suite_utility_shelf", accent_material, False),
+                (0.22, 1.950 / nominal_height, "taris_suite_upper_return", wall_material, False),
+                (0.34, 2.100 / nominal_height, "taris_suite_ceiling_shoulder", trim_material, False),
+                (0.44, 2.396 / nominal_height, "taris_suite_ceiling_cove", ceiling_material, False),
+                (0.44, 1.000, "recessed_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.045
+            bay_target = 4.80
+            rib_role = "taris_suite_divider"
+        else:
+            levels = (
+                (0.00, 0.000 / nominal_height, "", floor_edge_material, True),
+                (0.05, 0.187 / nominal_height, "taris_floor_edge", floor_edge_material, True),
+                (0.02, 0.450 / nominal_height, "taris_lower_service_plinth", utility_material, False),
+                (0.02, 1.350 / nominal_height, "taris_wall_panel_zone", wall_material, False),
+                (0.05, 1.500 / nominal_height, "integrated_light", light_material, False),
+                (0.02, 1.650 / nominal_height, "taris_utility_light_return", accent_material, False),
+                (0.03, 1.950 / nominal_height, "taris_upper_wall_panel", wall_material, False),
+                (0.14, 2.100 / nominal_height, "taris_upper_shoulder", trim_material, False),
+                (0.32, 2.396 / nominal_height, "taris_ceiling_cove", ceiling_material, False),
+                (0.32, 1.000, "recessed_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.055
+            bay_target = 2.40
+            rib_role = "structural_rib"
+    else:
+        # The vertical stations are measured from the repeated Endar/Harbinger
+        # corridor shell (m01aa_06a, m01ab_09a, 151har02). 151har02 repeats the
+        # same 0.000..3.655 m stations, proving this is a Republic-warship module
+        # dimension rather than a one-off screenshot estimate.
+        nominal_height = 4.20 if shell_profile == "endar_command_deck" else 3.655
+        if shell_profile == "endar_command_deck":
+            levels = (
+                (0.00, 0.00, "", floor_edge_material, True),
+                (0.42, 0.176 / nominal_height, "command_floor_edge", floor_edge_material, True),
+                (0.62, 0.760 / nominal_height, "command_console_plinth", utility_material, False),
+                (0.54, 1.160 / nominal_height, "command_light_belt", light_material, False),
+                (0.66, 1.760 / nominal_height, "command_bulkhead_field", wall_material, False),
+                (0.92, 2.720 / nominal_height, "command_canted_upper_bulkhead", accent_material, False),
+                (1.18, 3.180 / nominal_height, "command_arch_shoulder", trim_material, False),
+                (1.34, 3.620 / nominal_height, "command_ceiling_light_tray", light_material, False),
+                (1.42, 3.920 / nominal_height, "command_faceted_ceiling_cove", ceiling_material, False),
+                (1.42, 1.00, "recessed_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.12
+            bay_target = 5.10
+            rib_role = "command_deck_pylon"
+        elif shell_profile == "endar_crew_quarters":
+            levels = (
+                (0.00, 0.00, "", floor_edge_material, True),
+                (0.36, 0.176 / nominal_height, "quarters_floor_edge", floor_edge_material, True),
+                (0.64, 0.695 / nominal_height, "quarters_service_recess", utility_material, False),
+                (0.48, 1.177 / nominal_height, "integrated_light", light_material, False),
+                (0.62, 1.472 / nominal_height, "quarters_wall_panel", wall_material, False),
+                (0.84, 2.242 / nominal_height, "quarters_canted_upper_panel", accent_material, False),
+                (1.02, 2.676 / nominal_height, "quarters_arch_shoulder", trim_material, False),
+                (1.14, 2.971 / nominal_height, "quarters_ceiling_light_coffer", light_material, False),
+                (1.18, 3.221 / nominal_height, "quarters_ceiling_cove", ceiling_material, False),
+                (1.18, 1.00, "recessed_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.065
+            bay_target = 1.80
+            rib_role = "quarters_compartment_rib"
+        else:
+            levels = (
+                (0.00, 0.00, "", floor_edge_material, True),
+                (0.50, 0.176 / nominal_height, "raised_floor_edge", floor_edge_material, True),
+                (0.68, 0.695 / nominal_height, "red_inset_panel", accent_material, False),
+                (0.52, 0.945 / nominal_height, "lower_bulkhead_return", utility_material, False),
+                (0.47, 1.177 / nominal_height, "integrated_light", light_material, False),
+                (0.52, 1.472 / nominal_height, "mid_bulkhead", wall_material, False),
+                (0.76, 2.242 / nominal_height, "canted_upper_bulkhead", accent_material, False),
+                (0.97, 2.676 / nominal_height, "arched_shoulder", trim_material, False),
+                (1.10, 2.971 / nominal_height, "ceiling_light_coffer", light_material, False),
+                (1.13, 3.221 / nominal_height, "faceted_ceiling_cove", ceiling_material, False),
+                (1.13, 1.00, "recessed_ceiling_transition", ceiling_material, False),
+            )
+            rib_projection = 0.075
+            bay_target = 2.55
+            rib_role = "arched_rib"
+    depths = tuple(level[0] for level in levels) + tuple(level[0] + rib_projection for level in levels)
+    rings, depth_scale = _architecture_profile_rings(points, depths)
+    openings_by_edge: dict[int, tuple[FloorPlanWallOpening, ...]] = {
+        edge_index: tuple(opening for opening in primitive.openings if int(opening.edge_index) == edge_index)
+        for edge_index in range(len(points))
+    }
+    common = {
+        "primitive": "floor_plan_profiled_shell",
+        "architecture_profile": architecture_profile,
+        "architecture_shell_profile": shell_profile,
+        "profile_depth_scale": depth_scale,
+        "source_module": str(primitive.metadata.get("style_source_module", "") or ""),
+        "source_rooms": tuple(primitive.metadata.get("architecture_evidence_rooms") or ()),
+    }
+    meshes: list[PrimitiveMesh] = []
+
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        edge_length = _edge_length(start, end)
+        openings = openings_by_edge.get(edge_index, ())
+        if edge_length <= 0.05:
+            continue
+        tx = (end[0] - start[0]) / edge_length
+        ty = (end[1] - start[1]) / edge_length
+        nx, ny = -ty, tx
+        for band_index in range(1, len(levels)):
+            bottom_depth, bottom_fraction, _previous_role, _previous_material, _previous_floor = levels[band_index - 1]
+            top_depth, top_fraction, role, material, floor_facing = levels[band_index]
+            z_bottom = height * bottom_fraction
+            z_top = height * top_fraction
+            visible = _architecture_visible_intervals(edge_length, openings, z0=z_bottom, z1=z_top)
+            for ordinal, span in enumerate(visible, 1):
+                meshes.append(
+                    _architecture_profile_segment_mesh(
+                        name=f"{room_resref}_{shell_profile}_e{edge_index + 1:02d}_b{band_index:02d}_{ordinal:02d}",
+                        bottom_ring=rings[bottom_depth],
+                        top_ring=rings[top_depth],
+                        edge_index=edge_index,
+                        span=span,
+                        source_start=start,
+                        source_end=end,
+                        edge_length=edge_length,
+                        z_bottom=floor_z + z_bottom,
+                        z_top=floor_z + z_top,
+                        material=material,
+                        metadata={
+                            **common,
+                            "edge_index": edge_index,
+                            "architecture_role": role,
+                            "contour_band": band_index,
+                            "surface_role": "ceiling" if "ceiling" in role or role == "faceted_ceiling_cove" else "wall",
+                        },
+                        floor_facing=floor_facing,
+                    )
+                )
+
+        # Retail corridor ribs are not vertical pilasters: they wrap the lower
+        # wall, upper cant, and ceiling shoulder as one continuous frame.
+        bay_count = max(1, int(math.ceil(edge_length / bay_target)))
+        bay_width = edge_length / bay_count
+        rib_half = (
+            min(0.80, bay_width * 0.12)
+            if shell_profile == "korriban_tomb_monumental"
+            else
+            min(0.375, bay_width * 0.18)
+            if shell_profile
+            in {
+                "korriban_tomb_chamber",
+                "korriban_tomb_junction",
+                "korriban_tomb_burial",
+            }
+            else min(0.075, bay_width * 0.045)
+        )
+        # Interior bay boundaries are safe swept strips. Footprint corners are
+        # already mitered by the ring topology; adding an edge-local strip at
+        # distance zero would collapse against that miter on narrow bands.
+        for rib_index in range(1, bay_count):
+            center = min(edge_length, rib_index * bay_width)
+            rib_span = (max(0.0, center - rib_half), min(edge_length, center + rib_half))
+            for band_index in range(1, len(levels)):
+                bottom_depth, bottom_fraction, _previous_role, _previous_material, _previous_floor = levels[band_index - 1]
+                top_depth, top_fraction, contour_role, _material, floor_facing = levels[band_index]
+                z_bottom = height * bottom_fraction
+                z_top = height * top_fraction
+                visible = _architecture_intersections(
+                    _architecture_visible_intervals(edge_length, openings, z0=z_bottom, z1=z_top),
+                    rib_span,
+                )
+                for ordinal, span in enumerate(visible, 1):
+                    meshes.append(
+                        _architecture_profile_segment_mesh(
+                            name=f"{room_resref}_{shell_profile}_e{edge_index + 1:02d}_rib{rib_index + 1:02d}_b{band_index:02d}_{ordinal:02d}",
+                            bottom_ring=rings[bottom_depth + rib_projection],
+                            top_ring=rings[top_depth + rib_projection],
+                            edge_index=edge_index,
+                            span=span,
+                            source_start=start,
+                            source_end=end,
+                            edge_length=edge_length,
+                            z_bottom=min(floor_z + height, floor_z + z_bottom + 0.012),
+                            z_top=min(floor_z + height, floor_z + z_top + 0.012),
+                            material=trim_material,
+                            metadata={
+                                **common,
+                                "edge_index": edge_index,
+                                "architecture_role": rib_role,
+                                "contour_role": contour_role,
+                                "contour_band": band_index,
+                                "rib_index": rib_index - 1,
+                            },
+                            floor_facing=floor_facing,
+                        )
+                    )
+
+        if shell_profile in korriban_profiles:
+            # The stock K1 corridor reads as carved masonry because four
+            # bevelled relief ledges run continuously between its 1.5 m
+            # structural sections.  Baking these as real sloped faces (rather
+            # than trusting the diffuse texture to fake the depth) keeps the
+            # silhouette recognizable under Map Studio lighting and avoids a
+            # flat box even when the wall is viewed at a grazing angle.
+            relief_rows = (
+                (1.30, 1.44, 0.68, 0.76),
+                (1.76, 1.90, 0.70, 0.78),
+                (2.22, 2.36, 0.72, 0.80),
+                (2.68, 2.82, 0.74, 0.82),
+            )
+            if shell_profile == "korriban_tomb_ruined":
+                relief_rows = (
+                    (1.38, 1.54, 0.64, 0.76),
+                    (2.12, 2.28, 0.70, 0.84),
+                    (3.05, 3.23, 0.76, 0.92),
+                    (4.08, 4.26, 0.82, 0.98),
+                )
+            elif shell_profile == "korriban_tomb_chamber":
+                relief_rows = (
+                    (1.35, 1.55, 0.66, 0.80),
+                    (2.25, 2.45, 0.70, 0.85),
+                    (3.15, 3.35, 0.74, 0.90),
+                    (4.05, 4.25, 0.78, 0.95),
+                    (4.95, 5.15, 0.82, 1.00),
+                )
+            elif shell_profile == "korriban_tomb_junction":
+                relief_rows = (
+                    (1.40, 1.62, 0.72, 0.90),
+                    (2.80, 3.02, 0.78, 0.98),
+                    (4.20, 4.42, 0.84, 1.06),
+                    (5.60, 5.82, 0.90, 1.14),
+                )
+            elif shell_profile == "korriban_tomb_burial":
+                relief_rows = (
+                    (1.28, 1.48, 0.68, 0.82),
+                    (2.30, 2.50, 0.72, 0.88),
+                    (3.32, 3.52, 0.76, 0.94),
+                    (4.34, 4.54, 0.80, 1.00),
+                )
+            elif shell_profile == "korriban_tomb_monumental":
+                relief_rows = (
+                    (2.20, 2.52, 1.02, 1.36),
+                    (4.40, 4.72, 1.12, 1.52),
+                    (6.60, 6.92, 1.22, 1.68),
+                    (8.80, 9.12, 1.32, 1.84),
+                )
+
+            def backing_depth_at(local_z: float) -> float:
+                """Interpolate the measured shell depth behind one relief edge."""
+
+                for level_index in range(1, len(levels)):
+                    lower_depth, lower_fraction = levels[level_index - 1][:2]
+                    upper_depth, upper_fraction = levels[level_index][:2]
+                    lower_z = height * lower_fraction
+                    upper_z = height * upper_fraction
+                    if upper_z - lower_z <= 1.0e-8:
+                        continue
+                    if lower_z - 1.0e-8 <= local_z <= upper_z + 1.0e-8:
+                        ratio = max(0.0, min(1.0, (local_z - lower_z) / (upper_z - lower_z)))
+                        return (lower_depth + (upper_depth - lower_depth) * ratio) * depth_scale
+                return float(levels[-1][0]) * depth_scale
+
+            tx = (end[0] - start[0]) / max(edge_length, 1.0e-8)
+            ty = (end[1] - start[1]) / max(edge_length, 1.0e-8)
+            nx, ny = -ty, tx
+
+            def relief_point(distance: float, depth: float, z: float) -> Vec3:
+                return (
+                    start[0] + tx * distance + nx * depth,
+                    start[1] + ty * distance + ny * depth,
+                    floor_z + z,
+                )
+
+            for relief_index, (z0, z1, depth0, depth1) in enumerate(relief_rows, 1):
+                if z0 >= height - 0.02:
+                    continue
+                z1 = min(z1, height - 0.02)
+                visible = _architecture_visible_intervals(edge_length, openings, z0=z0, z1=z1)
+                for ordinal, span in enumerate(visible, 1):
+                    relief_material = trim_material if relief_index % 2 else accent_material
+                    relief_role = (
+                        "broken_sith_relief_ledge"
+                        if shell_profile == "korriban_tomb_ruined"
+                        else "beveled_sith_chamber_relief_ledge"
+                        if shell_profile == "korriban_tomb_chamber"
+                        else f"beveled_{shell_profile.removeprefix('korriban_tomb_')}_relief_ledge"
+                        if shell_profile
+                        in {
+                            "korriban_tomb_junction",
+                            "korriban_tomb_burial",
+                            "korriban_tomb_monumental",
+                        }
+                        else "beveled_sith_relief_ledge"
+                    )
+                    relief_metadata = {
+                        **common,
+                        "edge_index": edge_index,
+                        "architecture_role": relief_role,
+                        "relief_row": relief_index - 1,
+                        "beveled_geometry": True,
+                    }
+                    front_depth0 = depth0 * depth_scale
+                    front_depth1 = depth1 * depth_scale
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=(
+                                f"{room_resref}_{shell_profile}_e{edge_index + 1:02d}_"
+                                f"relief{relief_index:02d}_{ordinal:02d}"
+                            ),
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=front_depth0,
+                            depth_top=front_depth1,
+                            z_bottom=floor_z + z0,
+                            z_top=floor_z + z1,
+                            material=relief_material,
+                            metadata=relief_metadata,
+                        )
+                    )
+                    # Close the relief extrusion against the measured backing
+                    # shell. A front quad alone reads as a floating strip and
+                    # exposes black slits at grazing angles and doorway cuts.
+                    # These four bevel/cap faces make every row a closed,
+                    # manifold visual course without altering the room WOK.
+                    span_start, span_end = span
+                    back_depth0 = backing_depth_at(z0)
+                    back_depth1 = backing_depth_at(z1)
+                    cap_vertices = {
+                        "lower": (
+                            relief_point(span_start, back_depth0, z0),
+                            relief_point(span_start, front_depth0, z0),
+                            relief_point(span_end, front_depth0, z0),
+                            relief_point(span_end, back_depth0, z0),
+                        ),
+                        "upper": (
+                            relief_point(span_start, back_depth1, z1),
+                            relief_point(span_end, back_depth1, z1),
+                            relief_point(span_end, front_depth1, z1),
+                            relief_point(span_start, front_depth1, z1),
+                        ),
+                        "start": (
+                            relief_point(span_start, back_depth0, z0),
+                            relief_point(span_start, back_depth1, z1),
+                            relief_point(span_start, front_depth1, z1),
+                            relief_point(span_start, front_depth0, z0),
+                        ),
+                        "end": (
+                            relief_point(span_end, back_depth0, z0),
+                            relief_point(span_end, front_depth0, z0),
+                            relief_point(span_end, front_depth1, z1),
+                            relief_point(span_end, back_depth1, z1),
+                        ),
+                    }
+                    for cap_name, vertices in cap_vertices.items():
+                        meshes.append(
+                            _planar_surface_mesh(
+                                name=(
+                                    f"{room_resref}_{shell_profile}_e{edge_index + 1:02d}_"
+                                    f"relief{relief_index:02d}_{ordinal:02d}_{cap_name}"
+                                ),
+                                vertices=vertices,
+                                faces=((0, 1, 2), (0, 2, 3)),
+                                material=relief_material,
+                                metadata={
+                                    **relief_metadata,
+                                    "architecture_role": f"{relief_role}_cap",
+                                    "relief_cap": cap_name,
+                                },
+                            )
+                        )
+
+        if shell_profile in korriban_profiles:
+            meshes.extend(
+                _architecture_door_transition_meshes(
+                    room_resref=room_resref,
+                    profile=architecture_profile,
+                    edge_index=edge_index,
+                    start=start,
+                    end=end,
+                    edge_length=edge_length,
+                    floor_z=floor_z,
+                    wall_height=height,
+                    openings=openings,
+                    infill_material=accent_material,
+                    trim_material=trim_material,
+                    light_material=light_material,
+                    common=common,
+                )
+            )
+        if shell_profile in korriban_profiles or shell_profile.startswith("rhen_var_"):
+            for opening in openings:
+                meshes.extend(
+                    _module_transition_shell_meshes(
+                        room_resref=room_resref,
+                        edge_index=edge_index,
+                        start=start,
+                        tangent=(tx, ty),
+                        inward_normal=(nx, ny),
+                        edge_length=edge_length,
+                        opening=opening,
+                        floor_z=floor_z,
+                        architecture_profile=architecture_profile,
+                    )
+                )
+
+    if shell_profile == "korriban_tomb_chamber":
+        meshes.extend(
+            _korriban_chamber_corner_buttress_meshes(
+                room_resref=room_resref,
+                points=points,
+                floor_z=floor_z,
+                wall_height=height,
+                base_material=accent_material,
+                capital_material=wall_material,
+                common=common,
+            )
+        )
+    elif shell_profile == "korriban_tomb_junction":
+        meshes.extend(
+            _korriban_chamber_corner_buttress_meshes(
+                room_resref=room_resref,
+                points=points,
+                floor_z=floor_z,
+                wall_height=height,
+                base_material=accent_material,
+                capital_material=wall_material,
+                common=common,
+                base_role="sith_junction_cross_pier",
+                capital_role="sith_junction_vault_capital",
+                base_height_fraction=0.42,
+                maximum_base_width=2.40,
+                maximum_capital_width=3.30,
+                source_measurement="m38aa_06/m38aa_08",
+            )
+        )
+        meshes.extend(
+            _korriban_junction_crown_meshes(
+                room_resref=room_resref,
+                points=points,
+                floor_z=floor_z,
+                wall_height=height,
+                material=trim_material,
+                common=common,
+            )
+        )
+    elif shell_profile == "korriban_tomb_burial":
+        meshes.extend(
+            _korriban_burial_niche_meshes(
+                room_resref=room_resref,
+                points=points,
+                openings_by_edge=openings_by_edge,
+                floor_z=floor_z,
+                wall_height=height,
+                wall_material=wall_material,
+                accent_material=accent_material,
+                trim_material=trim_material,
+                common=common,
+            )
+        )
+    elif shell_profile == "korriban_tomb_monumental":
+        meshes.extend(
+            _korriban_chamber_corner_buttress_meshes(
+                room_resref=room_resref,
+                points=points,
+                floor_z=floor_z,
+                wall_height=height,
+                base_material=accent_material,
+                capital_material=wall_material,
+                common=common,
+                base_role="sith_monumental_corner_pylon",
+                capital_role="sith_monumental_vault_capital",
+                base_height_fraction=0.36,
+                maximum_base_width=5.81,
+                maximum_capital_width=7.20,
+                source_measurement="m39aa_07",
+            )
+        )
+        meshes.extend(
+            _korriban_monumental_pylon_meshes(
+                room_resref=room_resref,
+                points=points,
+                openings_by_edge=openings_by_edge,
+                floor_z=floor_z,
+                wall_height=height,
+                wall_material=wall_material,
+                accent_material=accent_material,
+                common=common,
+            )
+        )
+
+    if primitive.include_ceiling:
+        final_depth, final_fraction, _role, _material, _floor_facing = levels[-1]
+        ceiling_points = rings[final_depth]
+        ceiling_z = floor_z + height * final_fraction
+        vertices: tuple[Vec3, ...] = tuple((x, y, ceiling_z) for x, y in ceiling_points)
+        faces = tuple((c, b, a) for a, b, c in triangulate_floor_plan_points(ceiling_points))
+        ceiling_role = {
+            "korriban_tomb_chamber": "reliquary_vault_ceiling",
+            "korriban_tomb_junction": "junction_vault_ceiling",
+            "korriban_tomb_burial": "burial_vault_ceiling",
+            "korriban_tomb_monumental": "monumental_vault_ceiling",
+        }.get(shell_profile, "recessed_ceiling")
+        meshes.append(
+            PrimitiveMesh(
+                name=f"{room_resref}_{shell_profile}_recessed_ceiling",
+                vertices=vertices,
+                faces=faces,
+                normals=((0.0, 0.0, -1.0),) * len(vertices),
+                uvs=_planar_uvs(
+                    vertices,
+                    repeat_metres=_VANILLA_ARCHITECTURE_UV_METRES.get(
+                        str(ceiling_material.texture or "").strip().lower(),
+                        3.0,
+                    ),
+                ),
+                texture=ceiling_material.texture,
+                diffuse=ceiling_material.diffuse,
+                ambient=ceiling_material.ambient,
+                metadata={
+                    **dict(ceiling_material.metadata),
+                    **common,
+                    "architecture_role": ceiling_role,
+                    "surface_role": "ceiling",
+                },
+            )
+        )
+    return tuple(meshes)
+
+
+def _faceted_quad_surface_mesh(
+    *,
+    name: str,
+    corners: tuple[Vec3, Vec3, Vec3, Vec3],
+    material: PrimitiveMaterial,
+    metadata: dict[str, Any],
+    terrain_uv_scale: float | None = None,
+) -> PrimitiveMesh:
+    """Build a non-planar organic quad as two independently shaded facets.
+
+    ``terrain_uv_scale`` deliberately projects from world XY instead of giving
+    every triangulated patch its own 0..1 island.  Organic terrain needs this
+    mode: resetting the UV island per facet turns a broad dirt bank into large,
+    visibly triangular texture patches.  KOTOR diffuse textures repeat by
+    default, so the projected coordinates retain a continuous, game-valid
+    ground scale across adjacent berm segments.
+    """
+
+    source_faces = ((corners[0], corners[1], corners[2]), (corners[0], corners[2], corners[3]))
+    vertices: list[Vec3] = []
+    normals: list[Vec3] = []
+    uvs: list[Vec2] = []
+    for face_index, triangle in enumerate(source_faces):
+        a, b, c = triangle
+        ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        cross = (
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        )
+        length = math.sqrt(sum(component * component for component in cross))
+        if length <= 1.0e-9:
+            raise ValueError(f"{name} cannot contain a degenerate organic facet.")
+        normal = tuple(component / length for component in cross)
+        vertices.extend(triangle)
+        normals.extend((normal, normal, normal))
+        if terrain_uv_scale is not None:
+            scale = float(terrain_uv_scale)
+            if not math.isfinite(scale) or scale <= 0.0:
+                raise ValueError("terrain_uv_scale must be a positive finite value.")
+            abs_normal = tuple(abs(component) for component in normal)
+            if abs_normal[2] >= abs_normal[0] and abs_normal[2] >= abs_normal[1]:
+                # Horizontal-ish dirt floors use the usual top-down projection.
+                uvs.extend(tuple((float(vertex[0]) * scale, float(vertex[1]) * scale) for vertex in triangle))
+            elif abs_normal[0] >= abs_normal[1]:
+                # East/west wall banks should climb through V by height; using
+                # only XY is what made Shadowlands mud smear into long stripes.
+                uvs.extend(tuple((float(vertex[1]) * scale, float(vertex[2]) * scale) for vertex in triangle))
+            else:
+                uvs.extend(tuple((float(vertex[0]) * scale, float(vertex[2]) * scale) for vertex in triangle))
+        else:
+            uvs.extend(
+                ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0))
+                if face_index == 0
+                else ((0.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+            )
+    return PrimitiveMesh(
+        name=name,
+        vertices=tuple(vertices),
+        faces=((0, 1, 2), (3, 4, 5)),
+        normals=tuple(normals),
+        uvs=tuple(uvs),
+        texture=material.texture,
+        diffuse=material.diffuse,
+        ambient=material.ambient,
+        metadata={**dict(material.metadata), **metadata},
+    )
+
+
+def _faceted_triangle_surface_mesh(
+    *,
+    name: str,
+    corners: tuple[Vec3, Vec3, Vec3],
+    material: PrimitiveMaterial,
+    metadata: dict[str, Any],
+    terrain_uv_scale: float | None = None,
+) -> PrimitiveMesh:
+    """Build one non-degenerate terrain triangle with the same UV policy as a quad."""
+
+    a, b, c = corners
+    ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+    cross = (
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    )
+    length = math.sqrt(sum(component * component for component in cross))
+    if length <= 1.0e-9:
+        raise ValueError(f"{name} cannot contain a degenerate organic facet.")
+    normal = tuple(component / length for component in cross)
+    if terrain_uv_scale is not None:
+        scale = float(terrain_uv_scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("terrain_uv_scale must be a positive finite value.")
+        abs_normal = tuple(abs(component) for component in normal)
+        if abs_normal[2] >= abs_normal[0] and abs_normal[2] >= abs_normal[1]:
+            uvs = tuple((float(vertex[0]) * scale, float(vertex[1]) * scale) for vertex in corners)
+        elif abs_normal[0] >= abs_normal[1]:
+            uvs = tuple((float(vertex[1]) * scale, float(vertex[2]) * scale) for vertex in corners)
+        else:
+            uvs = tuple((float(vertex[0]) * scale, float(vertex[2]) * scale) for vertex in corners)
+    else:
+        uvs = ((0.0, 0.0), (1.0, 0.0), (0.5, 1.0))
+    return PrimitiveMesh(
+        name=name,
+        vertices=corners,
+        faces=((0, 1, 2),),
+        normals=(normal, normal, normal),
+        uvs=uvs,
+        texture=material.texture,
+        diffuse=material.diffuse,
+        ambient=material.ambient,
+        metadata={**dict(material.metadata), **metadata},
+    )
+
+
+def _shadowlands_depth(
+    edge_index: int,
+    distance: float,
+    *,
+    base: float,
+    amplitude: float,
+    channel: float,
+) -> float:
+    """Return deterministic smooth variation without persisting random state."""
+
+    phase = ((edge_index + 1) * 1.61803398875) + (float(distance) * 0.731) + (channel * 2.417)
+    wave = (math.sin(phase) * 0.62) + (math.sin(phase * 1.913 + 0.71) * 0.38)
+    return max(0.0, float(base) + float(amplitude) * wave)
+
+
+def _shadowlands_opening_half_width(opening: FloorPlanWallOpening, z_value: float) -> float:
+    """Return the clear half-width of one organic cave opening at ``z_value``.
+
+    Retail Shadowlands transitions are cut through soil and roots, not through
+    a rectangular interior doorway.  The lower opening is vertical enough for
+    the player, then resolves into a rounded earthen arch.  Sampling this
+    profile at each berm strip keeps the opening genuinely open instead of
+    placing a decorative arch over a rectangular hole.
+    """
+
+    bottom = float(opening.bottom)
+    transition_asset = str(
+        dict(opening.metadata or {}).get("module_transition_asset_id") or ""
+    ).strip().lower()
+    if transition_asset:
+        from .map_studio_terrain_kit import module_transition_fit_contract
+
+        fit = module_transition_fit_contract(
+            transition_asset,
+            float(opening.width),
+            float(opening.height),
+            "K1",
+        )
+        top = bottom + float(fit.host_opening_height_m)
+        if z_value < bottom - 1.0e-8 or z_value > top + 1.0e-8:
+            return 0.0
+        # The supplied organic facade owns the visible silhouette.  Give it a
+        # full measured recess instead of forcing its wide roots through the
+        # smaller, rounded WOK aperture.
+        return max(0.01, float(fit.host_opening_width_m) * 0.5)
+    top = bottom + float(opening.height)
+    half_width = max(0.01, float(opening.width) * 0.5)
+    if z_value < bottom - 1.0e-8 or z_value > top + 1.0e-8:
+        return 0.0
+    radius = min(half_width, max(0.18, float(opening.height) * 0.48))
+    spring = max(bottom, top - radius)
+    if z_value <= spring:
+        return half_width
+    height_over_spring = max(0.0, min(radius, z_value - spring))
+    # Retain a tiny, intentional apex rather than producing a degenerate
+    # zero-area strip on the final arch segment.
+    return max(0.015, math.sqrt(max(0.0, radius * radius - height_over_spring * height_over_spring)))
+
+
+def _shadowlands_visible_intervals(
+    edge_length: float,
+    openings: tuple[FloorPlanWallOpening, ...],
+    *,
+    z_value: float,
+) -> tuple[tuple[float, float], ...]:
+    """Return wall spans after subtracting round, walkable cave apertures."""
+
+    intervals = [(0.0, float(edge_length))]
+    for opening in openings:
+        half = _shadowlands_opening_half_width(opening, z_value)
+        if half <= 0.0:
+            continue
+        center = float(opening.center_fraction) * float(edge_length)
+        intervals = _subtract_interval(
+            intervals,
+            max(0.0, center - half),
+            min(float(edge_length), center + half),
+        )
+    return tuple((start, end) for start, end in intervals if end - start > 0.015)
+
+
+def _shadowlands_profile_depth(
+    edge_index: int,
+    distance: float,
+    *,
+    berm_width: float,
+    depth_factor: float,
+    amplitude_factor: float,
+    profile_level: float,
+) -> float:
+    """Return one shared bank-ring depth.
+
+    Adjacent vertical strips must ask for the *same* ring value at their
+    common height.  The old per-band channel differed on each side of a seam,
+    which opened the visible triangular gaps reported in the viewport.
+    """
+
+    return _shadowlands_depth(
+        edge_index,
+        distance,
+        base=float(berm_width) * float(depth_factor),
+        amplitude=float(berm_width) * float(amplitude_factor),
+        channel=float(profile_level) + 0.23,
+    )
+
+
+def _shadowlands_connected_cave_connector_meshes(
+    *,
+    room_resref: str,
+    edge_index: int,
+    start: Vec2,
+    tangent: tuple[float, float],
+    inward_normal: tuple[float, float],
+    edge_length: float,
+    opening: FloorPlanWallOpening,
+    floor_z: float,
+    berm_width: float,
+    material: PrimitiveMaterial,
+    common: dict[str, Any],
+    architecture_role: str = "shadowlands_cave_connector",
+    source_modules: tuple[str, ...] = ("m24aa", "m25aa"),
+) -> tuple[PrimitiveMesh, ...]:
+    """Build the sealed visual throat for one snapped Shadowlands room join.
+
+    A WOK transition makes movement continuous, but it does not create render
+    geometry between an authored dirt bank and a reused retail room.  Leaving
+    that volume open is what exposed the editor background at the connection.
+    This small, double-sided earthen tube is built *inside* the authored
+    clearing.  The connected retail room is clipped at the shared portal
+    plane, so neither half overlaps the other while the player corridor stays
+    clear and the visual seam is closed from either side.
+    """
+
+    opening_metadata = dict(opening.metadata or {})
+    target_room = str(opening_metadata.get("connected_room_resref") or "").strip().lower()
+    if not target_room:
+        return ()
+    half_width = max(0.28, float(opening.width) * 0.5 + 0.30)
+    crown_radius = min(half_width, max(0.28, float(opening.height) * 0.48))
+    spring_height = max(0.0, float(opening.height) - crown_radius)
+    # The connector clears the full berm on the authored side of the threshold
+    # and intentionally overlaps a short distance into the clipped retail side.
+    # Shadowlands modules have irregular soil shells; a razor-thin join leaves
+    # sky-colored slivers whenever the vanilla shell bows away from its WOK
+    # threshold.  The overlap is visual-only and does not change WOK portals.
+    connector_depth = min(4.60, max(1.65, float(berm_width) * 0.95))
+    connector_overlap = min(1.10, max(0.55, float(opening.width) * 0.12))
+    center_distance = max(0.0, min(float(edge_length), float(opening.center_fraction) * float(edge_length)))
+    # Traverse the inside profile from lower-left, up the wall and around the
+    # crown, then down to lower-right.  There is no bottom cap: the two WOK
+    # floors are the continuous, player-walkable surface.
+    profile: list[tuple[float, float]] = [(-half_width, 0.0), (-half_width, spring_height)]
+    arc_segments = 7
+    for sample_index in range(1, arc_segments + 1):
+        angle = math.pi - (math.pi * float(sample_index) / float(arc_segments))
+        profile.append((math.cos(angle) * crown_radius, spring_height + math.sin(angle) * crown_radius))
+    profile.append((half_width, 0.0))
+
+    def profile_point(lateral: float, height: float, depth: float) -> Vec3:
+        return (
+            float(start[0]) + float(tangent[0]) * (center_distance + lateral) + float(inward_normal[0]) * depth,
+            float(start[1]) + float(tangent[1]) * (center_distance + lateral) + float(inward_normal[1]) * depth,
+            float(floor_z) + float(opening.bottom) + height,
+        )
+
+    meshes: list[PrimitiveMesh] = []
+    for profile_index, (first, second) in enumerate(zip(profile, profile[1:]), 1):
+        inner_first = profile_point(first[0], first[1], -connector_overlap)
+        inner_second = profile_point(second[0], second[1], -connector_overlap)
+        outer_first = profile_point(first[0], first[1], connector_depth)
+        outer_second = profile_point(second[0], second[1], connector_depth)
+        metadata = {
+            **common,
+            "edge_index": edge_index,
+            "architecture_role": str(architecture_role or "cave_connector"),
+            "surface_role": "terrain_cave_connector",
+            "opening_name": str(opening.name or ""),
+            "connected_room_resref": target_room,
+            "connector_depth_m": connector_depth,
+            "connector_overlap_m": connector_overlap,
+            "connector_direction": "authored_clearing_interior",
+            "connector_profile_segment": profile_index,
+            "welded_terrain_boundary": True,
+            "source_modules": tuple(source_modules),
+        }
+        # Keep both windings.  KOTOR room geometry is normally culled, and a
+        # join must stay opaque whether it is viewed from the authored clearing
+        # or from the attached vanilla room.
+        meshes.append(
+            _faceted_quad_surface_mesh(
+                name=f"{room_resref}_shadowlands_e{edge_index + 1:02d}_cave_connector_{profile_index:02d}_in",
+                corners=(inner_first, outer_first, outer_second, inner_second),
+                material=material,
+                metadata=metadata,
+                terrain_uv_scale=0.30,
+            )
+        )
+        meshes.append(
+            _faceted_quad_surface_mesh(
+                name=f"{room_resref}_shadowlands_e{edge_index + 1:02d}_cave_connector_{profile_index:02d}_out",
+                corners=(inner_second, outer_second, outer_first, inner_first),
+                material=material,
+                metadata=metadata,
+                terrain_uv_scale=0.30,
+            )
+        )
+    # The authored and connected-room WOKs own collision.  This thin visual
+    # threshold closes the ground seam left by visual-only entrance shells.
+    threshold_half_width = max(0.28, float(opening.width) * 0.5)
+    threshold_z = float(floor_z) + float(opening.bottom) + 0.012
+    threshold = (
+        profile_point(-threshold_half_width, 0.0, -connector_overlap),
+        profile_point(threshold_half_width, 0.0, -connector_overlap),
+        profile_point(threshold_half_width, 0.0, connector_depth),
+        profile_point(-threshold_half_width, 0.0, connector_depth),
+    )
+    threshold = tuple((point[0], point[1], threshold_z) for point in threshold)
+    meshes.append(
+        _faceted_quad_surface_mesh(
+            name=f"{room_resref}_shadowlands_e{edge_index + 1:02d}_transition_floor",
+            corners=threshold,
+            material=material,
+            metadata={
+                **common,
+                "edge_index": edge_index,
+                "architecture_role": "shadowlands_transition_floor",
+                "surface_role": "visual_transition_floor",
+                "opening_name": str(opening.name or ""),
+                "connected_room_resref": target_room,
+                "visual_only": True,
+                "walkmesh_alignment": "reciprocal_portal_overlay",
+                "sealed_ground_seam": True,
+            },
+            terrain_uv_scale=0.30,
+        )
+    )
+
+    # Endar-style panorama cards close distant side views while the supplied
+    # tree shell provides the near-field silhouette.  Start them with the
+    # supplied opaque moss/root atlas so the default never exposes the hard,
+    # alpha-cut edges of retail foliage billboards.  The slots remain
+    # replaceable with a user-authored jungle panorama.
+    panorama_lateral = half_width + max(1.55, float(berm_width) * 0.58)
+    for side_name, lateral, texture in (
+        ("left", -panorama_lateral, "gr_shadentr"),
+        ("right", panorama_lateral, "gr_shadentr"),
+    ):
+        bottom = float(floor_z) + float(opening.bottom) + 0.04
+        top = bottom + max(3.5, float(opening.height) + 1.15)
+        card = (
+            profile_point(lateral, 0.0, -connector_overlap),
+            profile_point(lateral, 0.0, connector_depth),
+            profile_point(lateral, top - bottom, connector_depth),
+            profile_point(lateral, top - bottom, -connector_overlap),
+        )
+        card = tuple((point[0], point[1], bottom if index < 2 else top) for index, point in enumerate(card))
+        card_material = _architecture_material(texture)
+        for winding, corners in (
+            ("in", card),
+            ("out", tuple(reversed(card))),
+        ):
+            meshes.append(
+                _faceted_quad_surface_mesh(
+                    name=(
+                        f"{room_resref}_shadowlands_e{edge_index + 1:02d}_"
+                        f"jungle_panorama_{side_name}_{winding}"
+                    ),
+                    corners=corners,
+                    material=card_material,
+                    metadata={
+                        **common,
+                        "edge_index": edge_index,
+                        "architecture_role": "shadowlands_jungle_panorama_card",
+                        "surface_role": "forest_backdrop",
+                        "panorama_side": side_name,
+                        "panorama_lateral_offset_m": float(panorama_lateral),
+                        "portal_clearance_occlusion_safe": True,
+                        "replaceable_panorama_texture": True,
+                        "background_geometry": True,
+                        "visual_only": True,
+                        "source_modules": ("m24aa", "m25aa"),
+                    },
+                    terrain_uv_scale=0.20,
+                )
+            )
+    return tuple(meshes)
+
+
+def build_floor_plan_shadowlands_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[PrimitiveMesh, ...]:
+    """Compile an open-air Shadowlands clearing from measured organic forms.
+
+    Upper/Lower Shadowlands floors vary by roughly 10-17 m across 67-131 m
+    tiles.  Their playable clearings resolve into broad, weathered dirt banks
+    rather than a perimeter of vertical timber walls.  The authored recipe
+    therefore uses irregular, walk-up earthen berms as the default boundary;
+    retail roots, trunks, and canopy forms are staged explicitly from the
+    Shadowlands terrain shelf where their real silhouette can be retained.
+    """
+
+    if not primitive.include_walls:
+        return ()
+    validation = validate_floor_plan_room_primitive(primitive)
+    if not validation.ok:
+        raise ValueError("; ".join(validation.blocking_issues))
+    shell_profile = architecture_shell_profile(primitive)
+    if shell_profile not in {
+        "shadowlands_root_wall",
+        "shadowlands_root_passage",
+        "shadowlands_ancient_grove",
+    }:
+        shell_profile = "shadowlands_root_wall"
+    height = float(primitive.wall_height)
+    minimum_height = 3.5 if shell_profile == "shadowlands_root_passage" else 4.5
+    if height < minimum_height:
+        raise ValueError(
+            f"The Shadowlands {shell_profile.removeprefix('shadowlands_').replace('_', ' ')} "
+            f"contour requires a height of at least {minimum_height:.2f} m."
+        )
+    points = _ccw_points(_normalise_points(primitive.points))
+    room_resref = _normalise_resref(primitive.room_resref)
+    floor_z = float(primitive.z)
+    # Use the measured mud/plant palette for the *built* boundary.  Bark is a
+    # deliberately sparse accent only: covering every edge with bark made an
+    # exterior clearing read as a square, indoor room.
+    earth_material = _architecture_material("lka_mud02")
+    root_material = _architecture_material("lka_bark06")
+    openings_by_edge: dict[int, tuple[FloorPlanWallOpening, ...]] = {
+        edge_index: tuple(opening for opening in primitive.openings if int(opening.edge_index) == edge_index)
+        for edge_index in range(len(points))
+    }
+    common = {
+        "primitive": "floor_plan_shadowlands_shell",
+        "architecture_profile": "shadowlands",
+        "architecture_shell_profile": shell_profile,
+        "source_module": str(primitive.metadata.get("style_source_module", "") or ""),
+        "source_rooms": tuple(primitive.metadata.get("architecture_evidence_rooms") or ()),
+        "open_air": True,
+    }
+    meshes: list[PrimitiveMesh] = []
+    min_x = min(float(point[0]) for point in points)
+    max_x = max(float(point[0]) for point in points)
+    min_y = min(float(point[1]) for point in points)
+    max_y = max(float(point[1]) for point in points)
+    # A wide bank is the visual contract: it must visibly slope away from the
+    # clearing instead of reading as a textured vertical wall.  Limit it for
+    # compact footprints so a small encounter space remains usable.
+    footprint_span = min(max_x - min_x, max_y - min_y)
+    if shell_profile == "shadowlands_root_passage":
+        berm_width = min(3.60, max(1.55, footprint_span * 0.16))
+    elif shell_profile == "shadowlands_ancient_grove":
+        berm_width = min(6.40, max(2.60, footprint_span * 0.23))
+    else:
+        berm_width = min(4.80, max(1.85, footprint_span * 0.19))
+    # Closed height/depth rings.  Every vertical strip samples these shared
+    # values, and the corner caps below stitch adjacent polygon edges.  This
+    # is the topology contract that prevents a procedural outdoor boundary
+    # from exposing the editor grid through a crack.
+    if shell_profile == "shadowlands_root_passage":
+        profile_levels = (
+            (0.00, 0.00, 0.000, "root_passage_floor_weld"),
+            (0.08, 0.18, 0.070, "root_passage_earthen_toe"),
+            (0.34, 0.52, 0.145, "root_passage_steep_bank"),
+            (0.62, 0.86, 0.180, "root_passage_exposed_slope"),
+            (0.86, 1.00, 0.115, "root_passage_crown"),
+            (1.00, 0.92, 0.060, "root_passage_crown"),
+        )
+        vertical_subdivisions = 4
+        root_stride = 2
+    elif shell_profile == "shadowlands_ancient_grove":
+        profile_levels = (
+            (0.00, 0.00, 0.000, "grove_floor_weld"),
+            (0.10, 0.28, 0.075, "grove_earthen_toe"),
+            (0.35, 0.70, 0.145, "grove_broad_mound"),
+            (0.62, 0.96, 0.190, "grove_weathered_ridge"),
+            (0.82, 0.78, 0.160, "grove_root_recess"),
+            (0.94, 1.00, 0.120, "grove_high_crown"),
+            (1.00, 0.90, 0.080, "grove_high_crown"),
+        )
+        vertical_subdivisions = 4
+        root_stride = 2
+    else:
+        profile_levels = (
+            # The first ring is the exact authored floor outline.  Starting it
+            # at a positive berm offset left a real slit between terrain and
+            # floor; fog only hid that seam instead of closing it.
+            (0.00, 0.00, 0.000, "earthen_toe"),
+            (0.11, 0.24, 0.055, "earthen_toe"),
+            (0.42, 0.64, 0.100, "dirt_mound_slope"),
+            (0.69, 0.91, 0.130, "weathered_dirt_ridge"),
+            (0.90, 1.00, 0.075, "mossy_berm_crown"),
+            (1.00, 0.96, 0.040, "mossy_berm_crown"),
+        )
+        vertical_subdivisions = 3
+        root_stride = 3
+    # Three strips per profile band makes the circular cave aperture read as
+    # an actual dirt arch rather than a stepped rectangular cutout.
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        edge_length = _edge_length(start, end)
+        if edge_length <= 0.05:
+            continue
+        tx = (end[0] - start[0]) / edge_length
+        ty = (end[1] - start[1]) / edge_length
+        nx, ny = -ty, tx
+        openings = openings_by_edge.get(edge_index, ())
+        segment_count = max(1, int(math.ceil(edge_length / 3.40)))
+        segment_width = edge_length / segment_count
+
+        def point(distance: float, depth: float, z_value: float) -> Vec3:
+            # ``nx, ny`` is the inward normal of the CCW clearing outline.
+            # A Shadowlands berm belongs beyond the walkable clearing, not in
+            # it: retaining the old inward offset made the ridge read as an
+            # indoor ceiling at player height.
+            return (
+                start[0] + tx * distance - nx * depth,
+                start[1] + ty * distance - ny * depth,
+                floor_z + z_value,
+            )
+
+        for band_index in range(len(profile_levels) - 1):
+            z0f, d0f, a0f, role = profile_levels[band_index]
+            z1f, d1f, a1f, _next_role = profile_levels[band_index + 1]
+            for strip_index in range(vertical_subdivisions):
+                strip_lower = float(strip_index) / float(vertical_subdivisions)
+                strip_upper = float(strip_index + 1) / float(vertical_subdivisions)
+                # Never allow an individual surface to cross a cave aperture
+                # breakpoint.  A span pair would otherwise change from two
+                # side panels to one full-width panel at the apex, bridging
+                # straight across the walkable opening.
+                split_fractions = [strip_lower, strip_upper]
+                for opening in openings:
+                    transition_asset = str(
+                        dict(opening.metadata or {}).get("module_transition_asset_id") or ""
+                    ).strip().lower()
+                    if transition_asset:
+                        from .map_studio_terrain_kit import module_transition_fit_contract
+
+                        transition_fit = module_transition_fit_contract(
+                            transition_asset,
+                            float(opening.width),
+                            float(opening.height),
+                            "K1",
+                        )
+                        split_heights = (
+                            float(opening.bottom),
+                            float(opening.bottom) + float(transition_fit.host_opening_height_m),
+                        )
+                    else:
+                        radius = min(
+                            float(opening.width) * 0.5,
+                            max(0.18, float(opening.height) * 0.48),
+                        )
+                        split_heights = (
+                            float(opening.bottom),
+                            max(
+                                float(opening.bottom),
+                                float(opening.bottom) + float(opening.height) - radius,
+                            ),
+                            float(opening.bottom) + float(opening.height),
+                        )
+                    for split_z in split_heights:
+                        normalized = (float(split_z) / height - z0f) / max(1.0e-8, z1f - z0f)
+                        if strip_lower + 1.0e-7 < normalized < strip_upper - 1.0e-7:
+                            split_fractions.append(normalized)
+                split_fractions = sorted(set(split_fractions))
+                for substrip_index, (lower_fraction, upper_fraction) in enumerate(
+                    zip(split_fractions, split_fractions[1:]),
+                    1,
+                ):
+                    lower_zf = z0f + (z1f - z0f) * lower_fraction
+                    upper_zf = z0f + (z1f - z0f) * upper_fraction
+                    lower_df = d0f + (d1f - d0f) * lower_fraction
+                    upper_df = d0f + (d1f - d0f) * upper_fraction
+                    lower_af = a0f + (a1f - a0f) * lower_fraction
+                    upper_af = a0f + (a1f - a0f) * upper_fraction
+                    z0, z1 = height * lower_zf, height * upper_zf
+                    # Sample just inside the strip endpoints so an arch apex
+                    # becomes a valid sloped cap instead of a zero-area face.
+                    lower_visible = _shadowlands_visible_intervals(edge_length, openings, z_value=z0 + 1.0e-5)
+                    upper_visible = _shadowlands_visible_intervals(edge_length, openings, z_value=z1 - 1.0e-5)
+                    span_pairs = zip(lower_visible, upper_visible)
+                    for fragment_index, (bottom_span, top_span) in enumerate(span_pairs, 1):
+                        # A cave arch can narrow as it rises.  Each paired span is
+                        # a tapered, fully welded surface rather than two pieces
+                        # that leave triangular slits at the opening shoulders.
+                        a0, b0 = bottom_span
+                        a1, b1 = top_span
+                        meshes.append(
+                            _faceted_quad_surface_mesh(
+                                name=(
+                                    f"{room_resref}_shadowlands_e{edge_index + 1:02d}_"
+                                    f"{role}_{band_index + 1:02d}_{strip_index + 1:02d}_{substrip_index:02d}_{fragment_index:02d}"
+                                ),
+                                corners=(
+                                    point(a0, _shadowlands_profile_depth(edge_index, a0, berm_width=berm_width, depth_factor=lower_df, amplitude_factor=lower_af, profile_level=band_index + lower_fraction), z0),
+                                    point(b0, _shadowlands_profile_depth(edge_index, b0, berm_width=berm_width, depth_factor=lower_df, amplitude_factor=lower_af, profile_level=band_index + lower_fraction), z0),
+                                    point(b1, _shadowlands_profile_depth(edge_index, b1, berm_width=berm_width, depth_factor=upper_df, amplitude_factor=upper_af, profile_level=band_index + upper_fraction), z1),
+                                    point(a1, _shadowlands_profile_depth(edge_index, a1, berm_width=berm_width, depth_factor=upper_df, amplitude_factor=upper_af, profile_level=band_index + upper_fraction), z1),
+                                ),
+                                material=earth_material,
+                                metadata={
+                                    **common,
+                                    "edge_index": edge_index,
+                                    "architecture_role": role,
+                                    "contour_band": band_index,
+                                    "vertical_strip": strip_index,
+                                    "cave_substrip": substrip_index,
+                                    "surface_role": "terrain_wall",
+                                    "welded_terrain_boundary": True,
+                                    "cave_portal_profile": bool(openings),
+                                },
+                                terrain_uv_scale=0.30,
+                            )
+                        )
+
+        # A few exposed roots keep the bank grounded in Kashyyyk without
+        # turning every perimeter segment into a vertical tree-trunk fence.
+        for boundary_index in range(1, segment_count, root_stride):
+            center = min(edge_length, (boundary_index + 0.42) * segment_width)
+            half_bottom = min(0.52, segment_width * 0.20)
+            bottom_span = (max(0.0, center - half_bottom), min(edge_length, center + half_bottom))
+            visible = _architecture_intersections(
+                _shadowlands_visible_intervals(edge_length, openings, z_value=height * 0.31),
+                bottom_span,
+            )
+            for fragment_index, span in enumerate(visible, 1):
+                midpoint = (span[0] + span[1]) * 0.5
+                half_top = min((span[1] - span[0]) * 0.36, 0.18)
+                top_span = (midpoint - half_top, midpoint + half_top)
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_shadowlands_e{edge_index + 1:02d}_exposed_root_{boundary_index + 1:02d}_{fragment_index:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=span,
+                        span_top=top_span,
+                        depth_bottom=_shadowlands_depth(edge_index, center, base=berm_width * 0.30, amplitude=berm_width * 0.05, channel=5.0),
+                        depth_top=_shadowlands_depth(edge_index, center, base=berm_width * 0.56, amplitude=berm_width * 0.06, channel=6.0),
+                        z_bottom=floor_z + height * 0.08,
+                        z_top=floor_z + height * 0.53,
+                        material=root_material,
+                        metadata={
+                            **common,
+                            "edge_index": edge_index,
+                            "architecture_role": "exposed_root_run",
+                            "organic_segment": boundary_index,
+                            "surface_role": "terrain_wall",
+                        },
+                    )
+                )
+
+        for opening_index, opening in enumerate(openings):
+            transition_asset = str(
+                dict(opening.metadata or {}).get("module_transition_asset_id") or ""
+            ).strip().lower()
+            if not transition_asset:
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_shadowlands_e{edge_index + 1:02d}_cave_portal_lip_{opening_index + 1:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=(
+                            max(0.0, float(opening.center_fraction) * edge_length - float(opening.width) * 0.5 - 0.12),
+                            min(edge_length, float(opening.center_fraction) * edge_length + float(opening.width) * 0.5 + 0.12),
+                        ),
+                        span_top=None,
+                        depth_bottom=berm_width * 0.42,
+                        depth_top=berm_width * 0.57,
+                        # The generated connector owns this lip.  A supplied
+                        # facade already contains its own detailed crown.
+                        z_bottom=floor_z + min(height, float(opening.bottom) + float(opening.height)),
+                        z_top=floor_z + min(height, float(opening.bottom) + float(opening.height) + 0.18),
+                        material=root_material,
+                        metadata={
+                            **common,
+                            "edge_index": edge_index,
+                            "architecture_role": "shadowlands_cave_portal_lip",
+                            "opening_name": str(opening.name or ""),
+                            "source_modules": ("m24aa", "m25aa"),
+                            "surface_role": "terrain_wall",
+                        },
+                    )
+                )
+                meshes.extend(
+                    _shadowlands_connected_cave_connector_meshes(
+                        room_resref=room_resref,
+                        edge_index=edge_index,
+                        start=start,
+                        tangent=(tx, ty),
+                        inward_normal=(nx, ny),
+                        edge_length=edge_length,
+                        opening=opening,
+                        floor_z=floor_z,
+                        berm_width=berm_width,
+                        material=earth_material,
+                        common=common,
+                    )
+                )
+            meshes.extend(
+                _module_transition_shell_meshes(
+                    room_resref=room_resref,
+                    edge_index=edge_index,
+                    start=start,
+                    tangent=(tx, ty),
+                    inward_normal=(nx, ny),
+                    edge_length=edge_length,
+                    opening=opening,
+                    floor_z=floor_z,
+                    architecture_profile="shadowlands",
+                )
+            )
+
+    # Stitch the wedges created by each outward edge offset.  The cap shares
+    # the precise edge-ring vertices on both sides, so it closes polygon
+    # corners without a post-process that might alter authored boundaries.
+    for corner_index, corner in enumerate(points):
+        previous_index = (corner_index - 1) % len(points)
+        previous_start = points[previous_index]
+        previous_end = corner
+        next_start = corner
+        next_end = points[(corner_index + 1) % len(points)]
+        previous_length = _edge_length(previous_start, previous_end)
+        next_length = _edge_length(next_start, next_end)
+        if previous_length <= 0.05 or next_length <= 0.05:
+            continue
+        previous_tx = (previous_end[0] - previous_start[0]) / previous_length
+        previous_ty = (previous_end[1] - previous_start[1]) / previous_length
+        next_tx = (next_end[0] - next_start[0]) / next_length
+        next_ty = (next_end[1] - next_start[1]) / next_length
+        previous_normal = (-previous_ty, previous_tx)
+        next_normal = (-next_ty, next_tx)
+
+        def corner_point(tangent: tuple[float, float], normal: tuple[float, float], depth: float, z_value: float) -> Vec3:
+            del tangent
+            return (corner[0] - normal[0] * depth, corner[1] - normal[1] * depth, floor_z + z_value)
+
+        for band_index in range(len(profile_levels) - 1):
+            z0f, d0f, a0f, role = profile_levels[band_index]
+            z1f, d1f, a1f, _next_role = profile_levels[band_index + 1]
+            for strip_index in range(vertical_subdivisions):
+                lower_fraction = float(strip_index) / float(vertical_subdivisions)
+                upper_fraction = float(strip_index + 1) / float(vertical_subdivisions)
+                lower_zf = z0f + (z1f - z0f) * lower_fraction
+                upper_zf = z0f + (z1f - z0f) * upper_fraction
+                lower_df = d0f + (d1f - d0f) * lower_fraction
+                upper_df = d0f + (d1f - d0f) * upper_fraction
+                lower_af = a0f + (a1f - a0f) * lower_fraction
+                upper_af = a0f + (a1f - a0f) * upper_fraction
+                previous_lower = _shadowlands_profile_depth(previous_index, previous_length, berm_width=berm_width, depth_factor=lower_df, amplitude_factor=lower_af, profile_level=band_index + lower_fraction)
+                next_lower = _shadowlands_profile_depth(corner_index, 0.0, berm_width=berm_width, depth_factor=lower_df, amplitude_factor=lower_af, profile_level=band_index + lower_fraction)
+                previous_upper = _shadowlands_profile_depth(previous_index, previous_length, berm_width=berm_width, depth_factor=upper_df, amplitude_factor=upper_af, profile_level=band_index + upper_fraction)
+                next_upper = _shadowlands_profile_depth(corner_index, 0.0, berm_width=berm_width, depth_factor=upper_df, amplitude_factor=upper_af, profile_level=band_index + upper_fraction)
+                lower_previous = corner_point((previous_tx, previous_ty), previous_normal, previous_lower, height * lower_zf)
+                lower_next = corner_point((next_tx, next_ty), next_normal, next_lower, height * lower_zf)
+                upper_next = corner_point((next_tx, next_ty), next_normal, next_upper, height * upper_zf)
+                upper_previous = corner_point((previous_tx, previous_ty), previous_normal, previous_upper, height * upper_zf)
+                corner_name = f"{room_resref}_shadowlands_corner_{corner_index + 1:02d}_{band_index + 1:02d}_{strip_index + 1:02d}"
+                corner_metadata = {
+                    **common,
+                    "architecture_role": role,
+                    "surface_role": "terrain_corner_weld",
+                    "corner_index": corner_index,
+                    "welded_terrain_boundary": True,
+                }
+                if math.dist(lower_previous, lower_next) <= 1.0e-8:
+                    # The floor-weld ring intentionally collapses at every
+                    # footprint corner.  Fill that zero-width lower edge with
+                    # one triangle instead of manufacturing a degenerate quad.
+                    meshes.append(
+                        _faceted_triangle_surface_mesh(
+                            name=corner_name,
+                            corners=(lower_previous, upper_next, upper_previous),
+                            material=earth_material,
+                            metadata={**corner_metadata, "corner_topology": "triangle_fan"},
+                            terrain_uv_scale=0.30,
+                        )
+                    )
+                else:
+                    meshes.append(
+                        _faceted_quad_surface_mesh(
+                            name=corner_name,
+                            corners=(lower_previous, lower_next, upper_next, upper_previous),
+                            material=earth_material,
+                            metadata=corner_metadata,
+                            terrain_uv_scale=0.30,
+                        )
+                    )
+    return tuple(meshes)
+
+
+def _korriban_cave_formation_mesh(
+    *,
+    name: str,
+    anchor: Vec3,
+    height: float,
+    radius: float,
+    downward: bool,
+    lean: Vec2,
+    seed: float,
+    material: PrimitiveMaterial,
+    metadata: dict[str, Any],
+) -> PrimitiveMesh:
+    """Build one faceted stalactite/stalagmite without changing the room WOK.
+
+    Retail m34aa uses dense, irregular ``lko_cliff01`` formations around its
+    traversable floor.  These authored formations deliberately remain render
+    helpers: the floor WOK stays continuous and predictable while the cave
+    silhouette gains the pointed rock vocabulary visible in the stock rooms.
+    """
+
+    spike_height = max(0.25, float(height))
+    base_radius = max(0.08, float(radius))
+    segment_count = 7
+    direction = -1.0 if downward else 1.0
+    base_z = float(anchor[2])
+    middle_z = base_z + direction * spike_height * 0.54
+    tip_z = base_z + direction * spike_height
+    middle_center = (
+        float(anchor[0]) + float(lean[0]) * 0.48,
+        float(anchor[1]) + float(lean[1]) * 0.48,
+    )
+    tip = (
+        float(anchor[0]) + float(lean[0]),
+        float(anchor[1]) + float(lean[1]),
+        tip_z,
+    )
+    base_ring: list[Vec3] = []
+    middle_ring: list[Vec3] = []
+    for index in range(segment_count):
+        angle = (math.tau * float(index) / float(segment_count)) + float(seed) * 0.071
+        irregularity = 1.0 + 0.18 * math.sin((float(index) + 1.0) * 2.173 + float(seed))
+        middle_irregularity = 1.0 + 0.12 * math.sin((float(index) + 1.0) * 1.337 + float(seed) * 0.73)
+        base_ring.append(
+            (
+                float(anchor[0]) + math.cos(angle) * base_radius * irregularity,
+                float(anchor[1]) + math.sin(angle) * base_radius * irregularity,
+                base_z,
+            )
+        )
+        middle_ring.append(
+            (
+                middle_center[0] + math.cos(angle) * base_radius * 0.46 * middle_irregularity,
+                middle_center[1] + math.sin(angle) * base_radius * 0.46 * middle_irregularity,
+                middle_z,
+            )
+        )
+
+    triangles: list[tuple[Vec3, Vec3, Vec3]] = []
+    for index in range(segment_count):
+        following = (index + 1) % segment_count
+        rows = (
+            (base_ring[index], base_ring[following], middle_ring[following]),
+            (base_ring[index], middle_ring[following], middle_ring[index]),
+            (middle_ring[index], middle_ring[following], tip),
+        )
+        triangles.extend(
+            tuple((triangle[0], triangle[2], triangle[1]) for triangle in rows)
+            if downward
+            else rows
+        )
+
+    vertices: list[Vec3] = []
+    normals: list[Vec3] = []
+    uvs: list[Vec2] = []
+    faces: list[Face] = []
+    for triangle in triangles:
+        a, b, c = triangle
+        ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        cross = (
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        )
+        length = math.sqrt(sum(component * component for component in cross))
+        if length <= 1.0e-9:
+            raise ValueError(f"{name} cannot contain a degenerate cave formation facet.")
+        normal = tuple(component / length for component in cross)
+        first = len(vertices)
+        vertices.extend(triangle)
+        normals.extend((normal, normal, normal))
+        abs_normal = tuple(abs(component) for component in normal)
+        if abs_normal[2] >= abs_normal[0] and abs_normal[2] >= abs_normal[1]:
+            uvs.extend((float(vertex[0]) * 0.30, float(vertex[1]) * 0.30) for vertex in triangle)
+        elif abs_normal[0] >= abs_normal[1]:
+            uvs.extend((float(vertex[1]) * 0.30, float(vertex[2]) * 0.30) for vertex in triangle)
+        else:
+            uvs.extend((float(vertex[0]) * 0.30, float(vertex[2]) * 0.30) for vertex in triangle)
+        faces.append((first, first + 1, first + 2))
+    return PrimitiveMesh(
+        name=name,
+        vertices=tuple(vertices),
+        faces=tuple(faces),
+        normals=tuple(normals),
+        uvs=tuple(uvs),
+        texture=material.texture,
+        diffuse=material.diffuse,
+        ambient=material.ambient,
+        metadata={
+            **dict(material.metadata),
+            **metadata,
+            "formation_kind": "stalactite" if downward else "stalagmite",
+            "visual_only": True,
+            "walkmesh_role": "visual_dressing",
+            "faceted_geometry": True,
+        },
+    )
+
+
+def _korriban_cave_portal_volume_meshes(
+    *,
+    room_resref: str,
+    edge_index: int,
+    start: Vec2,
+    tangent: Vec2,
+    inward_normal: Vec2,
+    edge_length: float,
+    opening: FloorPlanWallOpening,
+    floor_z: float,
+    berm_width: float,
+    rock_material: PrimitiveMaterial,
+    trim_material: PrimitiveMaterial,
+    common: dict[str, Any],
+) -> tuple[PrimitiveMesh, ...]:
+    """Build a solid, irregular cave mouth around one reciprocal room portal.
+
+    The WOK portal remains the exact shared threshold plane.  Visible geometry
+    is a separate horseshoe-shaped rock volume with front/back annuli, an
+    irregular outer shell, a deep inner throat, floor shoulders, and a flush
+    threshold.  A Korriban door adds a second extruded masonry horseshoe rather
+    than pasting a rectangular frame plane over the cave wall.
+    """
+
+    opening_metadata = dict(opening.metadata or {})
+    target_room = str(opening_metadata.get("connected_room_resref") or "").strip().lower()
+    if not target_room:
+        return ()
+    center_distance = max(
+        0.0,
+        min(float(edge_length), float(opening.center_fraction) * float(edge_length)),
+    )
+    aperture_half = max(0.42, float(opening.width) * 0.5 + 0.10)
+    opening_height = max(0.90, float(opening.height))
+    crown_radius = min(aperture_half, max(0.45, opening_height * 0.48))
+    spring_height = max(0.32, opening_height - crown_radius)
+    connector_depth = min(4.40, max(2.15, float(berm_width) * 1.35))
+    connector_overlap = min(1.15, max(0.72, float(opening.width) * 0.14))
+    room_seed = sum((index + 1) * ord(character) for index, character in enumerate(room_resref))
+    portal_seed = float(room_seed + (edge_index + 1) * 977)
+
+    # Lower-left -> crown -> lower-right.  The open bottom is closed by the
+    # threshold and shoulder faces below, keeping the walking aperture clear.
+    profile: list[Vec2] = [(-aperture_half, 0.0), (-aperture_half, spring_height)]
+    arc_segments = 10
+    for sample_index in range(1, arc_segments + 1):
+        angle = math.pi - (math.pi * float(sample_index) / float(arc_segments))
+        profile.append(
+            (
+                math.cos(angle) * crown_radius,
+                spring_height + math.sin(angle) * crown_radius,
+            )
+        )
+    profile.append((aperture_half, 0.0))
+
+    def world_point(local: Vec2, depth: float) -> Vec3:
+        return (
+            float(start[0])
+            + float(tangent[0]) * (center_distance + float(local[0]))
+            + float(inward_normal[0]) * float(depth),
+            float(start[1])
+            + float(tangent[1]) * (center_distance + float(local[0]))
+            + float(inward_normal[1]) * float(depth),
+            float(floor_z) + float(opening.bottom) + float(local[1]),
+        )
+
+    def expanded_profile(
+        *,
+        station_index: int,
+        lateral_extra: float,
+        crown_extra: float,
+    ) -> tuple[Vec2, ...]:
+        rows: list[Vec2] = []
+        last_index = max(1, len(profile) - 1)
+        for profile_index, (lateral, height_value) in enumerate(profile):
+            arch_weight = math.sin(math.pi * float(profile_index) / float(last_index))
+            side = -1.0 if lateral < -1.0e-7 else 1.0 if lateral > 1.0e-7 else 0.0
+            phase = (
+                portal_seed * 0.0029
+                + float(station_index + 1) * 1.731
+                + float(profile_index + 1) * 1.113
+            )
+            lateral_noise = math.sin(phase) * 0.12 + math.sin(phase * 2.17 + 0.4) * 0.06
+            height_noise = math.sin(phase * 1.61 + 0.8) * 0.10
+            expanded_lateral = (
+                lateral
+                + side * lateral_extra * (0.76 + (1.0 - arch_weight) * 0.24)
+                + lateral_noise * max(0.18, lateral_extra)
+            )
+            if profile_index in {0, last_index}:
+                expanded_height = 0.0
+            else:
+                expanded_height = max(
+                    0.08,
+                    height_value
+                    + crown_extra * (0.32 + arch_weight * 0.68)
+                    + height_noise * max(0.16, crown_extra),
+                )
+            rows.append((expanded_lateral, expanded_height))
+        return tuple(rows)
+
+    # The widest shoulder sits just inside the cave and then recedes into the
+    # throat.  This gives the entrance a boulder-mound silhouette from oblique
+    # views instead of a constant-depth extrusion.
+    stations = (
+        (-connector_overlap, 0.68, 0.48),
+        (-0.10, 1.02, 0.86),
+        (0.58, 1.30, 1.18),
+        (1.28, 1.08, 0.91),
+        (connector_depth, 0.52, 0.42),
+    )
+    inner_rings = tuple(
+        tuple(world_point(point, depth) for point in profile)
+        for depth, _lateral, _crown in stations
+    )
+    outer_rings = tuple(
+        tuple(
+            world_point(point, depth)
+            for point in expanded_profile(
+                station_index=station_index,
+                lateral_extra=lateral_extra,
+                crown_extra=crown_extra,
+            )
+        )
+        for station_index, (depth, lateral_extra, crown_extra) in enumerate(stations)
+    )
+    base_metadata = {
+        **common,
+        "edge_index": edge_index,
+        "opening_name": str(opening.name or ""),
+        "connected_room_resref": target_room,
+        "architecture_role": "korriban_cave_portal_volume",
+        "surface_role": "cave_portal_volume",
+        "solid_portal_geometry": True,
+        "portal_plane_depth_m": 0.0,
+        "portal_volume_depth_m": connector_depth + connector_overlap,
+        "connector_overlap_m": connector_overlap,
+        "source_modules": ("m34aa", "710kor"),
+        "vanilla_form_reference": "Shyrack cave mound and tomb transition",
+    }
+    meshes: list[PrimitiveMesh] = []
+    for station_index in range(len(stations) - 1):
+        for profile_index in range(len(profile) - 1):
+            following = profile_index + 1
+            meshes.append(
+                _faceted_quad_surface_mesh(
+                    name=(
+                        f"{room_resref}_korriban_cave_e{edge_index + 1:02d}_"
+                        f"portal_rock_{station_index + 1:02d}_{profile_index + 1:02d}"
+                    ),
+                    corners=(
+                        outer_rings[station_index][profile_index],
+                        outer_rings[station_index + 1][profile_index],
+                        outer_rings[station_index + 1][following],
+                        outer_rings[station_index][following],
+                    ),
+                    material=rock_material,
+                    metadata={
+                        **base_metadata,
+                        "architecture_role": "korriban_cave_portal_rock_mound",
+                        "portal_shell_station": station_index,
+                        "portal_profile_segment": profile_index,
+                        "closed_outer_shell": True,
+                    },
+                    terrain_uv_scale=0.30,
+                )
+            )
+            meshes.append(
+                _faceted_quad_surface_mesh(
+                    name=(
+                        f"{room_resref}_korriban_cave_e{edge_index + 1:02d}_"
+                        f"portal_throat_{station_index + 1:02d}_{profile_index + 1:02d}"
+                    ),
+                    corners=(
+                        inner_rings[station_index][following],
+                        inner_rings[station_index + 1][following],
+                        inner_rings[station_index + 1][profile_index],
+                        inner_rings[station_index][profile_index],
+                    ),
+                    material=rock_material,
+                    metadata={
+                        **base_metadata,
+                        "architecture_role": "korriban_cave_portal_throat",
+                        "portal_shell_station": station_index,
+                        "portal_profile_segment": profile_index,
+                        "closed_inner_reveal": True,
+                    },
+                    terrain_uv_scale=0.30,
+                )
+            )
+
+        # Close the horseshoe volume along both floor shoulders.  These faces
+        # meet the authored floor exactly and never intrude into the aperture.
+        for side_name, profile_index in (("left", 0), ("right", len(profile) - 1)):
+            meshes.append(
+                _faceted_quad_surface_mesh(
+                    name=(
+                        f"{room_resref}_korriban_cave_e{edge_index + 1:02d}_"
+                        f"portal_floor_shoulder_{side_name}_{station_index + 1:02d}"
+                    ),
+                    corners=(
+                        outer_rings[station_index][profile_index],
+                        inner_rings[station_index][profile_index],
+                        inner_rings[station_index + 1][profile_index],
+                        outer_rings[station_index + 1][profile_index],
+                    )
+                    if side_name == "left"
+                    else (
+                        inner_rings[station_index][profile_index],
+                        outer_rings[station_index][profile_index],
+                        outer_rings[station_index + 1][profile_index],
+                        inner_rings[station_index + 1][profile_index],
+                    ),
+                    material=rock_material,
+                    metadata={
+                        **base_metadata,
+                        "architecture_role": "korriban_cave_portal_floor_shoulder",
+                        "portal_side": side_name,
+                        "closed_floor_shoulder": True,
+                    },
+                    terrain_uv_scale=0.30,
+                )
+            )
+
+    # Front and back annuli make the rock surround a closed three-dimensional
+    # horseshoe rather than a collection of un-capped shell strips.
+    for cap_name, ring_index, reverse in (
+        ("front", 0, False),
+        ("back", len(stations) - 1, True),
+    ):
+        for profile_index in range(len(profile) - 1):
+            following = profile_index + 1
+            corners = (
+                outer_rings[ring_index][profile_index],
+                outer_rings[ring_index][following],
+                inner_rings[ring_index][following],
+                inner_rings[ring_index][profile_index],
+            )
+            if reverse:
+                corners = tuple(reversed(corners))
+            meshes.append(
+                _faceted_quad_surface_mesh(
+                    name=(
+                        f"{room_resref}_korriban_cave_e{edge_index + 1:02d}_"
+                        f"portal_{cap_name}_cap_{profile_index + 1:02d}"
+                    ),
+                    corners=corners,
+                    material=rock_material,
+                    metadata={
+                        **base_metadata,
+                        "architecture_role": "korriban_cave_portal_volume_cap",
+                        "portal_volume_cap": cap_name,
+                        "closed_portal_annulus": True,
+                    },
+                    terrain_uv_scale=0.30,
+                )
+            )
+
+    threshold_front = -connector_overlap
+    threshold_back = connector_depth
+    threshold_z = float(floor_z) + float(opening.bottom) + 0.012
+    threshold = (
+        (
+            float(start[0]) + float(tangent[0]) * (center_distance - aperture_half)
+            + float(inward_normal[0]) * threshold_front,
+            float(start[1]) + float(tangent[1]) * (center_distance - aperture_half)
+            + float(inward_normal[1]) * threshold_front,
+            threshold_z,
+        ),
+        (
+            float(start[0]) + float(tangent[0]) * (center_distance + aperture_half)
+            + float(inward_normal[0]) * threshold_front,
+            float(start[1]) + float(tangent[1]) * (center_distance + aperture_half)
+            + float(inward_normal[1]) * threshold_front,
+            threshold_z,
+        ),
+        (
+            float(start[0]) + float(tangent[0]) * (center_distance + aperture_half)
+            + float(inward_normal[0]) * threshold_back,
+            float(start[1]) + float(tangent[1]) * (center_distance + aperture_half)
+            + float(inward_normal[1]) * threshold_back,
+            threshold_z,
+        ),
+        (
+            float(start[0]) + float(tangent[0]) * (center_distance - aperture_half)
+            + float(inward_normal[0]) * threshold_back,
+            float(start[1]) + float(tangent[1]) * (center_distance - aperture_half)
+            + float(inward_normal[1]) * threshold_back,
+            threshold_z,
+        ),
+    )
+    meshes.append(
+        _faceted_quad_surface_mesh(
+            name=f"{room_resref}_korriban_cave_e{edge_index + 1:02d}_portal_threshold",
+            corners=threshold,
+            material=rock_material,
+            metadata={
+                **base_metadata,
+                "architecture_role": "korriban_cave_portal_threshold",
+                "walkmesh_alignment": "flush_visual_overlay",
+                "closed_threshold": True,
+            },
+            terrain_uv_scale=0.30,
+        )
+    )
+
+    if str(opening_metadata.get("door_model_resref") or "").strip().lower() == "dor_lko04":
+        # An extruded octagonal/arched masonry ring sits *inside* the rock
+        # mound.  It is deliberately separate from the door actor and carries
+        # no walkmesh, matching the stock division between room surround,
+        # DOR_LKO04 animation, and WOK transition.
+        frame_front = 0.10
+        frame_back = 0.48
+        frame_outer = expanded_profile(
+            station_index=17,
+            lateral_extra=0.30,
+            crown_extra=0.34,
+        )
+        frame_inner_front = tuple(world_point(point, frame_front) for point in profile)
+        frame_inner_back = tuple(world_point(point, frame_back) for point in profile)
+        frame_outer_front = tuple(world_point(point, frame_front) for point in frame_outer)
+        frame_outer_back = tuple(world_point(point, frame_back) for point in frame_outer)
+        frame_metadata = {
+            **base_metadata,
+            "door_model_resref": "dor_lko04",
+            "architecture_role": "korriban_door_frame_cave_arch",
+            "surface_role": "architectural_detail",
+            "extruded_frame_depth_m": frame_back - frame_front,
+            "beveled_geometry": True,
+        }
+        for profile_index in range(len(profile) - 1):
+            following = profile_index + 1
+            frame_rows = (
+                (
+                    "front",
+                    (
+                        frame_outer_front[profile_index],
+                        frame_outer_front[following],
+                        frame_inner_front[following],
+                        frame_inner_front[profile_index],
+                    ),
+                ),
+                (
+                    "back",
+                    (
+                        frame_inner_back[profile_index],
+                        frame_inner_back[following],
+                        frame_outer_back[following],
+                        frame_outer_back[profile_index],
+                    ),
+                ),
+                (
+                    "outer",
+                    (
+                        frame_outer_front[profile_index],
+                        frame_outer_back[profile_index],
+                        frame_outer_back[following],
+                        frame_outer_front[following],
+                    ),
+                ),
+                (
+                    "reveal",
+                    (
+                        frame_inner_front[following],
+                        frame_inner_back[following],
+                        frame_inner_back[profile_index],
+                        frame_inner_front[profile_index],
+                    ),
+                ),
+            )
+            for part, corners in frame_rows:
+                meshes.append(
+                    _faceted_quad_surface_mesh(
+                        name=(
+                            f"{room_resref}_korriban_cave_e{edge_index + 1:02d}_"
+                            f"door_arch_{part}_{profile_index + 1:02d}"
+                        ),
+                        corners=corners,
+                        material=trim_material,
+                        metadata={
+                            **frame_metadata,
+                            "door_frame_part": part,
+                            "portal_profile_segment": profile_index,
+                            "closed_masonry_frame": True,
+                        },
+                        terrain_uv_scale=0.30,
+                    )
+                )
+    return tuple(meshes)
+
+
+def build_floor_plan_korriban_cave_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[PrimitiveMesh, ...]:
+    """Compile a sealed, irregular Shyrack-cave passage around a footprint.
+
+    K1 m34aa and K2 710KOR largely share the same cave topology: a continuous
+    walkable stone floor, faceted cliff walls, a rounded inward crown, and WOK
+    transition mouths without architectural door hooks.  This generator keeps
+    that vocabulary while leaving the large retail caverns available as
+    draggable room tiles.
+    """
+
+    if not primitive.include_walls:
+        return ()
+    validation = validate_floor_plan_room_primitive(primitive)
+    if not validation.ok:
+        raise ValueError("; ".join(validation.blocking_issues))
+    height = float(primitive.wall_height)
+    if height < 4.50:
+        raise ValueError("The Shyrack cave contour requires a height of at least 4.50 m.")
+    points = _ccw_points(_normalise_points(primitive.points))
+    room_resref = _normalise_resref(primitive.room_resref)
+    floor_z = float(primitive.z)
+    profile = str(primitive.metadata.get("architecture_profile", "") or "").strip().lower()
+    shell_profile = architecture_shell_profile(primitive)
+    if shell_profile not in {
+        "korriban_cave",
+        "korriban_cave_grotto",
+        "korriban_cave_nest",
+    }:
+        shell_profile = "korriban_cave"
+    is_k2 = profile == "korriban_caves_k2"
+    cliff_texture = "kor_cliff01" if is_k2 else "lko_cliff01"
+    cliff_material = primitive.wall_material or _architecture_material(cliff_texture)
+    ceiling_material = primitive.ceiling_material or cliff_material
+    portal_trim_material = _architecture_material("kor_tr01")
+    min_x = min(point[0] for point in points)
+    max_x = max(point[0] for point in points)
+    min_y = min(point[1] for point in points)
+    max_y = max(point[1] for point in points)
+    footprint_span = min(max_x - min_x, max_y - min_y)
+    if shell_profile == "korriban_cave_grotto":
+        maximum_depth = min(2.65, max(1.10, footprint_span * 0.22))
+    elif shell_profile == "korriban_cave_nest":
+        maximum_depth = min(2.20, max(0.90, footprint_span * 0.20))
+    else:
+        maximum_depth = min(1.85, max(0.72, footprint_span * 0.18))
+    # Alternating inward shoulders and outward pockets create a genuinely
+    # concave cross-section.  The old monotonic inset read as a flat berm even
+    # after triangulation.  These stations follow the layered bulge/recess
+    # rhythm measured across m34aa_02a/03a/04a cliff surfaces.
+    if shell_profile == "korriban_cave_grotto":
+        profile_levels = (
+            (0.00, 0.00, 0.000, "grotto_floor_weld"),
+            (0.08, 0.28, 0.150, "grotto_weathered_toe"),
+            (0.24, 0.02, 0.300, "grotto_lower_undercut"),
+            (0.42, 0.58, 0.360, "grotto_layered_cliff"),
+            (0.58, 0.16, 0.410, "grotto_deep_rock_pocket"),
+            (0.74, 0.86, 0.370, "grotto_rock_shelf"),
+            (0.88, 0.30, 0.330, "grotto_upper_undercut"),
+            (1.00, 1.00, 0.260, "grotto_faceted_crown"),
+        )
+        formation_spacing = 3.25
+    elif shell_profile == "korriban_cave_nest":
+        profile_levels = (
+            (0.00, 0.00, 0.000, "nest_floor_weld"),
+            (0.09, 0.22, 0.160, "nest_rock_toe"),
+            (0.25, 0.03, 0.310, "nest_lower_recess"),
+            (0.45, 0.50, 0.390, "nest_cliff_wall"),
+            (0.62, 0.10, 0.450, "nest_eroded_alcove"),
+            (0.78, 0.82, 0.410, "nest_pointed_shoulders"),
+            (0.91, 0.34, 0.370, "nest_ceiling_pocket"),
+            (1.00, 1.00, 0.300, "nest_irregular_crown"),
+        )
+        formation_spacing = 2.45
+    else:
+        profile_levels = (
+            (0.00, 0.00, 0.000, "cave_floor_weld"),
+            (0.10, 0.24, 0.120, "weathered_cave_toe"),
+            (0.28, 0.02, 0.220, "lower_cave_recess"),
+            (0.47, 0.44, 0.270, "shyrack_cliff_wall"),
+            (0.64, 0.12, 0.320, "eroded_cave_alcove"),
+            (0.80, 0.78, 0.290, "canted_rock_shoulders"),
+            (0.92, 0.38, 0.240, "upper_ceiling_pocket"),
+            (1.00, 1.00, 0.190, "faceted_cave_crown"),
+        )
+        formation_spacing = 3.80
+    depths = tuple(maximum_depth * level[1] for level in profile_levels)
+    rings, depth_scale = _architecture_profile_rings(points, depths)
+    ring_cache = dict(rings)
+
+    def profile_ring(depth_factor: float) -> tuple[Vec2, ...]:
+        depth = maximum_depth * float(depth_factor)
+        cached = ring_cache.get(depth)
+        if cached is None:
+            cached = points if depth <= 1.0e-8 else inset_floor_plan_points(points, depth * depth_scale)
+            ring_cache[depth] = cached
+        return cached
+    openings_by_edge: dict[int, tuple[FloorPlanWallOpening, ...]] = {
+        edge_index: tuple(opening for opening in primitive.openings if int(opening.edge_index) == edge_index)
+        for edge_index in range(len(points))
+    }
+    common = {
+        "primitive": "floor_plan_korriban_cave_shell",
+        "architecture_profile": profile,
+        "architecture_shell_profile": shell_profile,
+        "profile_depth_scale": depth_scale,
+        "source_module": "710kor" if is_k2 else "m34aa",
+        "source_rooms": tuple(primitive.metadata.get("architecture_evidence_rooms") or ()),
+        "source_geometry_family": "K2 710KOR" if is_k2 else "K1 m34aa",
+        "sealed_cave_shell": True,
+        "concave_profile": True,
+        "deterministic_organic_variation": True,
+    }
+    meshes: list[PrimitiveMesh] = []
+    room_seed = sum((index + 1) * ord(character) for index, character in enumerate(room_resref))
+
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        edge_length = _edge_length(start, end)
+        if edge_length <= 0.05:
+            continue
+        tx = (end[0] - start[0]) / edge_length
+        ty = (end[1] - start[1]) / edge_length
+        nx, ny = -ty, tx
+        openings = openings_by_edge.get(edge_index, ())
+
+        def ring_point(ring: tuple[Vec2, ...], distance: float) -> Vec2:
+            next_index = (edge_index + 1) % len(ring)
+            if distance <= 1.0e-8:
+                return ring[edge_index]
+            if distance >= edge_length - 1.0e-8:
+                return ring[next_index]
+            ring_start = ring[edge_index]
+            start_shift = (ring_start[0] - start[0]) * tx + (ring_start[1] - start[1]) * ty
+            along = distance - start_shift
+            return (ring_start[0] + tx * along, ring_start[1] + ty * along)
+
+        def cave_point(
+            ring: tuple[Vec2, ...],
+            distance: float,
+            z_value: float,
+            amplitude_factor: float,
+            profile_fraction: float,
+        ) -> Vec3:
+            base = ring_point(ring, distance)
+            window = math.sin(math.pi * max(0.0, min(1.0, distance / edge_length))) ** 2
+            amplitude = maximum_depth * float(amplitude_factor)
+            phase = (
+                float(room_seed) * 0.0019
+                + float(edge_index + 1) * 2.113
+                + float(distance) * 0.917
+                + float(profile_fraction) * 7.731
+            )
+            wave = (
+                math.sin(phase) * 0.48
+                + math.sin(phase * 1.873 + 0.63) * 0.31
+                + math.sin(phase * 3.119 + 1.17) * 0.21
+            )
+            varied = amplitude * wave
+            return (
+                base[0] + nx * varied * window,
+                base[1] + ny * varied * window,
+                floor_z + z_value,
+            )
+
+        for band_index in range(len(profile_levels) - 1):
+            z0f, d0f, a0f, role = profile_levels[band_index]
+            z1f, d1f, a1f, _next_role = profile_levels[band_index + 1]
+            strip_breaks = [0.0, 0.5, 1.0]
+            for opening in openings:
+                radius = min(float(opening.width) * 0.5, max(0.18, float(opening.height) * 0.48))
+                for split_z in (
+                    float(opening.bottom),
+                    max(float(opening.bottom), float(opening.bottom) + float(opening.height) - radius),
+                    float(opening.bottom) + float(opening.height),
+                ):
+                    normalized = (split_z / height - z0f) / max(1.0e-8, z1f - z0f)
+                    if 1.0e-7 < normalized < 1.0 - 1.0e-7:
+                        strip_breaks.append(normalized)
+            strip_breaks = sorted(set(strip_breaks))
+            for strip_index, (lower_fraction, upper_fraction) in enumerate(zip(strip_breaks, strip_breaks[1:]), 1):
+                lower_zf = z0f + (z1f - z0f) * lower_fraction
+                upper_zf = z0f + (z1f - z0f) * upper_fraction
+                lower_df = d0f + (d1f - d0f) * lower_fraction
+                upper_df = d0f + (d1f - d0f) * upper_fraction
+                lower_af = a0f + (a1f - a0f) * lower_fraction
+                upper_af = a0f + (a1f - a0f) * upper_fraction
+                z0 = height * lower_zf
+                z1 = height * upper_zf
+                lower_visible = _shadowlands_visible_intervals(edge_length, openings, z_value=z0 + 1.0e-5)
+                upper_visible = _shadowlands_visible_intervals(edge_length, openings, z_value=z1 - 1.0e-5)
+                for fragment_index, (bottom_span, top_span) in enumerate(zip(lower_visible, upper_visible), 1):
+                    subdivisions = max(
+                        1,
+                        int(
+                            math.ceil(
+                                max(bottom_span[1] - bottom_span[0], top_span[1] - top_span[0]) / 1.35
+                            )
+                        ),
+                    )
+                    for segment_index in range(subdivisions):
+                        first = float(segment_index) / float(subdivisions)
+                        second = float(segment_index + 1) / float(subdivisions)
+                        b0 = bottom_span[0] + (bottom_span[1] - bottom_span[0]) * first
+                        b1 = bottom_span[0] + (bottom_span[1] - bottom_span[0]) * second
+                        t0 = top_span[0] + (top_span[1] - top_span[0]) * first
+                        t1 = top_span[0] + (top_span[1] - top_span[0]) * second
+                        meshes.append(
+                            _faceted_quad_surface_mesh(
+                                name=(
+                                    f"{room_resref}_korriban_cave_e{edge_index + 1:02d}_"
+                                    f"{role}_{band_index + 1:02d}_{strip_index:02d}_{fragment_index:02d}_{segment_index + 1:02d}"
+                                ),
+                                # Reverse the ordinary exterior-wall winding so
+                                # the faceted normals face into the cave.
+                                corners=(
+                                    cave_point(profile_ring(lower_df), b0, z0, lower_af, lower_zf),
+                                    cave_point(profile_ring(upper_df), t0, z1, upper_af, upper_zf),
+                                    cave_point(profile_ring(upper_df), t1, z1, upper_af, upper_zf),
+                                    cave_point(profile_ring(lower_df), b1, z0, lower_af, lower_zf),
+                                ),
+                                material=cliff_material,
+                                metadata={
+                                    **common,
+                                    "edge_index": edge_index,
+                                    "architecture_role": role,
+                                    "surface_role": "cave_wall",
+                                    "contour_band": band_index,
+                                    "contour_depth_start": lower_df,
+                                    "contour_depth_end": upper_df,
+                                    "vertical_strip": strip_index,
+                                    "cave_segment": segment_index,
+                                    "rounded_opening_profile": bool(openings),
+                                },
+                                terrain_uv_scale=0.30,
+                            )
+                        )
+
+        for opening in openings:
+            meshes.extend(
+                _korriban_cave_portal_volume_meshes(
+                    room_resref=room_resref,
+                    edge_index=edge_index,
+                    start=start,
+                    tangent=(tx, ty),
+                    inward_normal=(nx, ny),
+                    edge_length=edge_length,
+                    opening=opening,
+                    floor_z=floor_z,
+                    berm_width=maximum_depth,
+                    rock_material=cliff_material,
+                    trim_material=portal_trim_material,
+                    common=common,
+                )
+            )
+            meshes.extend(
+                _module_transition_shell_meshes(
+                    room_resref=room_resref,
+                    edge_index=edge_index,
+                    start=start,
+                    tangent=(tx, ty),
+                    inward_normal=(nx, ny),
+                    edge_length=edge_length,
+                    opening=opening,
+                    floor_z=floor_z,
+                    architecture_profile=profile,
+                )
+            )
+        # The cave-specific volume above owns DOR_LKO04 framing.  Retain the
+        # generic transition path only for any future non-tomb door model.
+        generic_transition_openings = tuple(
+            opening
+            for opening in openings
+            if str(dict(opening.metadata or {}).get("door_model_resref") or "").strip().lower()
+            != "dor_lko04"
+        )
+        meshes.extend(
+            _architecture_door_transition_meshes(
+                room_resref=room_resref,
+                profile=profile,
+                edge_index=edge_index,
+                start=start,
+                end=end,
+                edge_length=edge_length,
+                floor_z=floor_z,
+                wall_height=height,
+                openings=generic_transition_openings,
+                infill_material=cliff_material,
+                trim_material=cliff_material,
+                light_material=cliff_material,
+                common=common,
+            )
+        )
+
+        # Keep pointed formations near the perimeter so they read clearly
+        # without narrowing the central traversal lane.  Openings receive a
+        # generous exclusion margin, and the formations stay visual-only.
+        formation_count = max(2, int(math.floor(edge_length / formation_spacing)))
+        for formation_index in range(formation_count):
+            distance = edge_length * (float(formation_index) + 0.5) / float(formation_count)
+            blocked = any(
+                abs(distance - float(opening.center_fraction) * edge_length)
+                <= float(opening.width) * 0.5 + 0.85
+                for opening in openings
+            )
+            if blocked:
+                continue
+            phase = (
+                float(room_seed) * 0.0037
+                + float(edge_index + 1) * 1.927
+                + float(formation_index + 1) * 2.311
+            )
+            downward = (edge_index + formation_index) % 2 == 0
+            base_2d = ring_point(profile_ring(0.58 if downward else 0.42), distance)
+            lateral = math.sin(phase * 1.71) * 0.28
+            inward = maximum_depth * (0.08 + 0.05 * (0.5 + 0.5 * math.sin(phase)))
+            anchor = (
+                base_2d[0] + tx * lateral + nx * inward,
+                base_2d[1] + ty * lateral + ny * inward,
+                floor_z + height - 0.08 if downward else floor_z + 0.015,
+            )
+            spike_height = min(
+                height * 0.31,
+                (0.72 if downward else 0.55) + (0.5 + 0.5 * math.sin(phase * 1.37)) * 1.05,
+            )
+            radius = 0.20 + (0.5 + 0.5 * math.sin(phase * 2.07 + 0.4)) * 0.23
+            lean = (
+                tx * math.sin(phase) * 0.18 + nx * 0.11,
+                ty * math.sin(phase) * 0.18 + ny * 0.11,
+            )
+            role = "shyrack_stalactite" if downward else "shyrack_stalagmite"
+            meshes.append(
+                _korriban_cave_formation_mesh(
+                    name=f"{room_resref}_{role}_{edge_index + 1:02d}_{formation_index + 1:02d}",
+                    anchor=anchor,
+                    height=spike_height,
+                    radius=radius,
+                    downward=downward,
+                    lean=lean,
+                    seed=phase,
+                    material=cliff_material,
+                    metadata={
+                        **common,
+                        "edge_index": edge_index,
+                        "architecture_role": role,
+                        "surface_role": "cave_formation",
+                        "source_measurement": "m34aa_02a/03a/04a pointed lko_cliff01 formations",
+                    },
+                )
+            )
+
+    if primitive.include_ceiling:
+        crown_ring = profile_ring(1.0)
+        center_x = sum(point[0] for point in crown_ring) / len(crown_ring)
+        center_y = sum(point[1] for point in crown_ring) / len(crown_ring)
+        boundary: list[Vec3] = []
+        for edge_index, first in enumerate(crown_ring):
+            second = crown_ring[(edge_index + 1) % len(crown_ring)]
+            length = _edge_length(first, second)
+            segment_count = max(2, int(math.ceil(length / 2.25)))
+            for segment_index in range(segment_count):
+                fraction = float(segment_index) / float(segment_count)
+                phase = (
+                    float(room_seed) * 0.0023
+                    + float(edge_index + 1) * 1.619
+                    + float(segment_index + 1) * 1.177
+                )
+                boundary.append(
+                    (
+                        first[0] + (second[0] - first[0]) * fraction,
+                        first[1] + (second[1] - first[1]) * fraction,
+                        floor_z + height + math.sin(phase) * 0.16,
+                    )
+                )
+        inner: list[Vec3] = []
+        for index, point in enumerate(boundary):
+            phase = float(room_seed) * 0.0041 + float(index + 1) * 1.413
+            radial_factor = 0.48 + math.sin(phase * 1.31) * 0.07
+            inner.append(
+                (
+                    center_x + (point[0] - center_x) * radial_factor + math.sin(phase) * 0.18,
+                    center_y + (point[1] - center_y) * radial_factor + math.cos(phase * 0.83) * 0.18,
+                    floor_z + height + 0.34 + math.sin(phase * 1.79) * 0.31,
+                )
+            )
+        center_phase = float(room_seed) * 0.0067
+        center = (
+            center_x + math.sin(center_phase) * 0.24,
+            center_y + math.cos(center_phase * 1.13) * 0.24,
+            floor_z + height + 0.56 + math.sin(center_phase * 1.91) * 0.22,
+        )
+        for index, first in enumerate(boundary):
+            following = (index + 1) % len(boundary)
+            meshes.append(
+                _faceted_quad_surface_mesh(
+                    name=f"{room_resref}_korriban_cave_crown_outer_{index + 1:03d}",
+                    corners=(
+                        first,
+                        inner[index],
+                        inner[following],
+                        boundary[following],
+                    ),
+                    material=ceiling_material,
+                    metadata={
+                        **common,
+                        "architecture_role": "faceted_cave_ceiling",
+                        "surface_role": "cave_ceiling",
+                        "ceiling_facet": index,
+                        "ceiling_region": "concave_outer_pocket",
+                        "source_measurement": "m34aa multi-facet cliff crown",
+                    },
+                    terrain_uv_scale=0.30,
+                )
+            )
+            meshes.append(
+                _faceted_triangle_surface_mesh(
+                    name=f"{room_resref}_korriban_cave_crown_inner_{index + 1:03d}",
+                    corners=(inner[index], center, inner[following]),
+                    material=ceiling_material,
+                    metadata={
+                        **common,
+                        "architecture_role": "faceted_cave_ceiling",
+                        "surface_role": "cave_ceiling",
+                        "ceiling_facet": index,
+                        "ceiling_region": "irregular_inner_vault",
+                        "source_measurement": "m34aa multi-facet cliff crown",
+                    },
+                    terrain_uv_scale=0.30,
+                )
+            )
+    return tuple(meshes)
+
+
+def build_floor_plan_architecture_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[PrimitiveMesh, ...]:
+    """Dress a footprint with a measured vanilla architecture profile.
+
+    Unlike the old palette-only styles, these profiles change the silhouette:
+    wall bays are recessed, structural ribs project into the room, Endar Spire
+    walls meet the ceiling through an angled cove, and Taris apartment walls
+    receive their characteristic framed panels, skirting, and utility lights.
+    The result remains ordinary Odyssey triangle meshes and exports through the
+    same MDL/MDX/WOK path as other authored geometry.
+    """
+
+    profile = str(primitive.metadata.get("architecture_profile", "") or "").strip().lower()
+    if profile not in {
+        "endar_spire",
+        "harbinger",
+        "taris_apartments",
+        "telos_citadel",
+        "rhen_var",
+        "onderon_city",
+        "onderon_cantina",
+        "onderon_sky_ramp",
+        "onderon_palace",
+        "shadowlands",
+        "korriban_tombs",
+        "korriban_tombs_k2",
+        "korriban_caves_k1",
+        "korriban_caves_k2",
+    } or not primitive.include_walls:
+        return ()
+    if profile == "shadowlands":
+        return build_floor_plan_shadowlands_meshes(primitive)
+    if profile in {"korriban_caves_k1", "korriban_caves_k2"}:
+        return build_floor_plan_korriban_cave_meshes(primitive)
+    if profile in {"korriban_tombs", "korriban_tombs_k2"}:
+        return build_floor_plan_profiled_shell_meshes(primitive)
+    height = float(primitive.wall_height)
+    if height < 1.8:
+        return ()
+    points = _ccw_points(_normalise_points(primitive.points))
+    room_resref = _normalise_resref(primitive.room_resref)
+    floor_z = float(primitive.z)
+    accents = tuple(
+        str(value or "").strip().lower()
+        for value in tuple(primitive.metadata.get("architecture_accent_textures") or ())
+        if str(value or "").strip()
+    )
+    if profile == "endar_spire":
+        defaults = ("lhr_red02", "lhr_trim01", "lhr_lit01", "lhr_wall06")
+        bay_target = 2.55
+    elif profile == "harbinger":
+        defaults = ("har_wl01", "har_tr02", "har_lt01", "har_wl09")
+        bay_target = 2.55
+    elif profile == "telos_citadel":
+        defaults = ("tel_wl03", "tel_tr04", "tel_lt02", "tel_hcl1")
+        bay_target = (
+            7.00
+            if architecture_shell_profile(primitive) == "telos_citadel_concourse"
+            else 5.00
+            if architecture_shell_profile(primitive) == "telos_citadel_civic"
+            else 4.00
+        )
+    elif profile == "rhen_var":
+        defaults = ("gr_rvstone", "gr_rvfloor", "gr_rvsnow", "gr_rvstone")
+        bay_target = 8.00
+    elif profile == "onderon_city":
+        defaults = ("ond_tr04", "ond_wl08", "ond_lt02", "ond_wl06")
+        bay_target = (
+            6.50
+            if architecture_shell_profile(primitive) == "onderon_city_square"
+            else 7.50
+            if architecture_shell_profile(primitive) == "onderon_city_spaceport"
+            else 5.50
+        )
+    elif profile == "onderon_cantina":
+        defaults = ("ond_wl11", "ond_tr03", "ond_lt03", "ond_wl06")
+        bay_target = 3.50 if architecture_shell_profile(primitive) == "onderon_cantina_lounge" else 4.25
+    elif profile == "onderon_sky_ramp":
+        defaults = ("ond_tr05", "ond_wl10", "ond_lt02", "ond_wl05")
+        bay_target = 10.00 if architecture_shell_profile(primitive) == "onderon_sky_ramp_terrace" else 8.00
+    elif profile == "onderon_palace":
+        defaults = ("ond_tr06", "ond_wl10", "ond_lt03", "ond_orn")
+        bay_target = (
+            7.50
+            if architecture_shell_profile(primitive) == "onderon_palace_state_hall"
+            else 3.75
+            if architecture_shell_profile(primitive) == "onderon_palace_museum"
+            else 4.50
+        )
+    else:
+        defaults = ("lts_pwall04", "lts_trim01", "lts_lite08", "lts_gwall01")
+        bay_target = 2.40
+    textures = tuple((accents + defaults)[:4])
+    if len(textures) < 4:
+        textures = defaults
+    accent_material = _architecture_material(textures[0])
+    trim_material = _architecture_material(textures[1])
+    light_material = _architecture_material(textures[2], luminous=True)
+    utility_material = _architecture_material(textures[3])
+    wall_material = primitive.wall_material or primitive.material
+    ceiling_material = primitive.ceiling_material or wall_material
+    shell_profile = architecture_shell_profile(primitive)
+    if profile == "rhen_var":
+        # Snow and frost are reflective surface accents, not emissive strips.
+        # Preserve the shared detail pass while preventing a glowing snow band.
+        light_material = _architecture_material(textures[2])
+    meshes: list[PrimitiveMesh] = list(build_floor_plan_profiled_shell_meshes(primitive))
+    openings_by_edge: dict[int, tuple[FloorPlanWallOpening, ...]] = {
+        edge_index: tuple(opening for opening in primitive.openings if int(opening.edge_index) == edge_index)
+        for edge_index in range(len(points))
+    }
+
+    for edge_index, start in enumerate(points):
+        end = points[(edge_index + 1) % len(points)]
+        edge_length = _edge_length(start, end)
+        if edge_length <= 0.05:
+            continue
+        openings = openings_by_edge.get(edge_index, ())
+        bay_count = max(1, int(math.ceil(edge_length / bay_target)))
+        bay_width = edge_length / bay_count
+        common = {
+            "primitive": "floor_plan_architecture",
+            "architecture_profile": profile,
+            "edge_index": edge_index,
+            "source_module": str(primitive.metadata.get("style_source_module", "") or ""),
+            "source_rooms": tuple(primitive.metadata.get("architecture_evidence_rooms") or ()),
+        }
+
+        # Continuous base and head bands make every arbitrary footprint read as
+        # one designed kit rather than unrelated textured rectangles.
+        for role, z0, z1, depth, material in (
+            ("skirting", 0.06, 0.30, 0.075, utility_material),
+            ("cornice", height - 0.30, height - 0.08, 0.085, trim_material),
+        ):
+            visible = _architecture_visible_intervals(edge_length, openings, z0=z0, z1=z1)
+            for ordinal, span in enumerate(visible, 1):
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_{role}_{ordinal:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=span,
+                        span_top=None,
+                        depth_bottom=depth,
+                        depth_top=depth,
+                        z_bottom=floor_z + z0,
+                        z_top=floor_z + z1,
+                        material=material,
+                        metadata={**common, "architecture_role": role},
+                    )
+                )
+
+        if profile in {"endar_spire", "harbinger"} and shell_profile not in {
+            "endar_corridor",
+            "harbinger_corridor",
+        }:
+            # The retail LHR rooms use a faceted upper shell rather than a
+            # ninety-degree wall/ceiling seam.  This sloped cove is the key
+            # silhouette cue visible in the Endar Spire corridors.
+            cove_bottom = max(1.25, height - 0.78)
+            visible = _architecture_visible_intervals(edge_length, openings, z0=cove_bottom, z1=height - 0.04)
+            for ordinal, span in enumerate(visible, 1):
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_cove_{ordinal:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=span,
+                        span_top=span,
+                        depth_bottom=0.035,
+                        depth_top=min(0.46, max(0.18, height * 0.14)),
+                        z_bottom=floor_z + cove_bottom,
+                        z_top=floor_z + height - 0.04,
+                        material=ceiling_material,
+                        metadata={**common, "architecture_role": "faceted_ceiling_cove"},
+                    )
+                )
+
+        for bay_index in range(bay_count):
+            bay_start = bay_index * bay_width
+            bay_end = (bay_index + 1) * bay_width
+            margin = min(0.18, bay_width * 0.09)
+            bay_span = (bay_start + margin, bay_end - margin)
+            if bay_span[1] - bay_span[0] <= 0.08:
+                continue
+            panel_bottom = (
+                0.34
+                if profile == "endar_spire"
+                else 0.38
+                if profile == "telos_citadel"
+                else 0.48
+                if profile.startswith("onderon_")
+                else 0.36
+            )
+            panel_top = max(
+                panel_bottom + 0.25,
+                height
+                - (
+                    0.82
+                    if profile == "endar_spire"
+                    else 1.10
+                    if profile == "telos_citadel"
+                    else max(1.25, height * 0.16)
+                    if profile.startswith("onderon_")
+                    else 0.44
+                ),
+            )
+            visible = _architecture_intersections(
+                _architecture_visible_intervals(edge_length, openings, z0=panel_bottom, z1=panel_top),
+                bay_span,
+            )
+            for segment_index, span in enumerate(visible, 1):
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_bay_{bay_index + 1:02d}_{segment_index:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=span,
+                        span_top=None,
+                        depth_bottom=0.028,
+                        depth_top=0.028,
+                        z_bottom=floor_z + panel_bottom,
+                        z_top=floor_z + panel_top,
+                        material=utility_material if profile == "endar_spire" else accent_material,
+                        metadata={**common, "architecture_role": "wall_bay"},
+                    )
+                )
+
+            center = (bay_start + bay_end) * 0.5
+            if profile == "endar_spire":
+                red_span = (max(bay_span[0], center - bay_width * 0.28), min(bay_span[1], center + bay_width * 0.28))
+                red_bottom, red_top = 0.62, min(1.52, panel_top - 0.12)
+                red_visible = _architecture_intersections(
+                    _architecture_visible_intervals(edge_length, openings, z0=red_bottom, z1=red_top),
+                    red_span,
+                )
+                for ordinal, span in enumerate(red_visible, 1):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_red_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.065,
+                            depth_top=0.065,
+                            z_bottom=floor_z + red_bottom,
+                            z_top=floor_z + red_top,
+                            material=accent_material,
+                            metadata={**common, "architecture_role": "red_inset_panel"},
+                        )
+                    )
+                upper_bottom = max(1.52, panel_bottom + 0.45)
+                upper_top = max(upper_bottom + 0.12, panel_top - 0.03)
+                upper_span = (bay_span[0] + bay_width * 0.08, bay_span[1] - bay_width * 0.08)
+                top_span = (upper_span[0] + bay_width * 0.10, upper_span[1] - bay_width * 0.10)
+                if top_span[1] > top_span[0] and not any(
+                    max(upper_span[0], float(opening.center_fraction) * edge_length - float(opening.width) * 0.5)
+                    < min(upper_span[1], float(opening.center_fraction) * edge_length + float(opening.width) * 0.5)
+                    and float(opening.bottom) < upper_top
+                    and float(opening.bottom) + float(opening.height) > upper_bottom
+                    for opening in openings
+                ):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_angled_{bay_index + 1:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=upper_span,
+                            span_top=top_span,
+                            depth_bottom=0.055,
+                            depth_top=0.072,
+                            z_bottom=floor_z + upper_bottom,
+                            z_top=floor_z + upper_top,
+                            material=wall_material,
+                            metadata={**common, "architecture_role": "angled_upper_panel"},
+                        )
+                    )
+                light_bottom = max(0.45, height - 0.64)
+                light_top = min(height - 0.34, light_bottom + 0.16)
+                light_span = (max(bay_span[0], center - 0.20), min(bay_span[1], center + 0.20))
+            elif profile == "telos_citadel":
+                inset_bottom = 0.52
+                inset_top = max(1.35, panel_top - 0.30)
+                inset_span = (
+                    bay_span[0] + min(0.22, bay_width * 0.08),
+                    bay_span[1] - min(0.22, bay_width * 0.08),
+                )
+                for ordinal, span in enumerate(
+                    _architecture_intersections(
+                        _architecture_visible_intervals(edge_length, openings, z0=inset_bottom, z1=inset_top),
+                        inset_span,
+                    ),
+                    1,
+                ):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_panel_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.075,
+                            depth_top=0.075,
+                            z_bottom=floor_z + inset_bottom,
+                            z_top=floor_z + inset_top,
+                            material=accent_material,
+                            metadata={**common, "architecture_role": "citadel_recessed_wall_panel"},
+                        )
+                    )
+                belt_bottom = min(max(0.88, height * 0.20), panel_top - 0.25)
+                belt_top = min(panel_top - 0.08, belt_bottom + 0.14)
+                for ordinal, span in enumerate(
+                    _architecture_intersections(
+                        _architecture_visible_intervals(edge_length, openings, z0=belt_bottom, z1=belt_top),
+                        bay_span,
+                    ),
+                    1,
+                ):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_belt_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.095,
+                            depth_top=0.095,
+                            z_bottom=floor_z + belt_bottom,
+                            z_top=floor_z + belt_top,
+                            material=trim_material,
+                            metadata={**common, "architecture_role": "citadel_utility_belt"},
+                        )
+                    )
+                light_bottom = max(1.25, panel_top - 0.42)
+                light_top = min(panel_top - 0.12, light_bottom + 0.16)
+                light_span = (max(bay_span[0], center - 0.42), min(bay_span[1], center + 0.42))
+            elif profile == "rhen_var":
+                inset_bottom = 0.62 if shell_profile == "rhen_var_catacomb_tunnel" else 0.82
+                inset_top = max(inset_bottom + 0.80, panel_top - max(0.56, height * 0.11))
+                shoulder = min(0.48, bay_width * 0.10)
+                inset_span = (bay_span[0] + shoulder, bay_span[1] - shoulder)
+                for ordinal, span in enumerate(
+                    _architecture_intersections(
+                        _architecture_visible_intervals(edge_length, openings, z0=inset_bottom, z1=inset_top),
+                        inset_span,
+                    ),
+                    1,
+                ):
+                    bevel = min(0.24, (span[1] - span[0]) * 0.08)
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_relief_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=(span[0] + bevel, span[1] - bevel),
+                            depth_bottom=0.16,
+                            depth_top=0.26,
+                            z_bottom=floor_z + inset_bottom,
+                            z_top=floor_z + inset_top,
+                            material=accent_material,
+                            metadata={
+                                **common,
+                                "architecture_role": "rhen_var_beveled_frost_stone_relief",
+                                "beveled_geometry": True,
+                                "texture_stretching_prevented": True,
+                                "module_rhythm_m": 8.0,
+                            },
+                        )
+                    )
+                course_bottom = min(max(1.15, height * 0.28), panel_top - 0.38)
+                course_top = min(panel_top - 0.10, course_bottom + max(0.18, height * 0.03))
+                for ordinal, span in enumerate(
+                    _architecture_intersections(
+                        _architecture_visible_intervals(edge_length, openings, z0=course_bottom, z1=course_top),
+                        bay_span,
+                    ),
+                    1,
+                ):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_course_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.21,
+                            depth_top=0.21,
+                            z_bottom=floor_z + course_bottom,
+                            z_top=floor_z + course_top,
+                            material=trim_material,
+                            metadata={
+                                **common,
+                                "architecture_role": "rhen_var_projecting_stone_course",
+                                "module_rhythm_m": 8.0,
+                            },
+                        )
+                    )
+                light_bottom = max(0.46, panel_top - max(0.70, height * 0.09))
+                light_top = min(panel_top - 0.14, light_bottom + max(0.14, height * 0.022))
+                light_span = (
+                    max(bay_span[0], center - min(0.72, bay_width * 0.20)),
+                    min(bay_span[1], center + min(0.72, bay_width * 0.20)),
+                )
+            elif profile.startswith("onderon_"):
+                # One framed relief per measured bay keeps the authored wall
+                # readable as Iziz architecture even before dressing pieces are
+                # added. The geometry is inset, beveled, and world-tiled; it is
+                # not a decal or a stretched rectangular texture panel.
+                inset_bottom = 0.72 if profile != "onderon_sky_ramp" else 1.20
+                inset_top = max(inset_bottom + 0.75, panel_top - max(0.48, height * 0.10))
+                shoulder = min(0.32, bay_width * 0.08)
+                inset_span = (bay_span[0] + shoulder, bay_span[1] - shoulder)
+                for ordinal, span in enumerate(
+                    _architecture_intersections(
+                        _architecture_visible_intervals(edge_length, openings, z0=inset_bottom, z1=inset_top),
+                        inset_span,
+                    ),
+                    1,
+                ):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_relief_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=(
+                                span[0] + min(0.18, (span[1] - span[0]) * 0.08),
+                                span[1] - min(0.18, (span[1] - span[0]) * 0.08),
+                            ),
+                            depth_bottom=0.095,
+                            depth_top=0.145,
+                            z_bottom=floor_z + inset_bottom,
+                            z_top=floor_z + inset_top,
+                            material=accent_material,
+                            metadata={
+                                **common,
+                                "architecture_role": "onderon_beveled_relief_bay",
+                                "beveled_geometry": True,
+                                "texture_stretching_prevented": True,
+                            },
+                        )
+                    )
+                belt_bottom = min(max(1.10, height * 0.27), panel_top - 0.35)
+                belt_top = min(panel_top - 0.10, belt_bottom + max(0.16, height * 0.025))
+                for ordinal, span in enumerate(
+                    _architecture_intersections(
+                        _architecture_visible_intervals(edge_length, openings, z0=belt_bottom, z1=belt_top),
+                        bay_span,
+                    ),
+                    1,
+                ):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_course_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.135,
+                            depth_top=0.135,
+                            z_bottom=floor_z + belt_bottom,
+                            z_top=floor_z + belt_top,
+                            material=trim_material,
+                            metadata={**common, "architecture_role": "onderon_projecting_trim_course"},
+                        )
+                    )
+                light_bottom = max(1.45, panel_top - max(0.62, height * 0.075))
+                light_top = min(panel_top - 0.16, light_bottom + max(0.16, height * 0.022))
+                light_span = (
+                    max(bay_span[0], center - min(0.62, bay_width * 0.20)),
+                    min(bay_span[1], center + min(0.62, bay_width * 0.20)),
+                )
+            else:
+                inset_bottom, inset_top = 0.58, max(0.82, panel_top - 0.22)
+                inset_span = (bay_span[0] + min(0.16, bay_width * 0.08), bay_span[1] - min(0.16, bay_width * 0.08))
+                inset_visible = _architecture_intersections(
+                    _architecture_visible_intervals(edge_length, openings, z0=inset_bottom, z1=inset_top),
+                    inset_span,
+                )
+                for ordinal, span in enumerate(inset_visible, 1):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_recess_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.052,
+                            depth_top=0.052,
+                            z_bottom=floor_z + inset_bottom,
+                            z_top=floor_z + inset_top,
+                            material=wall_material,
+                            metadata={**common, "architecture_role": "apartment_recess"},
+                        )
+                    )
+                rail_bottom = min(1.02, panel_top - 0.22)
+                rail_top = min(panel_top - 0.06, rail_bottom + 0.11)
+                rail_visible = _architecture_intersections(
+                    _architecture_visible_intervals(edge_length, openings, z0=rail_bottom, z1=rail_top),
+                    bay_span,
+                )
+                for ordinal, span in enumerate(rail_visible, 1):
+                    meshes.append(
+                        _architecture_wall_mesh(
+                            name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_rail_{bay_index + 1:02d}_{ordinal:02d}",
+                            start=start,
+                            end=end,
+                            span_bottom=span,
+                            span_top=None,
+                            depth_bottom=0.084,
+                            depth_top=0.084,
+                            z_bottom=floor_z + rail_bottom,
+                            z_top=floor_z + rail_top,
+                            material=trim_material,
+                            metadata={**common, "architecture_role": "utility_rail"},
+                        )
+                    )
+                light_bottom = max(0.55, height - 0.55)
+                light_top = min(height - 0.25, light_bottom + 0.12)
+                light_span = (max(bay_span[0], center - 0.24), min(bay_span[1], center + 0.24))
+
+            light_visible = _architecture_intersections(
+                _architecture_visible_intervals(edge_length, openings, z0=light_bottom, z1=light_top),
+                light_span,
+            )
+            for ordinal, span in enumerate(light_visible, 1):
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_light_{bay_index + 1:02d}_{ordinal:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=span,
+                        span_top=None,
+                        depth_bottom=0.105,
+                        depth_top=0.105,
+                        z_bottom=floor_z + light_bottom,
+                        z_top=floor_z + light_top,
+                        material=light_material,
+                        metadata={**common, "architecture_role": "integrated_light"},
+                    )
+                )
+
+        meshes.extend(
+            _architecture_door_transition_meshes(
+                room_resref=room_resref,
+                profile=profile,
+                edge_index=edge_index,
+                start=start,
+                end=end,
+                edge_length=edge_length,
+                floor_z=floor_z,
+                wall_height=height,
+                openings=openings,
+                # Endar's retail portal is cut through the white LHR bulkhead;
+                # red is adjacent panel dressing, not the aperture surround.
+                infill_material=wall_material if profile == "endar_spire" else accent_material,
+                trim_material=trim_material,
+                light_material=light_material,
+                common=common,
+            )
+        )
+
+        # Projected pilasters are the snap rhythm of both kits.  The Endar
+        # version continues into the cove, making a readable arch rib.
+        if shell_profile:
+            continue
+        rib_half = 0.055 if profile == "endar_spire" else 0.075
+        rib_top = height - (0.72 if profile == "endar_spire" else 0.28)
+        for rib_index in range(bay_count + 1):
+            center = min(edge_length, rib_index * bay_width)
+            rib_span = (max(0.0, center - rib_half), min(edge_length, center + rib_half))
+            visible = _architecture_intersections(
+                _architecture_visible_intervals(edge_length, openings, z0=0.08, z1=rib_top),
+                rib_span,
+            )
+            for ordinal, span in enumerate(visible, 1):
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_rib_{rib_index + 1:02d}_{ordinal:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=span,
+                        span_top=None,
+                        depth_bottom=0.125,
+                        depth_top=0.125,
+                        z_bottom=floor_z + 0.08,
+                        z_top=floor_z + rib_top,
+                        material=trim_material,
+                        metadata={**common, "architecture_role": "structural_rib"},
+                    )
+                )
+            if profile == "endar_spire" and rib_span[1] - rib_span[0] > 0.015:
+                meshes.append(
+                    _architecture_wall_mesh(
+                        name=f"{room_resref}_{profile}_e{edge_index + 1:02d}_arch_{rib_index + 1:02d}",
+                        start=start,
+                        end=end,
+                        span_bottom=rib_span,
+                        span_top=rib_span,
+                        depth_bottom=0.125,
+                        depth_top=min(0.53, max(0.22, height * 0.16)),
+                        z_bottom=floor_z + rib_top,
+                        z_top=floor_z + height - 0.025,
+                        material=trim_material,
+                        metadata={**common, "architecture_role": "arched_rib"},
+                    )
+                )
+    return tuple(meshes)
+
+
+def build_floor_plan_ceiling_mesh(primitive: FloorPlanRoomPrimitive) -> PrimitiveMesh | None:
+    """Build an optional inward-facing ceiling for closed interior rooms."""
+
+    if not primitive.include_ceiling:
+        return None
+    validation = validate_floor_plan_room_primitive(primitive)
+    if not validation.ok:
+        raise ValueError("; ".join(validation.blocking_issues))
+    points = _ccw_points(_normalise_points(primitive.points))
+    top_z = float(primitive.z) + float(primitive.wall_height)
+    vertices: tuple[Vec3, ...] = tuple((x, y, top_z) for x, y in points)
+    material = primitive.ceiling_material or primitive.wall_material or primitive.material
+    faces = tuple((c, b, a) for a, b, c in triangulate_floor_plan_points(points))
+    ceiling_texture = str(material.texture or "").strip().lower()
+    ceiling_repeat_metres = _VANILLA_ARCHITECTURE_UV_METRES.get(ceiling_texture, 3.0)
+    return PrimitiveMesh(
+        name=f"{_normalise_resref(primitive.room_resref)}_ceiling",
+        vertices=vertices,
+        faces=faces,
+        normals=((0.0, 0.0, -1.0),) * len(vertices),
+        uvs=_mesh_uvs(points, repeat_metres=ceiling_repeat_metres),
+        texture=material.texture,
+        diffuse=material.diffuse,
+        ambient=material.ambient,
+        metadata={
+            "primitive": "floor_plan_ceiling",
+            "source": "map_studio:pascal_building",
+            "uv_projection": "world_xy_tiled",
+            "uv_repeat_metres": ceiling_repeat_metres,
+            "texture_stretching_prevented": True,
+            **dict(material.metadata),
+        },
+    )
+
+
+def build_floor_plan_roof_meshes(primitive: FloorPlanRoomPrimitive) -> tuple[PrimitiveMesh, ...]:
+    """Compile a lightweight exterior roof that remains part of the room.
+
+    Flat roofs support every valid footprint. Gable roofs deliberately require
+    an axis-aligned rectangle so the authoring result stays predictable and
+    engine-budget safe rather than guessing at arbitrary residential CSG.
+    """
+
+    roof_type = _roof_type(primitive)
+    if roof_type == "none":
+        return ()
+    validation = validate_floor_plan_room_primitive(primitive)
+    if not validation.ok:
+        raise ValueError("; ".join(validation.blocking_issues))
+    points = _ccw_points(_normalise_points(primitive.points))
+    top_z = float(primitive.z) + float(primitive.wall_height)
+    roof_material = primitive.ceiling_material or primitive.wall_material or primitive.material
+    metadata = {
+        **dict(roof_material.metadata),
+        "primitive": "floor_plan_roof",
+        "roof_type": roof_type,
+        "source": "map_studio:pascal_building",
+        "surface_role": "roof",
+    }
+    room_resref = _normalise_resref(primitive.room_resref)
+    meshes: list[PrimitiveMesh] = []
+    if roof_type == "flat":
+        vertices: tuple[Vec3, ...] = tuple((x, y, top_z) for x, y in points)
+        return (
+            _planar_surface_mesh(
+                name=f"{room_resref}_roof_flat",
+                vertices=vertices,
+                faces=triangulate_floor_plan_points(points),
+                material=roof_material,
+                metadata=metadata,
+            ),
+        )
+
+    if roof_type == "hip":
+        center_x = sum(point[0] for point in points) / len(points)
+        center_y = sum(point[1] for point in points) / len(points)
+        overhang = float(primitive.metadata.get("building_roof_overhang", 0.25) or 0.0)
+        expanded: list[Vec2] = []
+        distances: list[float] = []
+        for x, y in points:
+            dx, dy = x - center_x, y - center_y
+            distance = math.hypot(dx, dy)
+            distances.append(distance)
+            scale = (distance + overhang) / max(distance, 1.0e-7)
+            expanded.append((center_x + dx * scale, center_y + dy * scale))
+        pitch = math.radians(float(primitive.metadata.get("building_roof_pitch_degrees", 30.0) or 30.0))
+        rise = max(0.05, (sum(distances) / max(len(distances), 1)) * 0.5 * math.tan(pitch))
+        apex = (center_x, center_y, top_z + rise)
+        for index, start in enumerate(expanded):
+            end = expanded[(index + 1) % len(expanded)]
+            meshes.append(
+                _planar_surface_mesh(
+                    name=f"{room_resref}_roof_hip_{index + 1:02d}",
+                    vertices=((start[0], start[1], top_z), (end[0], end[1], top_z), apex),
+                    faces=((0, 1, 2),),
+                    material=roof_material,
+                    metadata={**metadata, "roof_panel": f"hip_{index + 1:02d}"},
+                )
+            )
+        return tuple(meshes)
+
+    bounds = _rect_bounds(points)
+    if bounds is None:  # Kept defensive for callers that skip validation.
+        raise ValueError("Gable roofs currently require a rectangular room footprint.")
+    min_x, min_y, max_x, max_y = bounds
+    overhang = float(primitive.metadata.get("building_roof_overhang", 0.25) or 0.0)
+    pitch = math.radians(float(primitive.metadata.get("building_roof_pitch_degrees", 30.0) or 30.0))
+    width, depth = max_x - min_x, max_y - min_y
+    if width >= depth:
+        ridge_y = (min_y + max_y) * 0.5
+        ridge_z = top_z + max(0.05, depth * 0.5 * math.tan(pitch))
+        panels = (
+            (
+                "south",
+                ((min_x - overhang, min_y - overhang, top_z), (max_x + overhang, min_y - overhang, top_z), (max_x + overhang, ridge_y, ridge_z), (min_x - overhang, ridge_y, ridge_z)),
+                ((0, 1, 2), (0, 2, 3)),
+            ),
+            (
+                "north",
+                ((min_x - overhang, ridge_y, ridge_z), (max_x + overhang, ridge_y, ridge_z), (max_x + overhang, max_y + overhang, top_z), (min_x - overhang, max_y + overhang, top_z)),
+                ((0, 1, 2), (0, 2, 3)),
+            ),
+            ("west_gable", ((min_x, min_y, top_z), (min_x, ridge_y, ridge_z), (min_x, max_y, top_z)), ((0, 1, 2),)),
+            ("east_gable", ((max_x, min_y, top_z), (max_x, max_y, top_z), (max_x, ridge_y, ridge_z)), ((0, 1, 2),)),
+        )
+    else:
+        ridge_x = (min_x + max_x) * 0.5
+        ridge_z = top_z + max(0.05, width * 0.5 * math.tan(pitch))
+        panels = (
+            (
+                "west",
+                ((min_x - overhang, min_y - overhang, top_z), (ridge_x, min_y - overhang, ridge_z), (ridge_x, max_y + overhang, ridge_z), (min_x - overhang, max_y + overhang, top_z)),
+                ((0, 1, 2), (0, 2, 3)),
+            ),
+            (
+                "east",
+                ((ridge_x, min_y - overhang, ridge_z), (max_x + overhang, min_y - overhang, top_z), (max_x + overhang, max_y + overhang, top_z), (ridge_x, max_y + overhang, ridge_z)),
+                ((0, 1, 2), (0, 2, 3)),
+            ),
+            ("south_gable", ((min_x, min_y, top_z), (max_x, min_y, top_z), (ridge_x, min_y, ridge_z)), ((0, 1, 2),)),
+            ("north_gable", ((min_x, max_y, top_z), (ridge_x, max_y, ridge_z), (max_x, max_y, top_z)), ((0, 1, 2),)),
+        )
+    for label, vertices, faces in panels:
+        meshes.append(
+            _planar_surface_mesh(
+                name=f"{room_resref}_roof_{label}",
+                vertices=vertices,
+                faces=faces,
+                material=roof_material if "gable" not in label else (primitive.wall_material or roof_material),
+                metadata={**metadata, "roof_panel": label},
+            )
+        )
     return tuple(meshes)
 
 
@@ -873,7 +6764,15 @@ def compile_floor_plan_room_geometry(primitive: FloorPlanRoomPrimitive) -> Autho
     if not validation.ok:
         raise ValueError("; ".join(validation.blocking_issues))
     floor_mesh = build_floor_plan_floor_mesh(primitive)
-    helper_meshes = build_floor_plan_wall_meshes(primitive)
+    shell_profile = architecture_shell_profile(primitive)
+    wall_meshes = () if shell_profile else build_floor_plan_wall_meshes(primitive)
+    architecture_meshes = build_floor_plan_architecture_meshes(primitive)
+    helper_meshes = wall_meshes + architecture_meshes
+    ceiling = None if shell_profile else build_floor_plan_ceiling_mesh(primitive)
+    if ceiling is not None:
+        helper_meshes = helper_meshes + (ceiling,)
+    roof_meshes = build_floor_plan_roof_meshes(primitive)
+    helper_meshes = helper_meshes + roof_meshes
     surface_id = resolve_walkmesh_surface_id(primitive.floor_surface_id)
     room_resref = _normalise_resref(primitive.room_resref)
     return AuthoredRoomGeometry(
@@ -886,8 +6785,38 @@ def compile_floor_plan_room_geometry(primitive: FloorPlanRoomPrimitive) -> Autho
             "primitive": "floor_plan_extrusion",
             "source": "src.core.modules.authored_room_floorplan",
             "point_count": len(_normalise_points(primitive.points)),
-            "wall_count": len(helper_meshes),
+            "wall_count": len(wall_meshes),
+            "architecture_profile": str(primitive.metadata.get("architecture_profile", "") or ""),
+            "architecture_shell_profile": shell_profile,
+            "architecture_mesh_count": len(architecture_meshes),
             "opening_count": len(primitive.openings),
+            "has_ceiling": bool(
+                primitive.include_ceiling
+                and (
+                    ceiling is not None
+                    or shell_profile
+                    in {
+                        "endar_corridor",
+                        "harbinger_corridor",
+                        "telos_citadel_residential",
+                        "telos_citadel_civic",
+                        "telos_citadel_concourse",
+                        "rhen_var_landing_courtyard",
+                        "rhen_var_temple_interior",
+                        "rhen_var_catacomb_tunnel",
+                        "taris_apartment",
+                        "korriban_tomb",
+                        "korriban_tomb_chamber",
+                        "korriban_tomb_junction",
+                        "korriban_tomb_burial",
+                        "korriban_tomb_monumental",
+                        "korriban_tomb_ruined",
+                        "korriban_cave",
+                    }
+                )
+            ),
+            "has_roof": bool(roof_meshes),
+            "roof_type": _roof_type(primitive),
             "wall_height": float(primitive.wall_height),
             "polygon_area": validation.area,
             "floor_surface_id": surface_id,
@@ -915,11 +6844,17 @@ __all__ = [
     "apply_floor_plan_rectangular_union",
     "bevel_floor_plan_points",
     "build_floor_plan_floor_mesh",
+    "build_floor_plan_ceiling_mesh",
+    "build_floor_plan_architecture_meshes",
+    "build_floor_plan_korriban_cave_meshes",
+    "build_floor_plan_roof_meshes",
+    "build_floor_plan_shadowlands_meshes",
     "build_floor_plan_wall_meshes",
     "build_floor_plan_wok",
     "compile_floor_plan_room_geometry",
     "extrude_floor_plan_edge_points",
     "inset_floor_plan_points",
+    "triangulate_floor_plan_points",
     "polygon_signed_area",
     "validate_floor_plan_room_primitive",
 ]

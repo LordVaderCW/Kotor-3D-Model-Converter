@@ -7,9 +7,24 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+NATIVE_SOURCE_FALLBACKS = {
+    "src/gui/panels/qt_inspector_panel.py": (
+        "native/GhostRigger.Core.GUI.Display/Python/src/gui/panels/qt_inspector_panel.py"
+    ),
+    "src/gui/panels/qt_character_builder_panel.py": (
+        "native/GhostRigger.Core.GUI.Display/Python/src/gui/panels/qt_character_builder_panel.py"
+    ),
+    "src/core/characters/headless_body_workflow.py": (
+        "native/GhostRigger.Core.Workflow/Python/src/core/characters/headless_body_workflow.py"
+    ),
+}
+
 
 def _read(path: str) -> str:
-    return (ROOT / path).read_text(encoding="utf-8")
+    resolved = ROOT / path
+    if not resolved.exists() and path in NATIVE_SOURCE_FALLBACKS:
+        resolved = ROOT / NATIVE_SOURCE_FALLBACKS[path]
+    return resolved.read_text(encoding="utf-8")
 
 
 def _method_block(source: str, name: str) -> str:
@@ -62,6 +77,17 @@ def test_t1205_character_builder_preview_sets_gpu_skinning_base_pose():
     assert "base_pose = engine.evaluate(0.0)" in block
     assert "viewport.set_anim_base_pose(base_pose)" in block
     assert "viewport.set_animation_pose(" in block
+
+
+def test_t1205_character_builder_tags_body_pose_for_bas_head_local_animation():
+    source = _read("src/gui/panels/qt_character_builder_panel.py")
+    start_block = _method_block(source, "_start_preview_animation")
+    tick_block = _method_block(source, "_tick_preview_animation")
+
+    for block in (start_block, tick_block):
+        assert '"_gr_animation_source_model_id"' in block
+        assert '"_gr_animation_source_model_name"' in block
+        assert '"_gr_animation_name"' in block
 
 
 def test_t1205_character_builder_preview_fallback_uses_live_viewport():

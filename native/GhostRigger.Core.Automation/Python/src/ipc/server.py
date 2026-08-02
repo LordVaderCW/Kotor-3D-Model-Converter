@@ -18,21 +18,252 @@ Actions sent (client calls):
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
+import os
+from pathlib import Path
+import re
+import sys
 import threading
 from typing import Callable, Optional, Dict, Any
 
 from src.adapters.qt_ipc.threading import marshal_to_gui_thread
+from .spatial_auth import (
+    HEADER_SIGNATURE,
+    SpatialAuthenticationError,
+    SpatialRequestAuthenticator,
+    SpatialRequestSigner,
+    SpatialSessionCredentials,
+    publish_spatial_session_descriptor,
+    remove_spatial_session_descriptor,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _ensure_kotormcp_importable() -> bool:
+    """Make the standalone ``kotormcp`` package importable under its own name.
+
+    The native payload importer registers this package as ``src.kotormcp``
+    (it strips only the leading ``Python/`` from packaged paths), but
+    ``kotormcp`` was ported in as a self-contained MCP server and imports
+    itself with bare ``kotormcp.*`` names — including its submodules. Alias the
+    payload-registered package to the top-level ``kotormcp`` name so those
+    imports resolve, without adding ``src`` to ``sys.path`` (which would make
+    every ``src`` subpackage importable twice under two identities).
+
+    Returns True if ``kotormcp`` is importable afterwards.
+    """
+    if "kotormcp" in sys.modules:
+        return True
+    try:
+        sys.modules["kotormcp"] = importlib.import_module("src.kotormcp")
+        return True
+    except Exception:  # noqa: BLE001 - fall back to a path-based import
+        src_root = Path(__file__).resolve().parents[1]  # .../Python/src
+        if (src_root / "kotormcp" / "__init__.py").exists():
+            p = str(src_root)
+            if p not in sys.path:
+                sys.path.insert(0, p)
+            return True
+        log.exception("kotormcp package could not be made importable")
+        return False
 
 # ── IPC Port Assignment (per GHOSTWORKS_BLUEPRINT.md Section 3.1) ──────────
 PORT_GHOSTRIGGER  = 7001
 PORT_GHOSTSCRIPTER = 7002
 PORT_GMODULAR     = 7003
 
-_PROGRAM_NAME = "GhostRigger"
+_PROGRAM_NAME = "GhostStudio"
+_RESREF_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+_IPC_PORT_ENV = "GHOSTRIGGER_IPC_PORT"
+
+
+def resolve_ghostrigger_ipc_port(raw_value: object | None = None) -> int:
+    """Resolve the local IPC port without changing the normal 7001 contract.
+
+    A per-process environment override lets a focus-safe validation instance
+    coexist with the user's already-running GhostStudio process. Invalid
+    values deliberately fall back to the documented product port.
+    """
+
+    value = os.environ.get(_IPC_PORT_ENV, "") if raw_value is None else raw_value
+    text = str(value or "").strip()
+    if not text:
+        return PORT_GHOSTRIGGER
+    try:
+        port = int(text, 10)
+    except (TypeError, ValueError):
+        return PORT_GHOSTRIGGER
+    return port if 1 <= port <= 65535 else PORT_GHOSTRIGGER
+
+
+def _validate_map_studio_visual_proof_payload(payload: object) -> tuple[dict[str, Any] | None, str]:
+    """Validate and normalise the focus-safe Map Studio proof request."""
+
+    if not isinstance(payload, dict):
+        return None, "payload must be a JSON object"
+
+    game = str(payload.get("game") or "").strip().upper()
+    if game not in {"K1", "K2"}:
+        return None, "game must be 'K1' or 'K2'"
+
+    module_resref = str(payload.get("module_resref") or payload.get("module") or "").strip().lower()
+    if not _RESREF_RE.fullmatch(module_resref):
+        return None, "module_resref must be a 1-16 character KOTOR resref"
+
+    modules_dir_text = str(payload.get("modules_dir") or "").strip()
+    modules_dir = Path(modules_dir_text).expanduser()
+    if not modules_dir_text or not modules_dir.is_absolute():
+        return None, "modules_dir must be an absolute path"
+    if not modules_dir.is_dir():
+        return None, f"modules_dir does not exist: {modules_dir}"
+
+    capture_paths: dict[str, Path] = {}
+    for key in ("before_path", "after_path"):
+        text = str(payload.get(key) or "").strip()
+        candidate = Path(text).expanduser()
+        if not text or not candidate.is_absolute():
+            return None, f"{key} must be an absolute path"
+        if candidate.suffix.lower() != ".png":
+            return None, f"{key} must end in .png"
+        capture_paths[key] = candidate.resolve(strict=False)
+    if capture_paths["before_path"] == capture_paths["after_path"]:
+        return None, "before_path and after_path must be different files"
+
+    activate = payload.get("activate", False)
+    if not isinstance(activate, bool):
+        return None, "activate must be a boolean"
+    if activate:
+        return None, "map_studio_visual_proof is focus-safe; activate must be false"
+
+    settle_ms = payload.get("settle_ms", 5000)
+    if isinstance(settle_ms, bool) or not isinstance(settle_ms, int) or not 0 <= settle_ms <= 5000:
+        return None, "settle_ms must be an integer between 0 and 5000"
+    # A positive visual-proof delay is a renderer-residency contract, not a
+    # caller-selected performance knob.  Stock module textures can still be
+    # decoding/uploading after the former 750 ms default, yielding a nearly
+    # black capture that looked superficially different and falsely passed.
+    # Preserve zero only for deterministic focused tests; real proofs always
+    # receive the full measured residency window.
+    settle_ms = 0 if settle_ms == 0 else 5000
+
+    expected_room = str(payload.get("expected_room_resref") or "").strip().lower()
+    if expected_room and not _RESREF_RE.fullmatch(expected_room):
+        return None, "expected_room_resref must be a valid KOTOR resref"
+
+    expected_count = payload.get("expected_backdrop_surface_count", None)
+    if expected_count is not None:
+        if isinstance(expected_count, bool) or not isinstance(expected_count, int) or not 0 <= expected_count <= 1024:
+            return None, "expected_backdrop_surface_count must be an integer between 0 and 1024"
+
+    raw_textures = payload.get("expected_textures", {})
+    if raw_textures is None:
+        raw_textures = {}
+    if not isinstance(raw_textures, dict) or len(raw_textures) > 64:
+        return None, "expected_textures must be an object with at most 64 entries"
+    expected_textures: dict[str, list[int]] = {}
+    for raw_name, raw_size in raw_textures.items():
+        name = str(raw_name or "").strip().lower()
+        if not _RESREF_RE.fullmatch(name):
+            return None, f"invalid expected texture resref: {raw_name!r}"
+        if (
+            not isinstance(raw_size, (list, tuple))
+            or len(raw_size) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in raw_size)
+        ):
+            return None, f"expected texture size for {name} must be [width, height]"
+        width, height = int(raw_size[0]), int(raw_size[1])
+        if not 1 <= width <= 8192 or not 1 <= height <= 8192:
+            return None, f"expected texture size for {name} must be between 1 and 8192 pixels"
+        expected_textures[name] = [width, height]
+
+    return {
+        "game": game,
+        "module_resref": module_resref,
+        "modules_dir": str(modules_dir.resolve()),
+        "before_path": str(capture_paths["before_path"]),
+        "after_path": str(capture_paths["after_path"]),
+        "activate": activate,
+        "settle_ms": settle_ms,
+        "expected_room_resref": expected_room,
+        "expected_backdrop_surface_count": expected_count,
+        "expected_textures": expected_textures,
+    }, ""
+
+
+def _validate_map_studio_pie_visual_proof_payload(payload: object) -> tuple[dict[str, Any] | None, str]:
+    """Validate one focus-safe, bounded PIE motion/capture request."""
+
+    if not isinstance(payload, dict):
+        return None, "payload must be a JSON object"
+
+    kmap_text = str(payload.get("kmap_path") or "").strip()
+    kmap_path = Path(kmap_text).expanduser()
+    if not kmap_text or not kmap_path.is_absolute():
+        return None, "kmap_path must be an absolute path"
+    if kmap_path.suffix.lower() != ".kmap":
+        return None, "kmap_path must end in .kmap"
+    if not kmap_path.is_file():
+        return None, f"kmap_path does not exist: {kmap_path}"
+
+    capture_text = str(payload.get("capture_dir") or "").strip()
+    capture_dir = Path(capture_text).expanduser()
+    if not capture_text or not capture_dir.is_absolute():
+        return None, "capture_dir must be an absolute path"
+
+    activate = payload.get("activate", False)
+    if not isinstance(activate, bool):
+        return None, "activate must be a boolean"
+    if activate:
+        return None, "map_studio_pie_visual_proof is focus-safe; activate must be false"
+
+    settle_ms = payload.get("settle_ms", 1500)
+    if isinstance(settle_ms, bool) or not isinstance(settle_ms, int) or not 0 <= settle_ms <= 5000:
+        return None, "settle_ms must be an integer between 0 and 5000"
+    movement_ms = payload.get("movement_ms", 1200)
+    if isinstance(movement_ms, bool) or not isinstance(movement_ms, int) or not 100 <= movement_ms <= 5000:
+        return None, "movement_ms must be an integer between 100 and 5000"
+    sample_count = payload.get("sample_count", 12)
+    # Each proof also captures one post-movement frame.  Keep the stationary
+    # sequence at the proven twelve-frame bound: an extended 24-frame request
+    # exhausted the native ModernGL/QPixmap capture path on a real Debug run
+    # while the default 12 + motion sequence completed continuously.
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or not 2 <= sample_count <= 12:
+        return None, "sample_count must be an integer between 2 and 12"
+
+    motion: dict[str, float] = {}
+    for key, default in (("forward", 1.0), ("strafe", 0.0)):
+        raw = payload.get(key, default)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None, f"{key} must be a number between -1 and 1"
+        value = float(raw)
+        if not -1.0 <= value <= 1.0:
+            return None, f"{key} must be a number between -1 and 1"
+        motion[key] = value
+    run = payload.get("run", False)
+    if not isinstance(run, bool):
+        return None, "run must be a boolean"
+    expected_min_distance = payload.get("expected_min_distance", 0.05)
+    if isinstance(expected_min_distance, bool) or not isinstance(expected_min_distance, (int, float)):
+        return None, "expected_min_distance must be a number between 0 and 25"
+    expected_min_distance = float(expected_min_distance)
+    if not 0.0 <= expected_min_distance <= 25.0:
+        return None, "expected_min_distance must be a number between 0 and 25"
+
+    return {
+        "kmap_path": str(kmap_path.resolve()),
+        "capture_dir": str(capture_dir.resolve(strict=False)),
+        "activate": False,
+        "settle_ms": int(settle_ms),
+        "movement_ms": int(movement_ms),
+        "sample_count": int(sample_count),
+        "forward": motion["forward"],
+        "strafe": motion["strafe"],
+        "run": run,
+        "expected_min_distance": expected_min_distance,
+    }, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,31 +287,119 @@ class GhostRiggerIPCServer:
         'open_mdl'  : Callable[[str, str], None]
     """
 
-    def __init__(self, callbacks: Optional[Dict[str, Callable]] = None, port: int = 7001):
+    def __init__(
+        self,
+        callbacks: Optional[Dict[str, Callable]] = None,
+        port: int | None = None,
+        *,
+        program_name: str = _PROGRAM_NAME,
+        spatial_authenticator: SpatialRequestAuthenticator | None = None,
+        spatial_session_path: str | os.PathLike[str] | None = None,
+    ):
+        if spatial_authenticator is not None and spatial_session_path is not None:
+            raise ValueError(
+                "spatial_authenticator and spatial_session_path are mutually exclusive"
+            )
         self.callbacks: Dict[str, Callable] = callbacks or {}
         self._thread: Optional[threading.Thread] = None
         self._app = None
+        self._http_server = None
         self._running = False
-        self._port = port   # allow test to override port
+        self._port = resolve_ghostrigger_ipc_port() if port is None else int(port)
+        self._program_name = str(program_name or _PROGRAM_NAME)
+        self._spatial_authenticator = spatial_authenticator
+        self._spatial_session_path = (
+            Path(spatial_session_path).expanduser()
+            if spatial_session_path is not None
+            else None
+        )
+        if (
+            self._spatial_session_path is not None
+            and not self._spatial_session_path.is_absolute()
+        ):
+            raise ValueError("spatial_session_path must be absolute")
+        self._spatial_session_id: str | None = None
+        self._spatial_session_lock = threading.Lock()
+        self._startup_complete = threading.Event()
+        self._startup_error: BaseException | None = None
+        self._stop_requested = threading.Event()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def start(self):
         """Start the IPC server in a daemon background thread."""
-        if self._running:
+        if self._running or (
+            self._thread is not None and self._thread.is_alive()
+        ):
             return
+        self._startup_complete.clear()
+        self._startup_error = None
+        self._stop_requested.clear()
         self._thread = threading.Thread(
             target=self._run_server,
             name="GhostRigger-IPC-Server",
             daemon=True,
         )
         self._thread.start()
-        log.info("GhostRigger IPC server starting on port %d", PORT_GHOSTRIGGER)
+        log.info("GhostRigger IPC server starting on port %d", self._port)
+        if self._spatial_session_path is None:
+            return
+        if not self._startup_complete.wait(15.0):
+            self.stop()
+            raise RuntimeError(
+                "Ghost Studio spatial IPC session startup timed out"
+            )
+        if self._startup_error is not None:
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)
+            raise RuntimeError(
+                "Ghost Studio spatial IPC session failed to start"
+            ) from self._startup_error
+        if not self._running:
+            raise RuntimeError(
+                "Ghost Studio spatial IPC session stopped during startup"
+            )
+
+    @property
+    def port(self) -> int:
+        """Return the actual per-process listening port."""
+
+        return int(self._port)
 
     def stop(self):
-        """Stop the server (best-effort — Flask dev server can't be stopped cleanly)."""
+        """Stop the background Werkzeug server without leaving a bound port."""
+        self._stop_requested.set()
         self._running = False
+        if self._spatial_session_path is not None:
+            self._spatial_authenticator = None
+        self._remove_owned_spatial_session_descriptor()
+        server = self._http_server
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                log.exception("GhostStudio IPC server shutdown failed")
         log.info("GhostRigger IPC server stopping")
+
+    def _remove_owned_spatial_session_descriptor(self) -> None:
+        path = self._spatial_session_path
+        if path is None:
+            return
+        with self._spatial_session_lock:
+            session_id = self._spatial_session_id
+            if not session_id:
+                return
+            try:
+                remove_spatial_session_descriptor(
+                    path,
+                    session_id=session_id,
+                )
+            except Exception:
+                log.exception(
+                    "Ghost Studio spatial session descriptor cleanup failed"
+                )
+            finally:
+                self._spatial_session_id = None
 
     @property
     def is_running(self) -> bool:
@@ -114,6 +433,8 @@ class GhostRiggerIPCServer:
         try:
             from flask import Flask, request, jsonify
         except ImportError:
+            self._startup_error = RuntimeError("Flask is not installed")
+            self._startup_complete.set()
             log.warning(
                 "Flask not installed — GhostRigger IPC server unavailable. "
                 "Install with: pip install flask"
@@ -122,7 +443,6 @@ class GhostRiggerIPCServer:
 
         app = Flask(__name__)
         self._app = app
-        self._running = True
 
         # Suppress Flask startup banner
         import os as _os
@@ -145,6 +465,51 @@ class GhostRiggerIPCServer:
         def _payload(body: dict) -> dict:
             payload = body.get("payload", body)
             return payload if isinstance(payload, dict) else {}
+
+        def _authenticate_spatial_request():
+            authenticator = self._spatial_authenticator
+            if authenticator is None:
+                return jsonify({
+                    "status": "error",
+                    "code": "spatial-auth-unconfigured",
+                }), 503
+            body_bytes = request.get_data(cache=True, as_text=False)
+            try:
+                authenticator.verify(
+                    headers=request.headers,
+                    method=request.method,
+                    path=request.path,
+                    body=body_bytes,
+                )
+            except SpatialAuthenticationError as exc:
+                return jsonify({
+                    "status": "error",
+                    "code": exc.code,
+                }), 401
+            return None
+
+        def _strict_spatial_payload(allowed_keys: set[str]):
+            body = request.get_json(force=True, silent=True)
+            if not isinstance(body, dict):
+                return None, (
+                    jsonify({
+                        "status": "error",
+                        "code": "invalid-spatial-payload",
+                    }),
+                    400,
+                )
+            if any(
+                not isinstance(key, str) or key not in allowed_keys
+                for key in body
+            ):
+                return None, (
+                    jsonify({
+                        "status": "error",
+                        "code": "invalid-spatial-payload",
+                    }),
+                    400,
+                )
+            return body, None
 
         def _handle(action: str):
             """Generic IPC endpoint handler."""
@@ -172,7 +537,7 @@ class GhostRiggerIPCServer:
                     return _err(action, str(exc))
 
             if action == "ping":
-                return _ok(action, {"program": _PROGRAM_NAME, "port": self._port})
+                return _ok(action, {"program": self._program_name, "port": self._port})
             return _ok(action)
 
         # ── Routes ────────────────────────────────────────────────────────
@@ -371,7 +736,7 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(result)}), 504
             payload_result = result if isinstance(result, dict) else {"value": result}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "result": payload_result})
+            return jsonify({"status": "ok", "program": self._program_name, "result": payload_result})
 
         @app.route("/api/scene_object_properties", methods=["POST"])
         def route_scene_object_properties():
@@ -396,7 +761,7 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(result)}), 504
             payload_result = result if isinstance(result, dict) else {"value": result}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "result": payload_result})
+            return jsonify({"status": "ok", "program": self._program_name, "result": payload_result})
 
         @app.route("/api/show_panel", methods=["POST"])
         def route_show_panel():
@@ -516,7 +881,7 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(result)}), 504
             payload_result = result if isinstance(result, dict) else {"value": result}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "result": payload_result})
+            return jsonify({"status": "ok", "program": self._program_name, "result": payload_result})
 
         @app.route("/api/mesh_tool_command", methods=["POST"])
         def route_mesh_tool_command():
@@ -545,7 +910,7 @@ class GhostRiggerIPCServer:
             response = result if isinstance(result, dict) else {"status": "ok", "command": command, "result": result}
             response.setdefault("status", "ok")
             response.setdefault("command", command)
-            response.setdefault("program", _PROGRAM_NAME)
+            response.setdefault("program", self._program_name)
             return jsonify(response)
 
         @app.route("/api/select_module_mesh", methods=["POST"])
@@ -642,6 +1007,46 @@ class GhostRiggerIPCServer:
                 self._schedule_callback(cb, path)
             return jsonify({"status": "ok", "path": path})
 
+        @app.route("/api/map_studio_visual_proof", methods=["POST"])
+        def route_map_studio_visual_proof():
+            """Run a focus-safe stock-skybox before/after proof in Map Studio."""
+
+            body = request.get_json(force=True, silent=True) or {}
+            payload, validation_error = _validate_map_studio_visual_proof_payload(_payload(body))
+            if payload is None:
+                return jsonify({"status": "error", "message": validation_error}), 400
+
+            cb = self.callbacks.get("map_studio_visual_proof")
+            if cb is None:
+                return jsonify({"status": "error", "message": "map_studio_visual_proof callback unavailable"}), 503
+            ok, result = self._invoke_callback_sync(cb, payload, timeout=180.0)
+            if not ok:
+                return jsonify({"status": "error", "message": str(result)}), 504
+            proof = result if isinstance(result, dict) else {"status": "blocked", "value": result}
+            return jsonify({"status": "ok", "program": self._program_name, "proof": proof})
+
+        @app.route("/api/map_studio_pie_visual_proof", methods=["POST"])
+        def route_map_studio_pie_visual_proof():
+            """Run a focus-safe bounded PIE motion/capture proof."""
+
+            body = request.get_json(force=True, silent=True) or {}
+            payload, validation_error = _validate_map_studio_pie_visual_proof_payload(_payload(body))
+            if payload is None:
+                return jsonify({"status": "error", "message": validation_error}), 400
+
+            cb = self.callbacks.get("map_studio_pie_visual_proof")
+            if cb is None:
+                return jsonify({"status": "error", "message": "map_studio_pie_visual_proof callback unavailable"}), 503
+            # Cold-opening an editable stock module can legitimately cross the
+            # 90-second mark while the UI remains responsive.  Match the
+            # bounded Map Studio proof timeout so the synchronous IPC caller
+            # can receive that completed proof instead of a false timeout.
+            ok, result = self._invoke_callback_sync(cb, payload, timeout=180.0)
+            if not ok:
+                return jsonify({"status": "error", "message": str(result)}), 504
+            proof = result if isinstance(result, dict) else {"status": "blocked", "value": result}
+            return jsonify({"status": "ok", "program": self._program_name, "proof": proof})
+
         @app.route("/api/library_search", methods=["GET", "POST"])
         def route_library_search():
             """Return searchable rows from the running app's indexed Content Browser library."""
@@ -660,7 +1065,7 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(result)}), 504
             payload_result = result if isinstance(result, dict) else {"value": result}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "library": payload_result})
+            return jsonify({"status": "ok", "program": self._program_name, "library": payload_result})
 
         @app.route("/api/library_select", methods=["POST"])
         def route_library_select():
@@ -683,7 +1088,7 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(result)}), 504
             payload_result = result if isinstance(result, dict) else {"value": result}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "selection": payload_result})
+            return jsonify({"status": "ok", "program": self._program_name, "selection": payload_result})
 
         @app.route("/api/resource_search", methods=["GET", "POST"])
         def route_resource_search():
@@ -703,7 +1108,7 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(result)}), 504
             payload_result = result if isinstance(result, dict) else {"value": result}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "resources": payload_result})
+            return jsonify({"status": "ok", "program": self._program_name, "resources": payload_result})
 
         @app.route("/api/resource_select", methods=["POST"])
         def route_resource_select():
@@ -725,7 +1130,7 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(result)}), 504
             payload_result = result if isinstance(result, dict) else {"value": result}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "selection": payload_result})
+            return jsonify({"status": "ok", "program": self._program_name, "selection": payload_result})
 
         @app.route("/api/state", methods=["GET", "POST"])
         def route_state():
@@ -737,11 +1142,121 @@ class GhostRiggerIPCServer:
             if not ok:
                 return jsonify({"status": "error", "message": str(state)}), 504
             payload = state if isinstance(state, dict) else {"value": state}
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME, "state": payload})
+            return jsonify({"status": "ok", "program": self._program_name, "state": payload})
+
+        # ── MCP Studio spatial endpoints ───────────────────────────────────
+        # These are a separate, authenticated, read-focused surface. Legacy
+        # Ghostworks/KotorMCP routes above and below are not implicitly trusted
+        # merely because this narrow channel is configured.
+
+        @app.route("/api/mcpstudio/health", methods=["GET"])
+        def route_mcpstudio_health():
+            auth_error = _authenticate_spatial_request()
+            if auth_error is not None:
+                return auth_error
+            return jsonify({
+                "status": "ok",
+                "schema": "ghoststudio-spatial-health/v1",
+                "program": self._program_name,
+                "capabilities": [
+                    "health",
+                    "spatial-snapshot",
+                    "capture",
+                    "evidence-gaps",
+                ],
+            })
+
+        @app.route("/api/mcpstudio/spatial-snapshot", methods=["POST"])
+        def route_mcpstudio_spatial_snapshot():
+            auth_error = _authenticate_spatial_request()
+            if auth_error is not None:
+                return auth_error
+            payload, payload_error = _strict_spatial_payload({
+                "includeBounds",
+                "includeHierarchy",
+                "includeSelection",
+            })
+            if payload_error is not None:
+                return payload_error
+            cb = self.callbacks.get("get_spatial_snapshot")
+            if cb is None:
+                return jsonify({
+                    "status": "error",
+                    "code": "spatial-snapshot-unavailable",
+                }), 503
+            ok, snapshot = self._invoke_callback_sync(cb, payload, timeout=3.0)
+            if not ok or not isinstance(snapshot, dict):
+                return jsonify({
+                    "status": "error",
+                    "code": "spatial-snapshot-failed",
+                }), 504
+            return jsonify({
+                "status": "ok",
+                "schema": "ghoststudio-spatial-response/v1",
+                "snapshot": snapshot,
+            })
+
+        @app.route("/api/mcpstudio/capture", methods=["POST"])
+        def route_mcpstudio_capture():
+            auth_error = _authenticate_spatial_request()
+            if auth_error is not None:
+                return auth_error
+            payload, payload_error = _strict_spatial_payload({"captureId"})
+            if payload_error is not None:
+                return payload_error
+            capture_id = str(payload.get("captureId") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", capture_id):
+                return jsonify({
+                    "status": "error",
+                    "code": "invalid-capture-id",
+                }), 400
+            cb = self.callbacks.get("capture_spatial_evidence")
+            if cb is None:
+                return jsonify({
+                    "status": "error",
+                    "code": "spatial-capture-unavailable",
+                }), 503
+            ok, capture = self._invoke_callback_sync(cb, payload, timeout=5.0)
+            if not ok or not isinstance(capture, dict):
+                return jsonify({
+                    "status": "error",
+                    "code": "spatial-capture-failed",
+                }), 504
+            return jsonify({
+                "status": "ok",
+                "schema": "ghoststudio-spatial-response/v1",
+                "capture": capture,
+            })
+
+        @app.route("/api/mcpstudio/evidence-gaps", methods=["POST"])
+        def route_mcpstudio_evidence_gaps():
+            auth_error = _authenticate_spatial_request()
+            if auth_error is not None:
+                return auth_error
+            payload, payload_error = _strict_spatial_payload(set())
+            if payload_error is not None:
+                return payload_error
+            cb = self.callbacks.get("get_spatial_evidence_gaps")
+            if cb is None:
+                return jsonify({
+                    "status": "error",
+                    "code": "spatial-evidence-unavailable",
+                }), 503
+            ok, evidence = self._invoke_callback_sync(cb, payload, timeout=3.0)
+            if not ok or not isinstance(evidence, dict):
+                return jsonify({
+                    "status": "error",
+                    "code": "spatial-evidence-failed",
+                }), 504
+            return jsonify({
+                "status": "ok",
+                "schema": "ghoststudio-spatial-response/v1",
+                "evidence": evidence,
+            })
 
         @app.route("/api/health", methods=["GET"])
         def route_health():
-            return jsonify({"status": "ok", "program": _PROGRAM_NAME,
+            return jsonify({"status": "ok", "program": self._program_name,
                             "port": self._port, "version": "2.8",
                             "mcp": True})
 
@@ -753,6 +1268,7 @@ class GhostRiggerIPCServer:
         def route_mcp_tools_list():
             """Return all available MCP tool definitions."""
             try:
+                _ensure_kotormcp_importable()
                 from kotormcp.tools import get_all_tools  # noqa: PLC0415
                 return jsonify({"tools": get_all_tools()})
             except Exception as exc:
@@ -771,6 +1287,7 @@ class GhostRiggerIPCServer:
                 arguments = body.get("arguments", {})
                 if not tool_name:
                     return jsonify({"error": "Missing 'name' in request body"}), 400
+                _ensure_kotormcp_importable()
                 from kotormcp.tools import handle_tool  # noqa: PLC0415
                 result = asyncio.run(handle_tool(tool_name, arguments))
                 return jsonify({"result": result})
@@ -785,6 +1302,7 @@ class GhostRiggerIPCServer:
             """Return the kotor:// URI resource template list."""
             import asyncio  # noqa: PLC0415
             try:
+                _ensure_kotormcp_importable()
                 from kotormcp import mcp_resources  # noqa: PLC0415
                 resources = asyncio.run(mcp_resources.list_resources())
                 return jsonify({"resources": resources})
@@ -803,6 +1321,7 @@ class GhostRiggerIPCServer:
                 uri = body.get("uri", "")
                 if not uri:
                     return jsonify({"error": "Missing 'uri' in request body"}), 400
+                _ensure_kotormcp_importable()
                 from kotormcp import mcp_resources  # noqa: PLC0415
                 content = asyncio.run(mcp_resources.read_resource(uri))
                 return jsonify({"content": content})
@@ -811,9 +1330,32 @@ class GhostRiggerIPCServer:
 
         @app.route("/api/<path:action_name>", methods=["POST"])
         def route_catch_all(action_name):
-            """Catch-all for unknown POST actions — returns JSON error."""
-            return jsonify({"status": "error", "action": action_name,
-                            "message": f"unknown action: {action_name}"}), 404
+            """Dispatch registered compatibility actions with a bounded payload."""
+
+            cb = self.callbacks.get(str(action_name))
+            if cb is None:
+                return jsonify({"status": "error", "action": action_name,
+                                "message": f"unknown action: {action_name}"}), 404
+            body = request.get_json(force=True, silent=True) or {}
+            payload = _payload(body)
+            ok, result = self._invoke_callback_sync(cb, payload, timeout=30.0)
+            if not ok:
+                return jsonify({
+                    "status": "error",
+                    "action": action_name,
+                    "program": self._program_name,
+                    "message": str(result),
+                }), 500
+            response = {
+                "status": "ok",
+                "action": action_name,
+                "program": self._program_name,
+            }
+            if isinstance(result, dict):
+                response.update(result)
+            elif result is not None:
+                response["result"] = result
+            return jsonify(response)
 
         @app.errorhandler(404)
         def not_found(e):
@@ -827,23 +1369,58 @@ class GhostRiggerIPCServer:
         # Use werkzeug make_server directly to avoid the WERKZEUG_SERVER_FD
         # environment variable issue present in newer werkzeug versions when
         # running inside a daemon thread (no reloader needed).
+        srv = None
         try:
             from werkzeug.serving import make_server
             srv = make_server("127.0.0.1", self._port, app, threaded=True)
+            self._http_server = srv
+            if self._port == 0:
+                self._port = int(srv.server_port)
+            if self._spatial_session_path is not None:
+                credentials = SpatialSessionCredentials.create()
+                self._spatial_authenticator = SpatialRequestAuthenticator(
+                    credentials
+                )
+                with self._spatial_session_lock:
+                    self._spatial_session_id = credentials.session_id
+                    publish_spatial_session_descriptor(
+                        self._spatial_session_path,
+                        port=self._port,
+                        credentials=credentials,
+                    )
+            if self._stop_requested.is_set():
+                return
             self._running = True
             log.info("GhostRigger IPC server bound on port %d", self._port)
+            self._startup_complete.set()
             srv.serve_forever()
-        except OSError as exc:
-            if "Address already in use" in str(exc) or "10048" in str(exc):
+        except Exception as exc:
+            self._startup_error = exc
+            if isinstance(exc, OSError) and (
+                "Address already in use" in str(exc)
+                or "10048" in str(exc)
+            ):
                 log.warning(
                     "GhostRigger IPC port %d already in use — "
                     "another instance may be running.",
                     self._port,
                 )
             else:
-                log.error("GhostRigger IPC server error: %s", exc)
+                log.exception("GhostRigger IPC server failed")
         finally:
             self._running = False
+            self._startup_complete.set()
+            self._remove_owned_spatial_session_descriptor()
+            if srv is not None:
+                try:
+                    close_server = getattr(srv, "server_close", None)
+                    if callable(close_server):
+                        close_server()
+                except Exception:
+                    log.exception("GhostRigger IPC server close failed")
+            self._http_server = None
+            if self._spatial_session_path is not None:
+                self._spatial_authenticator = None
 
     def _schedule_callback(self, cb: Callable, *args):
         """Execute a callback through Qt when active, otherwise directly."""

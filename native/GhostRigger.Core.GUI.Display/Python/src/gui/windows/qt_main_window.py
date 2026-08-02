@@ -66,7 +66,6 @@ from src.gui.qt_lib.dialogs.add_model_to_scene_dialog import AddModelToSceneChoi
 from src.gui.qt_lib.dialogs.qt_lightmap_baker_dialog import QtLightmapBakerDialog
 from src.gui.qt_lib.dialogs.qt_render_frame_dialog import QtRenderFrameDialog
 from src.gui.qt_lib.panels.qt_resource_panel import QtResourceBrowserPanel, Qt2DABrowserPanel
-from src.gui.qt_lib.windows.module_editor_window import ModuleEditorWindow
 from src.gui.qt_lib.windows.qt_retarget_preview_controller import (
     QtRetargetViewportAdapter,
     RetargetPreviewUiController,
@@ -81,6 +80,7 @@ from src.gui.qt_lib.dialogs.qt_settings_dialog import QtSettingsDialog, save_set
 from src.gui.qt_lib.panels.qt_texture_panel import QtTextureToolWindow
 from src.gui.qt_lib.sequence_editor.sequence_editor_window import SequenceEditorWindow
 from src.ipc.server import GhostRiggerIPCServer
+from src.ipc.spatial_auth import default_spatial_session_path
 from src.core.rendering.viewport_navigation import DEFAULT_VIEWPORT_NAVIGATION_PROFILE, normalize_viewport_navigation_profile
 from src.core.rendering.hardware_info import collect_hardware_diagnostics
 from src.systems.bas.attachment_alignment import (
@@ -155,6 +155,8 @@ from src.gui.windows.application_core.application_core_lib.functions.splash_them
     _surface_fill,
 )
 from src.gui.windows.application_core.application_core_lib.shared.scene_workflow import SceneWorkflowMixin
+from src.gui.windows.application_core.application_core_lib.shared.scripting_studio_workflow import ScriptingStudioWorkflowMixin
+from src.gui.windows.application_core.application_core_lib.shared.gui_editor_workflow import GuiEditorWorkflowMixin
 from src.gui.windows.application_core.application_core_lib.shared.viewport_tools import ViewportToolsMixin
 from src.gui.windows.application_core.application_core_lib.shared.model_io import ModelIoMixin
 from src.gui.windows.application_core.application_core_lib.shared.retarget_workflow import RetargetWorkflowMixin
@@ -215,6 +217,8 @@ def _build_prelaunch_library_input(
 
 class QtGhostRiggerMainWindow(
     WindowChromeMixin,
+    ScriptingStudioWorkflowMixin,
+    GuiEditorWorkflowMixin,
     MainWindowLayoutMixin,
     ViewportToolsMixin,
     ModelIoMixin,
@@ -232,7 +236,7 @@ class QtGhostRiggerMainWindow(
     WorkspaceDockMixin,
     QtWidgets.QMainWindow,
 ):
-    APP_TITLE = "GhostRigger-K1-K2  //  Odyssey Engine Pipeline v6.1"
+    APP_TITLE = "GhostStudio  //  Odyssey Engine Pipeline v6.1"
     APP_VERSION = "6.1.0"
     # Source-contract anchors for tests that still inspect this shell after the
     # behavior moved into mixins:
@@ -274,6 +278,7 @@ class QtGhostRiggerMainWindow(
         self.settings_data.setdefault("autoscan", True)
         self.settings_data.setdefault("fbx_sdk", {})
         self.settings_data.setdefault("mixamo_companion_mesh_path", "")
+        self.settings_data.setdefault("getting_started_seen", False)
         RendererSettings.apply_defaults(self.settings_data)
         self._preloaded_library = dict(self.startup_input.get("preloaded_library") or {})
         self._preloaded_hardware_diagnostics = dict(self.startup_input.get("hardware_diagnostics") or {})
@@ -302,6 +307,12 @@ class QtGhostRiggerMainWindow(
         self._auto_detect_worker: Optional[QtCore.QObject] = None
         self._animation_scan_thread: Optional[QtCore.QThread] = None
         self._animation_scan_worker: Optional[QtCore.QObject] = None
+        self._animation_model_load_thread: Optional[QtCore.QThread] = None
+        self._animation_model_load_worker: Optional[QtCore.QObject] = None
+        self._animation_model_load_request_id = 0
+        self._animation_model_load_model_id = 0
+        self._pending_animation_model_load: Optional[tuple] = None
+        self._defer_inherited_animation_loading = True
         self._batch_thread: Optional[QtCore.QThread] = None
         self._batch_worker: Optional[QtCore.QObject] = None
         self._floating_dock_hosts: dict[str, QtFloatingDockHost] = {}
@@ -333,6 +344,7 @@ class QtGhostRiggerMainWindow(
         self._progress_toast: Optional[QtProgressToast] = None
         self._gui_log_handler: Optional[QtLogPanelHandler] = None
         self._ipc_server: Optional[GhostRiggerIPCServer] = None
+        self._scripter_compat_ipc_server: Optional[GhostRiggerIPCServer] = None
         self._pending_gpu_upload_model_id = 0
         self._pending_gpu_upload_total = 0
         self._texture_dir = ""
@@ -392,6 +404,7 @@ class QtGhostRiggerMainWindow(
         QtCore.QTimer.singleShot(250, self._start_ipc_server)
         QtCore.QTimer.singleShot(1200, self._enable_theme_progress_toasts)
         QtCore.QTimer.singleShot(300, self._finish_pending_prelaunch_after_first_paint)
+        QtCore.QTimer.singleShot(650, self._maybe_show_getting_started_on_first_launch)
         if not self._preloaded_library.get("detection_attempted"):
             QtCore.QTimer.singleShot(350, self._auto_detect_dirs_on_startup)
 
@@ -514,8 +527,13 @@ class QtGhostRiggerMainWindow(
                 self._log(f"IPC open_tool dock: {tool}", "info")
                 return
             tool_actions = {
-                "module_editor": self._open_module_editor_window,
+                "module_editor": self._open_stock_module_editor_window,
+                "map_studio": self._open_module_editor_window,
                 "gmodular": self._open_module_editor_window,
+                "scripting_studio": self._open_scripting_dialogue_studio_window,
+                "scripting_dialogue_studio": self._open_scripting_dialogue_studio_window,
+                "script_editor": self._open_scripting_dialogue_studio_window,
+                "dialogue_editor": self._open_scripting_dialogue_studio_window,
                 "rig": self._open_rig_window,
                 "rigging": self._open_rig_window,
                 "rigging_window": self._open_rig_window,
@@ -525,12 +543,30 @@ class QtGhostRiggerMainWindow(
                 "blueprint_editor": self._open_blueprint_editor_window,
                 "character_builder": self._open_qt_character_builder_window,
                 "character_studio": self._open_qt_character_builder_window,
+                "native_kotor_head": lambda: self._open_qt_character_builder_window(
+                    "native_kotor_head"
+                ),
+                "head_builder": lambda: self._open_qt_character_builder_window(
+                    "native_kotor_head"
+                ),
+                "custom_head": lambda: self._open_qt_character_builder_window(
+                    "native_kotor_head"
+                ),
+                "modular_head": lambda: self._open_qt_character_builder_window(
+                    "native_kotor_head"
+                ),
                 "retarget": self._open_animation_retarget_window,
                 "retarget_workbench": self._open_animation_retarget_window,
                 "animation_retarget": self._open_animation_retarget_window,
                 "unreal_animator": self._open_unreal_animator_window,
                 "sequence_editor": self._open_sequence_editor_window,
                 "sequence_editor_window": self._open_sequence_editor_window,
+                "gui_editor": self._open_gui_editor_window,
+                "odyssey_gui_editor": self._open_gui_editor_window,
+                "particle_editor": self._open_particle_editor_window,
+                "particles": self._open_particle_editor_window,
+                "placeable_builder": self._open_placeable_builder_window,
+                "placeables": self._open_placeable_builder_window,
                 "settings": self._open_settings_dialog,
                 "theme_editor": self._open_theme_editor_window,
             }
@@ -538,7 +574,12 @@ class QtGhostRiggerMainWindow(
             if action is None:
                 self._log(f"IPC open_tool: unknown tool {tool}", "warning")
                 return
-            action()
+            try:
+                action()
+            except Exception as exc:
+                log.exception("IPC open_tool failed for %s", tool)
+                self._log(f"IPC open_tool failed for {tool}: {exc}", "error")
+                return
             self._log(f"IPC open_tool: {tool}", "info")
 
         def viewport_command(command: str, options: object = None) -> None:
@@ -659,6 +700,89 @@ class QtGhostRiggerMainWindow(
             else:
                 self._log(f"IPC window capture failed: {target}", "warning")
 
+        def map_studio_visual_proof(payload: object = None) -> dict:
+            data = payload if isinstance(payload, dict) else {}
+            return self._map_studio_visual_proof_from_ipc(data)
+
+        def map_studio_pie_visual_proof(payload: object = None) -> dict:
+            data = payload if isinstance(payload, dict) else {}
+            return self._map_studio_pie_visual_proof_from_ipc(data)
+
+        def scripting_status(_payload: object = None) -> dict:
+            controller = getattr(self, "scripting_dialogue_studio_controller", None)
+            project_controller = getattr(controller, "project_controller", None)
+            project = getattr(project_controller, "project", None)
+            documents = tuple(getattr(controller, "documents", ()) or ())
+            runtime = tuple(getattr(controller, "runtime_resources", lambda: ())() or ()) if controller else ()
+            return {
+                "suite_open": controller is not None,
+                "game": str(getattr(self, "_current_game", "") or "K2"),
+                "document_count": len(documents),
+                "dirty_document_count": sum(bool(row.get("dirty")) for row in documents if isinstance(row, dict)),
+                "runtime_resource_count": len(runtime),
+                "project_path": str(getattr(project, "manifest_path", "") or ""),
+            }
+
+        def open_scripting_resource(payload: object = None) -> dict:
+            data = dict(payload) if isinstance(payload, dict) else {}
+            requested = str(data.get("kind") or data.get("restype") or "script").strip().lower().lstrip(".")
+            aliases = {"nss": "script", "ncs": "script", "dlg": "dialogue"}
+            kind = aliases.get(requested, requested)
+            game = str(data.get("game") or getattr(self, "_current_game", "") or "K2").upper()
+            path = str(data.get("path") or data.get("source_path") or "").strip()
+            resref = str(data.get("resref") or Path(path).stem if path else data.get("resref") or "").strip()
+            context_kind = kind if kind in {"script", "dialogue"} else "script"
+            window = self._open_scripting_dialogue_studio_window(
+                {
+                    "source": "legacy_ipc",
+                    "kind": context_kind,
+                    "game": game,
+                    "restype": "DLG" if kind == "dialogue" else "NSS",
+                    "resref": resref if not path else "",
+                    "suggested_resref": resref,
+                }
+            )
+            controller = getattr(self, "scripting_dialogue_studio_controller", None)
+            opened = ""
+            if controller is not None and path:
+                if kind in {"script", "dialogue"}:
+                    opened = str(controller.script_controller.open_file(path, game=game))
+                elif kind in {"2da", "globals"}:
+                    controller.data_controller.set_table_mode("globals" if kind == "globals" else "2da")
+                    opened = str(bool(controller.data_controller.open_table(path)))
+                elif kind in {"tlk", "talk_table"}:
+                    opened = str(bool(controller.data_controller.open_talk_table(path)))
+                elif kind in {"jrl", "journal"}:
+                    opened = str(bool(controller.data_controller.open_journal(path)))
+                elif kind == "lip":
+                    opened = str(bool(controller.data_controller.open_lip(path)))
+                elif kind == "ssf":
+                    opened = str(bool(controller.data_controller.open_sound_set(path)))
+                elif kind in {"gff", "blueprint", "utc", "utp", "utd", "uti", "ute", "utm", "uts", "utt", "utw"}:
+                    blueprint = getattr(controller, "blueprint_controller", None)
+                    if blueprint is not None:
+                        opened = str(bool(blueprint.open_path(path)))
+            page_keys = {
+                "2da": "tables", "globals": "tables", "tlk": "talk", "talk_table": "talk",
+                "jrl": "journal", "journal": "journal", "lip": "voice", "ssf": "voice",
+                "gff": "blueprint", "blueprint": "blueprint", "utc": "blueprint", "utp": "blueprint",
+                "utd": "blueprint", "uti": "blueprint", "ute": "blueprint", "utm": "blueprint",
+                "uts": "blueprint", "utt": "blueprint", "utw": "blueprint",
+            }
+            window.show_suite_page(page_keys.get(kind, "code"))
+            return {"opened": opened or resref, "kind": kind, "game": game, "path": path}
+
+        def open_scripting_project(payload: object = None) -> dict:
+            data = dict(payload) if isinstance(payload, dict) else {}
+            path = str(data.get("path") or data.get("project") or "").strip()
+            window = self._open_scripting_dialogue_studio_window({"source": "legacy_ipc"})
+            controller = getattr(self, "scripting_dialogue_studio_controller", None)
+            opened = False
+            if controller is not None and path:
+                opened = controller.project_controller.open_project(path) is not None
+            window.show_suite_page("project")
+            return {"opened": bool(opened), "path": path}
+
         try:
             self._ipc_server = GhostRiggerIPCServer(
                 {
@@ -697,12 +821,52 @@ class QtGhostRiggerMainWindow(
                     "select_helper": select_helper,
                     "capture_viewport": capture_viewport,
                     "capture_window": capture_window,
-                }
+                    "map_studio_visual_proof": map_studio_visual_proof,
+                    "map_studio_pie_visual_proof": map_studio_pie_visual_proof,
+                    "get_spatial_snapshot": self._ipc_spatial_snapshot,
+                    "capture_spatial_evidence": self._ipc_capture_spatial_evidence,
+                    "get_spatial_evidence_gaps": self._ipc_spatial_evidence_gaps,
+                },
+                spatial_session_path=default_spatial_session_path(),
             )
             self._ipc_server.start()
-            self._log("IPC server starting on port 7001.", "info")
+            self._log(f"IPC server listening on port {self._ipc_server.port}.", "info")
+
+            try:
+                compatibility_port = int(os.environ.get("GHOSTSTUDIO_SCRIPTER_IPC_PORT", "7002"))
+            except ValueError:
+                compatibility_port = 7002
+            self._scripter_compat_ipc_server = GhostRiggerIPCServer(
+                {
+                    "status": scripting_status,
+                    "open_script": lambda payload: open_scripting_resource({**dict(payload or {}), "kind": "script"}),
+                    "open_dlg": lambda payload: open_scripting_resource({**dict(payload or {}), "kind": "dialogue"}),
+                    "open_2da": lambda payload: open_scripting_resource({**dict(payload or {}), "kind": "2da"}),
+                    "open_tlk": lambda payload: open_scripting_resource({**dict(payload or {}), "kind": "tlk"}),
+                    "open_journal": lambda payload: open_scripting_resource({**dict(payload or {}), "kind": "jrl"}),
+                    "open_gff": lambda payload: open_scripting_resource({**dict(payload or {}), "kind": "gff"}),
+                    "open_project": open_scripting_project,
+                },
+                port=compatibility_port,
+                program_name="GhostStudio Scripting Suite",
+            )
+            self._scripter_compat_ipc_server.start()
+            self._log(
+                f"Scripting Suite compatibility IPC starting on port {compatibility_port}.",
+                "info",
+            )
         except Exception as exc:
+            for server in (
+                self._ipc_server,
+                self._scripter_compat_ipc_server,
+            ):
+                if server is not None:
+                    try:
+                        server.stop()
+                    except Exception:
+                        log.exception("IPC startup cleanup failed")
             self._ipc_server = None
+            self._scripter_compat_ipc_server = None
             self._log(f"IPC server failed to start: {exc}", "warning")
 
     def _enable_theme_progress_toasts(self) -> None:

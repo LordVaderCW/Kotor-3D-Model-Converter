@@ -7,6 +7,11 @@ from typing import Any
 from PySide6 import QtCore, QtWidgets
 
 from src.gui.qt_lib.assets.qt_theme import heading
+from src.systems.bas.attachment_catalog import (
+    BasAttachmentCatalog,
+    saber_color_variants,
+    saber_family,
+)
 from src.systems.bas.head_resolution import normalize_bas_model_resref
 
 
@@ -70,6 +75,8 @@ BAS_MODE_LABELS: dict[str, str] = {
     "full_body": "Full Body",
 }
 
+BAS_CATALOG_GAME_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 1
+
 
 class QtBodyAttachmentPanel(QtWidgets.QWidget):
     """Attach heads, hands, and weapons to the active body preview."""
@@ -77,18 +84,28 @@ class QtBodyAttachmentPanel(QtWidgets.QWidget):
     attachRequested = QtCore.Signal(str, str)
     clearRequested = QtCore.Signal(str)
     saveBuildRequested = QtCore.Signal()
+    exportComposedRequested = QtCore.Signal()
     slotSelected = QtCore.Signal(str)
     modeChanged = QtCore.Signal(str)
+    catalogRefreshRequested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._slot_buttons: dict[str, QtWidgets.QToolButton] = {}
         self._slot_models: dict[str, str] = {}
+        self._slot_model_games: dict[str, str] = {}
         self._selected_slot = "head"
         self._mode = "headless_body"
         self._syncing_layer_selection = False
+        self._catalog: BasAttachmentCatalog | None = None
+        self._catalog_revision: int | None = None
+        self._syncing_color_combo = False
         self._build()
         self.set_selected_slot("head")
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt virtual
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self.catalogRefreshRequested.emit)
 
     def _build(self) -> None:
         root = QtWidgets.QVBoxLayout(self)
@@ -128,7 +145,17 @@ class QtBodyAttachmentPanel(QtWidgets.QWidget):
         form.addRow("Slot", self.slot_label)
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.setEditable(True)
+        self.model_combo.currentIndexChanged.connect(self._sync_color_combo)
         form.addRow("Model", self.model_combo)
+        self.color_combo = QtWidgets.QComboBox()
+        self.color_combo.setObjectName("basLightsaberColorComboBox")
+        self.color_combo.setToolTip(
+            "Blade colors for the selected lightsaber family from both installed games. "
+            "Changing the color re-attaches the matching model variation."
+        )
+        self.color_combo.setEnabled(False)
+        self.color_combo.activated.connect(self._handle_color_selected)
+        form.addRow("Color", self.color_combo)
         root.addLayout(form)
 
         controls = QtWidgets.QHBoxLayout()
@@ -143,6 +170,17 @@ class QtBodyAttachmentPanel(QtWidgets.QWidget):
         self.save_build_button = QtWidgets.QPushButton("Save Build")
         self.save_build_button.clicked.connect(self.saveBuildRequested.emit)
         root.addWidget(self.save_build_button)
+
+        self.export_composed_button = QtWidgets.QPushButton("Export Composed Model…")
+        self.export_composed_button.setObjectName("basExportComposedButton")
+        self.export_composed_button.setToolTip(
+            "Export the body with every attached layer (head, mask, weapons, belt) "
+            "combined into one model: binary MDL/MDX for the game, or OBJ/FBX for DCC tools. "
+            "The export keeps the composed geometry, hierarchy, skins, materials, and textures; "
+            "animation takes are those already baked or owned by the composed body model."
+        )
+        self.export_composed_button.clicked.connect(self.exportComposedRequested.emit)
+        root.addWidget(self.export_composed_button)
 
         self.layer_tree = QtWidgets.QTreeWidget()
         self.layer_tree.setHeaderLabels(["Layer", "Model", "State"])
@@ -188,6 +226,12 @@ class QtBodyAttachmentPanel(QtWidgets.QWidget):
             return normalize_bas_model_resref(text)
         return normalize_bas_model_resref(self.model_combo.currentData() or text or "")
 
+    def selected_model_game(self) -> str:
+        """Return the explicit K1/K2 owner of the selected catalog row."""
+
+        game = str(self.model_combo.currentData(BAS_CATALOG_GAME_ROLE) or "").strip().upper()
+        return game if game in {"K1", "K2"} else ""
+
     def set_selected_slot(self, slot: str) -> None:
         slot = slot if slot in BAS_SLOT_LABELS else "head"
         self._selected_slot = slot
@@ -195,41 +239,141 @@ class QtBodyAttachmentPanel(QtWidgets.QWidget):
             button.setChecked(key == slot)
         self.slot_label.setText(BAS_SLOT_LABELS[slot])
         self._populate_model_combo(slot)
-        attachable = slot not in {"body", "left_hand", "right_hand"} and not (slot == "head" and self._mode == "full_body")
+        attachable = slot not in {"left_hand", "right_hand"} and not (slot == "head" and self._mode == "full_body")
         self.model_combo.setEnabled(attachable)
         self.attach_button.setEnabled(attachable)
         self.clear_button.setEnabled(slot != "body" and attachable)
+        self.attach_button.setText("Use Body" if slot == "body" else "Attach")
+        self._sync_color_combo()
         self._sync_selected_layer()
         self.slotSelected.emit(slot)
 
-    def set_body_model(self, model: Any) -> None:
-        name = str(getattr(model, "name", "") or "BODY") if model is not None else "BODY"
+    def set_body_model(self, model: Any, *, resref: str = "", game: str = "") -> None:
+        name = str(
+            resref
+            or getattr(model, "_gr_source_resref", "")
+            or getattr(model, "name", "")
+            or "BODY"
+        ) if model is not None else "BODY"
+        source_game = str(game or getattr(model, "_gr_source_game", "") or "").strip().upper()
         self._slot_models["body"] = name
+        self._slot_model_games["body"] = source_game if source_game in {"K1", "K2"} else ""
         self._set_slot_text("body", name)
 
     def set_slot_model(self, slot: str, model: Any = None, *, resref: str = "") -> None:
         label = str(resref or getattr(model, "name", "") or BAS_SLOT_LABELS.get(slot, slot))
         self._slot_models[slot] = label
+        source_game = str(getattr(model, "_gr_source_game", "") or "").strip().upper()
+        self._slot_model_games[slot] = source_game if source_game in {"K1", "K2"} else ""
         self._set_slot_text(slot, label)
 
     def clear_slot_model(self, slot: str) -> None:
         self._slot_models.pop(slot, None)
+        self._slot_model_games.pop(slot, None)
         self._set_slot_text(slot, BAS_SLOT_LABELS.get(slot, slot))
 
     def set_status(self, message: str) -> None:
         self.status.setPlainText(str(message or ""))
 
+    def set_attachment_catalog(
+        self,
+        catalog: BasAttachmentCatalog | None,
+        *,
+        revision: int | None = None,
+    ) -> None:
+        """Adopt the game-derived item catalog and refresh the active slot."""
+
+        self._catalog = catalog if catalog is not None and not getattr(catalog, "empty", True) else None
+        self._catalog_revision = int(revision) if revision is not None else None
+        self._populate_model_combo(self._selected_slot)
+        self._sync_color_combo()
+
+    def attachment_catalog(self) -> BasAttachmentCatalog | None:
+        return self._catalog
+
+    def attachment_catalog_revision(self) -> int | None:
+        return self._catalog_revision
+
     def _populate_model_combo(self, slot: str) -> None:
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
-        for label, value in BAS_PRESET_MODELS.get(slot, ()):
-            self.model_combo.addItem(f"{label} - {value}", value)
+        entries = self._catalog.entries(slot) if self._catalog is not None else ()
+        if entries:
+            for entry in entries:
+                games = f" [{entry.games_label}]" if entry.games_label else ""
+                self.model_combo.addItem(f"{entry.label}{games} - {entry.resref}", entry.resref)
+                self.model_combo.setItemData(
+                    self.model_combo.count() - 1,
+                    str(getattr(entry, "game", "") or "").upper(),
+                    BAS_CATALOG_GAME_ROLE,
+                )
+        else:
+            for label, value in BAS_PRESET_MODELS.get(slot, ()):
+                self.model_combo.addItem(f"{label} - {value}", value)
         if self.model_combo.count() == 0:
             self.model_combo.addItem("", "")
+        selected_resref = normalize_bas_model_resref(self._slot_models.get(slot, ""))
+        selected_game = str(self._slot_model_games.get(slot, "") or "").upper()
+        if selected_resref:
+            for index in range(self.model_combo.count()):
+                if normalize_bas_model_resref(self.model_combo.itemData(index)) != selected_resref:
+                    continue
+                item_game = str(self.model_combo.itemData(index, BAS_CATALOG_GAME_ROLE) or "").upper()
+                if selected_game and item_game and item_game != selected_game:
+                    continue
+                self.model_combo.setCurrentIndex(index)
+                break
         self.model_combo.blockSignals(False)
+        self._sync_color_combo()
+
+    def _sync_color_combo(self) -> None:
+        """Mirror the selected model's saber family into the Color choices."""
+
+        combo = getattr(self, "color_combo", None)
+        if combo is None or self._syncing_color_combo:
+            return
+        self._syncing_color_combo = True
+        try:
+            resref = self.selected_model_resref()
+            family = saber_family(resref)
+            combo.blockSignals(True)
+            combo.clear()
+            if not family:
+                combo.setEnabled(False)
+                return
+            current_index = 0
+            for index, variant in enumerate(saber_color_variants(resref, self._catalog, self._selected_slot)):
+                games = f" [{variant.games_label}]" if variant.games_label else ""
+                combo.addItem(f"{variant.color}{games}", variant.resref)
+                if variant.resref == resref:
+                    current_index = index
+            combo.setCurrentIndex(current_index)
+            combo.setEnabled(combo.count() > 0 and self.model_combo.isEnabled())
+        finally:
+            combo.blockSignals(False)
+            self._syncing_color_combo = False
+
+    def _handle_color_selected(self, index: int) -> None:
+        """Swap the model to the chosen blade color, re-attaching if live."""
+
+        variant = str(self.color_combo.itemData(index) or "").strip()
+        if not variant:
+            return
+        previous = self.selected_model_resref()
+        match = self.model_combo.findData(variant)
+        self.model_combo.blockSignals(True)
+        if match >= 0:
+            self.model_combo.setCurrentIndex(match)
+        else:
+            self.model_combo.setEditText(variant)
+        self.model_combo.blockSignals(False)
+        slot = self._selected_slot
+        attached = str(self._slot_models.get(slot, "") or "").strip()
+        if attached and saber_family(attached) and saber_family(attached) == saber_family(previous or variant):
+            self.attachRequested.emit(slot, variant)
 
     def _emit_attach(self) -> None:
-        if self._selected_slot in {"body", "left_hand", "right_hand"} or (
+        if self._selected_slot in {"left_hand", "right_hand"} or (
             self._selected_slot == "head" and self._mode == "full_body"
         ):
             return

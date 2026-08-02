@@ -632,6 +632,8 @@ class OBJExporter:
           3. Not a deformation helper.
           4. Not an emitter or light node.
         """
+        if bool(getattr(node, '_gr_bas_geometry_replaced_by_attachment', False)):
+            return False
         if not getattr(node, 'vertices', None):
             return False
         # Facial geometry nodes bypass the render=False gate entirely
@@ -647,6 +649,26 @@ class OBJExporter:
     # ── Bind-pose world-space transform helpers ──────────────────────────────
 
     @staticmethod
+    def _node_bind_world_transform(node):
+        """Compose the emitted object hierarchy with standard rigid math."""
+
+        local_position = tuple(float(value) for value in getattr(node, "position", (0.0, 0.0, 0.0)))
+        local_rotation = _quat_normalize(
+            tuple(float(value) for value in getattr(node, "rotation", (0.0, 0.0, 0.0, 1.0)))
+        )
+        parent = getattr(node, "parent", None)
+        if parent is None:
+            return local_position, local_rotation
+        parent_position, parent_rotation = OBJExporter._node_bind_world_transform(parent)
+        rotated_position = _quat_rotate(parent_rotation, local_position)
+        world_position = tuple(
+            parent_position[index] + rotated_position[index]
+            for index in range(3)
+        )
+        world_rotation = _quat_normalize(_quat_mul(parent_rotation, local_rotation))
+        return world_position, world_rotation
+
+    @staticmethod
     def _node_bind_world_verts(node) -> List[Tuple[float, float, float]]:
         """
         Return vertices transformed to bind-pose world space.
@@ -656,8 +678,8 @@ class OBJExporter:
 
             v_world = rotate(skin_wo, v_local) + skin_wp
 
-        where (skin_wp, skin_wo) is the node's world transform from
-        ModelNode.world_transform().  When the skin-node rotation is the
+        where (skin_wp, skin_wo) is composed from the emitted local hierarchy.
+        When the skin-node rotation is the
         identity quaternion (the common case) this simplifies to:
 
             v_world = v_local + skin_wp
@@ -678,7 +700,7 @@ class OBJExporter:
         if not verts:
             return []
 
-        wp, wo = node.world_transform()
+        wp, wo = OBJExporter._node_bind_world_transform(node)
         wo_rot = math.sqrt(wo[0]**2 + wo[1]**2 + wo[2]**2)
         is_id = wo_rot < 0.001
 
@@ -702,7 +724,7 @@ class OBJExporter:
         if not normals:
             return []
 
-        _wp, wo = node.world_transform()
+        _wp, wo = OBJExporter._node_bind_world_transform(node)
         wo_rot = math.sqrt(wo[0]**2 + wo[1]**2 + wo[2]**2)
         is_id = wo_rot < 0.001
 
@@ -905,6 +927,18 @@ class OBJExporter:
                 out_path = out_dir / f"{tex_name}.tga"
                 if not out_path.exists():
                     img_rgb = img.convert('RGB') if img.mode not in ('RGB', 'RGBA') else img
+                    # T2554: decoded KOTOR textures are in game/D3D row order
+                    # (the viewport compensates in-shader with 1-v).  The OBJ
+                    # exporter writes DCC-convention vt (1-v), so the sidecar
+                    # image must be row-flipped for Blender/Maya — same parity
+                    # rule as the FBX sidecar path below and the game-import
+                    # direction (T2552).  Without this the texture reads
+                    # coherently-but-misplaced (V-mirrored atlas islands).
+                    try:
+                        from PIL import Image as _PILImage
+                        img_rgb = img_rgb.transpose(_PILImage.FLIP_TOP_BOTTOM)
+                    except Exception:
+                        pass
                     img_rgb.save(str(out_path))
                     log.debug(f"Saved texture: {out_path.name}")
                     saved += 1
@@ -1164,9 +1198,43 @@ class FBXExporter:
          skin cluster deformers), and the bone hierarchy as null/joint nodes.
     """
 
+    COMPATIBILITY_STANDARD = "standard"
+    COMPATIBILITY_UNITY = "unity"
+    COMPATIBILITY_UNREAL = "unreal"
+    COMPATIBILITY_3DS_MAX = "3ds_max"
+
+    @classmethod
+    def normalize_compatibility_profile(cls, value: str | None) -> str:
+        key = str(value or cls.COMPATIBILITY_STANDARD).strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "": cls.COMPATIBILITY_STANDARD,
+            "default": cls.COMPATIBILITY_STANDARD,
+            "native": cls.COMPATIBILITY_STANDARD,
+            "kotor": cls.COMPATIBILITY_STANDARD,
+            "unity_engine": cls.COMPATIBILITY_UNITY,
+            "unreal_engine": cls.COMPATIBILITY_UNREAL,
+            "ue": cls.COMPATIBILITY_UNREAL,
+            "ue5": cls.COMPATIBILITY_UNREAL,
+            "max": cls.COMPATIBILITY_3DS_MAX,
+            "3dsmax": cls.COMPATIBILITY_3DS_MAX,
+            "autodesk_3ds_max": cls.COMPATIBILITY_3DS_MAX,
+        }
+        key = aliases.get(key, key)
+        valid = {
+            cls.COMPATIBILITY_STANDARD,
+            cls.COMPATIBILITY_UNITY,
+            cls.COMPATIBILITY_UNREAL,
+            cls.COMPATIBILITY_3DS_MAX,
+        }
+        if key not in valid:
+            raise ValueError(f"Unsupported FBX compatibility profile: {value}")
+        return key
+
     def export(self, model: KotorModel, fbx_path: str, tex_cache=None,
                export_rigging: bool = True,
-               base_skeleton_model: 'Optional[KotorModel]' = None) -> bool:
+               base_skeleton_model: 'Optional[KotorModel]' = None,
+               export_manifest: bool = True,
+               compatibility_profile: str = "standard") -> bool:
         """
         Export model to FBX.
 
@@ -1188,15 +1256,49 @@ class FBXExporter:
                               instead of identity matrices.  This is required for
                               accessory meshes (heads, bodies, hands) to deform
                               correctly in Unreal Engine.
+        export_manifest     : When True (default), write a
+                              ``<fbx_stem>.ghostrigger.json`` sidecar preserving
+                              KOTOR node flags, hook roles, texture slots,
+                              qbone/tbone skin data, animation summaries, and
+                              Unreal import guidance that FBX cannot carry
+                              reliably on its own.
+        compatibility_profile : ``standard``, ``unity``, ``unreal``, or
+                              ``3ds_max``. Engine/DCC profiles force the complete
+                              ASCII writer and apply explicit unit and animation
+                              interchange contracts.
         """
-        # Try fbx module (Autodesk FBX Python SDK)
-        try:
-            import fbx as _fbx
-            ok = self._export_fbx_sdk(model, fbx_path, _fbx)
-        except ImportError:
+        compatibility_profile = self.normalize_compatibility_profile(compatibility_profile)
+        exporter_backend = ""
+        fbx_format = ""
+        # Rigged or animated models must use the ASCII 7.4 writer: the SDK
+        # path writes skeleton nodes translation-only (no rotation), builds no
+        # skin clusters, and exports no animation takes, so a creature body
+        # arrives in Max/Unity as scattered rigid parts (2026-07-15 user
+        # report: republic soldier female).  The SDK path stays available for
+        # static props, where a binary FBX is friendlier to Unity.
+        has_skins = any(getattr(node, "is_skin", False) for node in model.all_nodes())
+        has_animations = bool(getattr(model, "animations", None))
+        if has_skins or has_animations or compatibility_profile != self.COMPATIBILITY_STANDARD:
+            log.info(
+                "FBX export: %s has %s; using the ASCII FBX writer (profile=%s; the SDK bridge "
+                "does not export skin clusters, animation takes, or compatibility metadata yet).",
+                model.name,
+                "skinned meshes" if has_skins else ("animations" if has_animations else "a compatibility profile"),
+                compatibility_profile,
+            )
             ok = None
+        else:
+            # Try fbx module (Autodesk FBX Python SDK)
+            try:
+                import fbx as _fbx
+                ok = self._export_fbx_sdk(model, fbx_path, _fbx)
+                if ok:
+                    exporter_backend = "autodesk_fbx_python_sdk"
+                    fbx_format = "FBX SDK writer"
+            except ImportError:
+                ok = None
 
-        if ok is None:
+        if ok is None and compatibility_profile == self.COMPATIBILITY_STANDARD:
             # Try pyassimp (treated as a hint only – fall through on any failure)
             try:
                 import pyassimp  # noqa: F401
@@ -1206,6 +1308,8 @@ class FBXExporter:
                 # if it succeeds we are done, otherwise fall through.
                 if _assimp_ok:
                     ok = True
+                    exporter_backend = "pyassimp_ascii_delegate"
+                    fbx_format = "FBX 7.4 ASCII"
                 # If False, keep ok=None so the ASCII path runs below.
             except (ImportError, Exception):
                 pass  # pyassimp not installed – go straight to ASCII
@@ -1216,8 +1320,26 @@ class FBXExporter:
             # Primary export path: FBX ASCII 7.4 (zero-dependency, full feature set)
             import traceback as _tb
             try:
-                ok = self._export_fbx_ascii(model, fbx_path,
-                                            base_skeleton_model=base_skeleton_model)
+                texture_paths = None
+                if tex_cache is not None:
+                    texture_paths = self._export_fbx_textures_to_dir(
+                        model,
+                        Path(fbx_path).parent / "textures",
+                        tex_cache,
+                        Path(fbx_path).parent,
+                    )
+                ascii_kwargs = {
+                    "base_skeleton_model": base_skeleton_model,
+                    "texture_paths": texture_paths,
+                }
+                # Preserve the long-standing monkeypatch/backend seam for the
+                # standard writer while passing the new option only when needed.
+                if compatibility_profile != self.COMPATIBILITY_STANDARD:
+                    ascii_kwargs["compatibility_profile"] = compatibility_profile
+                ok = self._export_fbx_ascii(model, fbx_path, **ascii_kwargs)
+                if ok:
+                    exporter_backend = "builtin_ascii"
+                    fbx_format = "FBX 7.4 ASCII"
             except Exception as e:
                 log.error(f"FBX ASCII export failed: {e}\n{_tb.format_exc()}")
                 # Last resort: OBJ
@@ -1227,9 +1349,9 @@ class FBXExporter:
                                      export_rigging=export_rigging)
                 return False
 
-        # Copy textures alongside the FBX
+        # Copy textures alongside the FBX for non-ASCII fallback backends.
         out_dir = Path(fbx_path).parent
-        if ok and tex_cache is not None:
+        if ok and tex_cache is not None and exporter_backend != "builtin_ascii":
             OBJExporter._export_textures_to_dir(model, out_dir, tex_cache)
         if ok:
             OBJExporter._export_baked_lightmaps_to_dir(model, out_dir)
@@ -1240,7 +1362,75 @@ class FBXExporter:
             if rig_count > 0:
                 log.info(f"Rigging data exported: {rig_count} file(s) → "
                          f"{out_dir / 'rigging'}")
+        if ok and export_manifest:
+            try:
+                from src.core.export.kotor_fbx_manifest import write_kotor_fbx_manifest
+
+                exported_mesh_names = [node.name for node in _renderable_mesh_nodes(model)]
+                manifest_path = write_kotor_fbx_manifest(
+                    model,
+                    fbx_path,
+                    exported_mesh_names=exported_mesh_names,
+                    exporter_backend=exporter_backend,
+                    fbx_format=fbx_format,
+                    target_engine=(
+                        "unity" if compatibility_profile == self.COMPATIBILITY_UNITY else
+                        "unreal" if compatibility_profile == self.COMPATIBILITY_UNREAL else
+                        "3ds_max" if compatibility_profile == self.COMPATIBILITY_3DS_MAX else
+                        "unreal"
+                    ),
+                    compatibility_profile=compatibility_profile,
+                )
+                log.info(f"GhostRigger FBX manifest exported: {manifest_path.name}")
+            except Exception as exc:
+                log.warning(f"Could not write GhostRigger FBX manifest: {exc}")
         return bool(ok)
+
+    @staticmethod
+    def _export_fbx_textures_to_dir(
+        model: KotorModel,
+        texture_dir: Path,
+        tex_cache,
+        fbx_dir: Path,
+    ) -> Dict[str, str]:
+        """Save FBX texture sidecars and return texture-name to relative path."""
+        written: Dict[str, str] = {}
+        if tex_cache is None:
+            return written
+        texture_dir.mkdir(parents=True, exist_ok=True)
+        seen: set[str] = set()
+        for node in model.mesh_nodes():
+            raw = getattr(node, "texture_clean", "") or getattr(node, "texture", "") or ""
+            tex_name = raw.strip()
+            if not tex_name or tex_name.upper() in ("NULL", "BLACK"):
+                continue
+            key = tex_name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                img = tex_cache.get(tex_name)
+                if img is None:
+                    continue
+                out_path = texture_dir / f"{tex_name}.png"
+                if not out_path.exists():
+                    img_to_save = img.convert("RGBA") if getattr(img, "mode", "") != "RGBA" else img
+                    transpose = getattr(img_to_save, "transpose", None)
+                    if callable(transpose):
+                        try:
+                            from PIL import Image as _PILImage
+
+                            img_to_save = transpose(_PILImage.FLIP_TOP_BOTTOM)
+                        except Exception:
+                            pass
+                    img_to_save.save(str(out_path))
+                rel = os.path.relpath(out_path, fbx_dir).replace(os.sep, "/")
+                written[tex_name] = rel
+            except Exception as exc:
+                log.debug("Could not save FBX texture '%s': %s", tex_name, exc)
+        if written:
+            log.info("Saved %d FBX texture sidecar(s) in %s", len(written), texture_dir)
+        return written
 
     # ── FBX SDK (Autodesk Python SDK) ─────────────────────────────────
 
@@ -1362,7 +1552,9 @@ class FBXExporter:
     # ── FBX ASCII 7.4 (zero-dependency fallback) ──────────────────────
 
     def _export_fbx_ascii(self, model: KotorModel, fbx_path: str,
-                          base_skeleton_model: 'Optional[KotorModel]' = None) -> bool:
+                          base_skeleton_model: 'Optional[KotorModel]' = None,
+                          texture_paths: 'Optional[Dict[str, str]]' = None,
+                          compatibility_profile: str = "standard") -> bool:
         """
         Write FBX ASCII 7.4 file.  No external dependencies required.
         Supported by Blender 2.79+, Maya 2016+, 3ds Max 2016+, Unreal Engine 5.
@@ -1389,6 +1581,18 @@ class FBXExporter:
             supermodel joints receive correct bind-pose world matrices instead of
             identity matrices, fixing skin deformation in Unreal Engine.
         """
+        compatibility_profile = self.normalize_compatibility_profile(compatibility_profile)
+        texture_paths = texture_paths or {}
+        unit_scale_factor = 100.0 if compatibility_profile in {
+            self.COMPATIBILITY_UNITY,
+            self.COMPATIBILITY_UNREAL,
+            self.COMPATIBILITY_3DS_MAX,
+        } else 1.0
+        linear_animation_keys = compatibility_profile in {
+            self.COMPATIBILITY_UNITY,
+            self.COMPATIBILITY_UNREAL,
+            self.COMPATIBILITY_3DS_MAX,
+        }
         # Build a fast name→node lookup for the base skeleton (supermodel) so that
         # synthetic bones created for cross-referenced joints get correct transforms.
         _base_skel_node_by_name: Dict[str, 'ModelNode'] = {}
@@ -1402,6 +1606,8 @@ class FBXExporter:
 
         # Only export renderable mesh nodes (respects render flag + deform helpers)
         mesh_nodes_list = _renderable_mesh_nodes(model)
+        renderable_mesh_names = {node.name for node in mesh_nodes_list}
+        renderable_mesh_name_by_lower = {node.name.lower(): node.name for node in mesh_nodes_list}
 
         # ── Header ────────────────────────────────────────────────────
         # Keep ASCII FBX output reproducible so golden-file regression tests
@@ -1417,6 +1623,7 @@ class FBXExporter:
         w('; FBX 7.4.0 project file')
         w('; Created by GhostRigger-K1-K2')
         w(f'; Model: {model.name}')
+        w(f'; Compatibility profile: {compatibility_profile}')
         w('')
         w('FBXHeaderExtension:  {')
         w('\tFBXHeaderVersion: 1003')
@@ -1452,9 +1659,11 @@ class FBXExporter:
         # Value 2 = Z was the original up axis (same as UpAxis so no extra flip needed).
         w('\t\tP: "OriginalUpAxis", "int", "Integer", "",2')
         w('\t\tP: "OriginalUpAxisSign", "int", "Integer", "",1')
-        # Unit scale: KotOR uses centimeters (1 unit = 1 cm), matching UE5 default.
-        w('\t\tP: "UnitScaleFactor", "double", "Number", "",1')
-        w('\t\tP: "OriginalUnitScaleFactor", "double", "Number", "",1')
+        # FBX system units are expressed in centimeters.  KOTOR character
+        # coordinates are meter-scale (a humanoid is roughly 1.7 units tall),
+        # so Unity/Unreal/Max compatibility profiles declare 100 cm per source unit.
+        w(f'\t\tP: "UnitScaleFactor", "double", "Number", "",{unit_scale_factor:g}')
+        w(f'\t\tP: "OriginalUnitScaleFactor", "double", "Number", "",{unit_scale_factor:g}')
         # Time / frame-rate settings (FBX 7.4 standard: TimeMode 6 = 30fps)
         # UE5 FbxMainImport.cpp reads GetTimeMode() to determine frame rate.
         # TimeMode 6 = eFBXTimeMode30 (30 fps) — standard for game animations.
@@ -1498,10 +1707,27 @@ class FBXExporter:
         mat_ids:     Dict[str, int] = {}
         deform_ids:  Dict[str, int] = {}  # skin deformer per mesh
         cluster_ids: Dict[str, Dict[str,int]] = {}  # clusters[mesh_name][bone_name]
+        bone_alias_ids: Dict[str, int] = {}
+        bone_alias_attr_ids: Dict[str, int] = {}
         pose_id = new_id()
 
         for n in model.all_nodes():
             node_ids[n.name] = new_id()
+        node_name_by_lower = {name.lower(): name for name in node_ids}
+
+        def _node_name_for_ref(name: str) -> str | None:
+            if not name:
+                return None
+            if name in node_ids:
+                return name
+            return node_name_by_lower.get(name.lower())
+
+        def _renderable_mesh_name_for_ref(name: str) -> str | None:
+            if not name:
+                return None
+            if name in renderable_mesh_names:
+                return name
+            return renderable_mesh_name_by_lower.get(name.lower())
 
         # RIGGING FIX: Some models (especially accessories / heads / equipment) rely
         # on bones provided by their supermodel skeleton (e.g. S_MALE02, S_FEMALE02).
@@ -1518,13 +1744,36 @@ class FBXExporter:
         for mesh_n in mesh_nodes_list:
             if mesh_n.is_skin:
                 for bname in (mesh_n.bone_map or []):
-                    if bname and bname not in node_ids:
+                    mesh_bone_name = _renderable_mesh_name_for_ref(bname)
+                    node_bone_name = _node_name_for_ref(bname)
+                    if bname and mesh_bone_name:
+                        bone_alias_ids.setdefault(mesh_bone_name, new_id())
+                    elif bname and node_bone_name is None:
                         _all_referenced_bones.add(bname)
         # Collect from animation node names
         for anim in model.animations:
             for an in anim.nodes:
-                if an.name and an.name not in node_ids:
+                mesh_anim_name = _renderable_mesh_name_for_ref(an.name)
+                if mesh_anim_name:
+                    mesh_anim_node = next((n for n in mesh_nodes_list if n.name == mesh_anim_name), None)
+                    if mesh_anim_node is not None and not mesh_anim_node.is_skin:
+                        bone_alias_ids.setdefault(mesh_anim_name, new_id())
+                elif an.name and _node_name_for_ref(an.name) is None:
                     _all_referenced_bones.add(an.name)
+        # Preserve each referenced supermodel bone's ancestor chain.  Emitting
+        # a child's base-skeleton LOCAL transform while parenting it directly
+        # to the accessory root makes its hierarchy disagree with TransformLink
+        # and BindPose world matrices.  Pulling only the required ancestors is
+        # cheap and keeps standalone heads/equipment structurally coherent.
+        if _base_skel_node_by_name:
+            for referenced_name in tuple(_all_referenced_bones):
+                base_node = _base_skel_node_by_name.get(str(referenced_name).lower())
+                ancestor = getattr(base_node, "parent", None) if base_node is not None else None
+                while ancestor is not None:
+                    ancestor_name = str(getattr(ancestor, "name", "") or "")
+                    if ancestor_name and _node_name_for_ref(ancestor_name) is None:
+                        _all_referenced_bones.add(ancestor_name)
+                    ancestor = getattr(ancestor, "parent", None)
         # Synthesise placeholder skeleton nodes for missing bones
         for bname in sorted(_all_referenced_bones):
             synth = ModelNode(name=bname, flags=0, position=(0.0, 0.0, 0.0),
@@ -1536,6 +1785,7 @@ class FBXExporter:
                 synth.parent = root_sk
             _extra_bone_nodes[bname] = synth
             node_ids[bname] = new_id()
+            node_name_by_lower[bname.lower()] = bname
             log.debug(f"FBX export: synthesised missing bone node '{bname}' "
                       f"(supermodel reference)")
 
@@ -1548,6 +1798,22 @@ class FBXExporter:
                 for bname in n.bone_map:
                     if bname and bname not in cluster_ids[n.name]:
                         cluster_ids[n.name][bname] = new_id()
+
+        def _bone_model_id(bname: str) -> int | None:
+            """Return the FBX model ID to use for a skin-cluster bone link."""
+            mesh_bone_name = _renderable_mesh_name_for_ref(bname)
+            if mesh_bone_name in bone_alias_ids:
+                return bone_alias_ids[mesh_bone_name]
+            node_name = _node_name_for_ref(bname)
+            if node_name is not None:
+                return node_ids.get(node_name)
+            return None
+
+        def _fbx_uv_pair(node: ModelNode, u: float, v: float) -> tuple[float, float]:
+            """Return the DCC-facing UV pair for this mesh node."""
+            if not bool(getattr(node, "uv_v_flip", True)):
+                return float(u), float(v)
+            return float(u), 1.0 - float(v)
 
         # ── Definitions section (mandatory for FBX 7.4 / UE5 / ufbx) ─────
         # FBX 7.4 requires a Definitions block that declares the count of
@@ -1671,7 +1937,7 @@ class FBXExporter:
             if n.uvs:
                 # GhostRigger stores KotOR-oriented UVs internally.  Match the OBJ
                 # and glTF exporters by converting V for DCC/engine importers.
-                uv_flat = [c for u, v in n.uvs for c in (float(u), 1.0 - float(v))]
+                uv_flat = [c for u, v in n.uvs for c in _fbx_uv_pair(n, u, v)]
                 _fuvs_fbx = getattr(n, 'face_uvs', []) or []
                 _has_fuvs_fbx = bool(_fuvs_fbx) and len(_fuvs_fbx) == len(n.faces)
                 _nuv_fbx = len(n.uvs)
@@ -1701,7 +1967,7 @@ class FBXExporter:
             # Exported for area meshes and any node with a second UV set.
             _uvs_lm_n = getattr(n, 'uvs_lm', []) or getattr(n, 'uvs2', []) or []
             if _uvs_lm_n:
-                _uv2_flat = [c for u, v in _uvs_lm_n for c in (float(u), 1.0 - float(v))]
+                _uv2_flat = [c for u, v in _uvs_lm_n for c in _fbx_uv_pair(n, u, v)]
                 _nuv2 = len(_uvs_lm_n)
                 _uv2_idx = []
                 for _face2 in n.faces:
@@ -1792,16 +2058,17 @@ class FBXExporter:
                 vid_id     = new_id()
                 _tex_obj_ids[tname_tex] = tex_obj_id
                 _tex_vid_ids[tname_tex] = vid_id
+                texture_file = texture_paths.get(tname_tex, f"{tname_tex}.tga")
                 # Video (file reference)
                 _n_video += 1
                 w(f'\tVideo: {vid_id}, "Video::{tname_tex}", "Clip" {{')
                 w(f'\t\tType: "Clip"')
                 w(f'\t\tProperties70:  {{')
-                w(f'\t\t\tP: "Path","KString","XRefUrl","","{tname_tex}.tga"')
+                w(f'\t\t\tP: "Path","KString","XRefUrl","","{texture_file}"')
                 w(f'\t\t}}')
                 w(f'\t\tUseMipMap: 0')
-                w(f'\t\tFilename: "{tname_tex}.tga"')
-                w(f'\t\tRelativeFilename: "{tname_tex}.tga"')
+                w(f'\t\tFilename: "{texture_file}"')
+                w(f'\t\tRelativeFilename: "{texture_file}"')
                 w(f'\t}}')
                 # Texture object
                 _n_texture += 1
@@ -1816,8 +2083,8 @@ class FBXExporter:
                 w(f'\t\t\tP: "WrapModeV","enum","","",{wrap_v}')
                 w(f'\t\t}}')
                 w(f'\t\tMedia: "{tname_tex}"')
-                w(f'\t\tFileName: "{tname_tex}.tga"')
-                w(f'\t\tRelativeFilename: "{tname_tex}.tga"')
+                w(f'\t\tFileName: "{texture_file}"')
+                w(f'\t\tRelativeFilename: "{texture_file}"')
                 w(f'\t}}')
 
         # Material objects
@@ -1862,6 +2129,59 @@ class FBXExporter:
             ez = _m.degrees(_m.atan2(siny, cosy))
             return ex, ey, ez
 
+        def _rotation_to_euler_deg(rotation):
+            """Decompose a 3x3 rigid rotation using FBX's emitted XYZ branch."""
+            sinp = max(-1.0, min(1.0, -float(rotation[2][0])))
+            ey = _m.asin(sinp)
+            if abs(abs(sinp) - 1.0) < 1e-8:
+                # At gimbal lock keep Z at zero and retain the combined X term.
+                ex = _m.atan2(-float(rotation[0][1]), float(rotation[1][1]))
+                ez = 0.0
+            else:
+                ex = _m.atan2(float(rotation[2][1]), float(rotation[2][2]))
+                ez = _m.atan2(float(rotation[1][0]), float(rotation[0][0]))
+            return _m.degrees(ex), _m.degrees(ey), _m.degrees(ez)
+
+        def _rotation_3x3(quat):
+            qx, qy, qz, qw = (float(value) for value in quat)
+            length = _m.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+            if length > 1e-9:
+                qx, qy, qz, qw = qx/length, qy/length, qz/length, qw/length
+            else:
+                qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+            return (
+                (1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)),
+                (2*(qx*qy + qz*qw), 1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)),
+                (2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)),
+            )
+
+        _world_bind_cache = {}
+
+        def _world_bind_transform(node):
+            """Compose the emitted FBX hierarchy using standard rigid math."""
+            cache_key = id(node)
+            cached = _world_bind_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            local_r = _rotation_3x3(getattr(node, "rotation", (0.0, 0.0, 0.0, 1.0)))
+            local_t = tuple(float(value) for value in getattr(node, "position", (0.0, 0.0, 0.0)))
+            parent = getattr(node, "parent", None)
+            if parent is None:
+                result = (local_t, local_r)
+            else:
+                parent_t, parent_r = _world_bind_transform(parent)
+                world_r = tuple(
+                    tuple(sum(parent_r[row][k] * local_r[k][col] for k in range(3)) for col in range(3))
+                    for row in range(3)
+                )
+                world_t = tuple(
+                    parent_t[row] + sum(parent_r[row][k] * local_t[k] for k in range(3))
+                    for row in range(3)
+                )
+                result = (world_t, world_r)
+            _world_bind_cache[cache_key] = result
+            return result
+
         def _world_matrix_col_major(node) -> str:
             """
             Return 16 floats for FBX BindPose/TransformLink matrices.
@@ -1875,29 +2195,77 @@ class FBXExporter:
             Unity's FBX importer reads Transform/TransformLink this way when
             constructing SkinnedMeshRenderer bindposes.
 
-            KotorBlender's world_transform() returns (world_pos, world_quat).
-            The quaternion is [x, y, z, w].
+            Compose from the local transforms written to the FBX.  The generic
+            model ``world_transform()`` helper uses a legacy point-rotation
+            convention that diverges on some deep, near-180-degree joint
+            chains, so it cannot define an interoperable FBX bind pose.
             """
             try:
-                wp, wq = node.world_transform()
-                qx, qy, qz, qw = wq
-                r00 = 1 - 2*(qy*qy + qz*qz)
-                r01 = 2*(qx*qy - qz*qw)
-                r02 = 2*(qx*qz + qy*qw)
-                r10 = 2*(qx*qy + qz*qw)
-                r11 = 1 - 2*(qx*qx + qz*qz)
-                r12 = 2*(qy*qz - qx*qw)
-                r20 = 2*(qx*qz - qy*qw)
-                r21 = 2*(qy*qz + qx*qw)
-                r22 = 1 - 2*(qx*qx + qy*qy)
+                wp, world_r = _world_bind_transform(node)
                 tx, ty, tz = wp
-                mat = [r00, r01, r02, 0.0,
-                       r10, r11, r12, 0.0,
-                       r20, r21, r22, 0.0,
+                mat = [world_r[0][0], world_r[0][1], world_r[0][2], 0.0,
+                       world_r[1][0], world_r[1][1], world_r[1][2], 0.0,
+                       world_r[2][0], world_r[2][1], world_r[2][2], 0.0,
                        tx,  ty,  tz,  1.0]
                 return ','.join(f'{v:.6f}' for v in mat)
             except Exception:
                 return '1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1'
+
+        def _cluster_bind_matrix(node, bone_node) -> str:
+            """Return Unity's raw mesh-to-bone cluster Transform matrix.
+
+            Autodesk's SDK describes ``Transform`` and ``TransformLink`` as
+            global bind matrices, but the serialized FBX cluster ``Transform``
+            consumed by Blender and Unity is the mesh-to-bone bind matrix:
+
+                inverse(bone_world_bind) * mesh_world_bind
+
+            Unity stores that raw Transform as ``Mesh.bindposes``.  Writing the
+            mesh world matrix directly therefore applies every bone transform
+            twice and produces the classic exploded character on import.
+            """
+            try:
+                mesh_pos, mesh_r = _world_bind_transform(node)
+                bone_pos, bone_r = _world_bind_transform(bone_node)
+                # inverse rigid rotation is transpose(bone_r).
+                bind_r = tuple(
+                    tuple(sum(bone_r[k][row] * mesh_r[k][col] for k in range(3)) for col in range(3))
+                    for row in range(3)
+                )
+                delta = tuple(float(mesh_pos[index]) - float(bone_pos[index]) for index in range(3))
+                bind_t = tuple(
+                    sum(bone_r[k][row] * delta[k] for k in range(3))
+                    for row in range(3)
+                )
+                values = [
+                    bind_r[0][0], bind_r[1][0], bind_r[2][0], 0.0,
+                    bind_r[0][1], bind_r[1][1], bind_r[2][1], 0.0,
+                    bind_r[0][2], bind_r[1][2], bind_r[2][2], 0.0,
+                    bind_t[0], bind_t[1], bind_t[2], 1.0,
+                ]
+                return ','.join(f'{value:.6f}' for value in values)
+            except Exception:
+                return _world_matrix_col_major(node)
+
+        def _skeleton_display_size(node, *, fallback: float = 0.15) -> float:
+            """Return a Blender-friendly display size for an FBX skeleton node."""
+            try:
+                candidates = []
+                for child in getattr(node, "children", []) or []:
+                    cx, cy, cz = getattr(child, "position", (0.0, 0.0, 0.0))
+                    dist = _m.sqrt(float(cx) * float(cx) + float(cy) * float(cy) + float(cz) * float(cz))
+                    if dist > 1e-5:
+                        candidates.append(dist)
+                if candidates:
+                    size = min(candidates)
+                else:
+                    px, py, pz = getattr(node, "position", (0.0, 0.0, 0.0))
+                    size = _m.sqrt(float(px) * float(px) + float(py) * float(py) + float(pz) * float(pz)) * 0.5
+                if size <= 1e-5:
+                    size = fallback
+                return max(0.035, min(float(size), 0.85))
+            except Exception:
+                return fallback
 
         # ── Determine which nodes are skeleton joints ──────────────────────
         # v6.0 FIX: Include ALL non-renderable nodes as skeleton joints.
@@ -1922,6 +2290,13 @@ class FBXExporter:
         _model_cls_int = int(_mt_raw) if _mt_raw is not None else 4
         _has_any_skin = any(n.is_skin for n in mesh_nodes_list)
         _is_character_model = (_model_cls_int == 4 or _has_any_skin)
+        _skin_bone_names_lower = {
+            str(bname).lower()
+            for _skin_node in mesh_nodes_list
+            if _skin_node.is_skin
+            for bname in (_skin_node.bone_map or [])
+            if bname
+        }
 
         skeleton_nodes = []
         for n in model.all_nodes():
@@ -1947,13 +2322,16 @@ class FBXExporter:
             skel_attr_ids[n.name] = new_id()
         for bname in _extra_bone_nodes:
             skel_attr_ids[bname] = new_id()
+        for bname in bone_alias_ids:
+            bone_alias_attr_ids[bname] = new_id()
 
         # Skeleton/joint model nodes (root + all bone nodes)
         for n in skeleton_nodes:
             nid = node_ids[n.name]
             # Root node (flags=HEADER) → "Root"; child joint nodes → "LimbNode"
             is_root = (n.parent is None) or (n.flags == int(NodeFlags.HEADER))
-            fbx_node_type = 'Null' if is_root else 'LimbNode'
+            is_skin_influence = n.name.lower() in _skin_bone_names_lower
+            fbx_node_type = 'LimbNode' if (not is_root or is_skin_influence) else 'Null'
             w(f'\tModel: {nid}, "Model::{n.name}", "{fbx_node_type}" {{')
             w('\t\tVersion: 232')
             w('\t\tProperties70:  {')
@@ -1974,11 +2352,12 @@ class FBXExporter:
         for n in skeleton_nodes:
             attr_id = skel_attr_ids[n.name]
             is_root = (n.parent is None) or (n.flags == int(NodeFlags.HEADER))
-            skel_type = 'Root' if is_root else 'Limb'
-            w(f'\tNodeAttribute: {attr_id}, "NodeAttribute::{n.name}", "Skeleton" {{')
+            limb_size = _skeleton_display_size(n, fallback=0.25 if is_root else 0.15)
+            w(f'\tNodeAttribute: {attr_id}, "NodeAttribute::{n.name}", "LimbNode" {{')
             w(f'\t\tTypeFlags: "Skeleton"')
             w(f'\t\tProperties70:  {{')
-            w(f'\t\t\tP: "Size", "double", "Number", "",1')
+            w(f'\t\t\tP: "Size", "double", "Number", "",{limb_size:.6f}')
+            w(f'\t\t\tP: "LimbLength", "double", "Number", "",{limb_size:.6f}')
             w(f'\t\t}}')
             w(f'\t}}')
 
@@ -2010,10 +2389,42 @@ class FBXExporter:
         # v6.0 FIX: NodeAttribute for synthetic bones
         for bname in _extra_bone_nodes:
             attr_id = skel_attr_ids[bname]
-            w(f'\tNodeAttribute: {attr_id}, "NodeAttribute::{bname}", "Skeleton" {{')
+            synth_size = 0.15
+            w(f'\tNodeAttribute: {attr_id}, "NodeAttribute::{bname}", "LimbNode" {{')
             w(f'\t\tTypeFlags: "Skeleton"')
             w(f'\t\tProperties70:  {{')
-            w(f'\t\t\tP: "Size", "double", "Number", "",1')
+            w(f'\t\t\tP: "Size", "double", "Number", "",{synth_size:.6f}')
+            w(f'\t\t\tP: "LimbLength", "double", "Number", "",{synth_size:.6f}')
+            w(f'\t\t}}')
+            w(f'\t}}')
+
+        # Renderable mesh nodes can also appear in KotOR bone maps. FBX DCCs
+        # expect cluster links to target skeleton limbs, not mesh objects, so
+        # create a separate limb alias while leaving the original node as Mesh.
+        for bname, alias_id in bone_alias_ids.items():
+            source_node = model.find_node(bname)
+            if source_node is not None:
+                px, py, pz = getattr(source_node, "position", (0.0, 0.0, 0.0))
+                qx, qy, qz, qw = getattr(source_node, "rotation", (0.0, 0.0, 0.0, 1.0))
+                ex, ey, ez = _quat_to_euler_deg(qx, qy, qz, qw)
+            else:
+                px = py = pz = ex = ey = ez = 0.0
+            w(f'\tModel: {alias_id}, "Model::{bname}_bone", "LimbNode" {{')
+            w('\t\tVersion: 232')
+            w('\t\tProperties70:  {')
+            w(f'\t\t\tP: "Lcl Translation","Lcl Translation","","A",{px:.6f},{py:.6f},{pz:.6f}')
+            w(f'\t\t\tP: "Lcl Rotation","Lcl Rotation","","A",{ex:.4f},{ey:.4f},{ez:.4f}')
+            w(f'\t\t\tP: "Lcl Scaling","Lcl Scaling","","A",1.000000,1.000000,1.000000')
+            w(f'\t\t\tP: "RotationOrder","enum","","",0')
+            w('\t\t}')
+            w('\t}')
+
+        for bname, attr_id in bone_alias_attr_ids.items():
+            w(f'\tNodeAttribute: {attr_id}, "NodeAttribute::{bname}_bone", "LimbNode" {{')
+            w(f'\t\tTypeFlags: "Skeleton"')
+            w(f'\t\tProperties70:  {{')
+            w(f'\t\t\tP: "Size", "double", "Number", "",0.150000')
+            w(f'\t\t\tP: "LimbLength", "double", "Number", "",0.150000')
             w(f'\t\t}}')
             w(f'\t}}')
 
@@ -2023,20 +2434,27 @@ class FBXExporter:
             w(f'\tModel: {nid}, "Model::{n.name}", "Mesh" {{')
             w('\t\tVersion: 232')
             w('\t\tProperties70:  {')
+            is_rigid_mesh_bone_alias = n.name in bone_alias_ids and not n.is_skin
             if n.is_skin:
                 # Skinned mesh objects must not inherit animated bone transforms
                 # through their scene parent while also being deformed by skin
                 # clusters.  Emit them in bind-pose world space and connect them
                 # under the model root; the Cluster Transform/TransformLink data
                 # then supplies the intended bind relationship to the bones.
-                (px, py, pz), (mqx, mqy, mqz, mqw) = n.world_transform()
-                mex, mey, mez = _quat_to_euler_deg(mqx, mqy, mqz, mqw)
+                (px, py, pz), mesh_world_rotation = _world_bind_transform(n)
+                mex, mey, mez = _rotation_to_euler_deg(mesh_world_rotation)
+            elif is_rigid_mesh_bone_alias:
+                # KotOR can use a renderable rigid mesh as an animated bone
+                # (for example the rancor jaw/eyes).  FBX importers need the
+                # skeleton alias to own the transform; the visible mesh is
+                # identity-local under that alias so it follows animation.
+                px = py = pz = mex = mey = mez = 0.0
             else:
                 px, py, pz = n.position
-                mex = mey = mez = 0.0
+                mqx, mqy, mqz, mqw = getattr(n, "rotation", (0.0, 0.0, 0.0, 1.0))
+                mex, mey, mez = _quat_to_euler_deg(mqx, mqy, mqz, mqw)
             w(f'\t\t\tP: "Lcl Translation","Lcl Translation","","A",{px:.6f},{py:.6f},{pz:.6f}')
-            if n.is_skin:
-                w(f'\t\t\tP: "Lcl Rotation","Lcl Rotation","","A",{mex:.4f},{mey:.4f},{mez:.4f}')
+            w(f'\t\t\tP: "Lcl Rotation","Lcl Rotation","","A",{mex:.4f},{mey:.4f},{mez:.4f}')
             w(f'\t\t\tP: "Lcl Scaling","Lcl Scaling","","A",1.000000,1.000000,1.000000')
             w('\t\t}')
             w('\t}')  # end Model (mesh node)
@@ -2169,13 +2587,19 @@ class FBXExporter:
                 if bone_node:
                     link_m = _world_matrix_col_major(bone_node)
                 elif bname.lower() in _base_skel_node_by_name:
-                    link_m = _world_matrix_col_major(
-                        _base_skel_node_by_name[bname.lower()])
+                    bone_node = _base_skel_node_by_name[bname.lower()]
+                    link_m = _world_matrix_col_major(bone_node)
                 elif primary_bi < len(_qbone_list) and primary_bi < len(_tbone_list):
                     # v7.1: qBone/tBone fallback (Finding 2.5)
                     link_m = _qbone_matrix_col_major(primary_bi)
                 else:
                     link_m = identity_m
+                cluster_transform_m = (
+                    _cluster_bind_matrix(n, bone_node)
+                    if bone_node is not None
+                    and compatibility_profile == self.COMPATIBILITY_UNITY
+                    else mesh_transform_m
+                )
 
                 # FBX cluster objects are Deformer records with subtype "Cluster".
                 # Writing "SubDeformer:" produces an object our own text checks can
@@ -2195,7 +2619,7 @@ class FBXExporter:
                 # inverse bone transform. Using the mesh node's world matrix ensures
                 # correct placement for skin nodes whose verts are in local space.
                 w(f'\t\tTransform: *16 {{')
-                w(f'\t\t\ta: {mesh_transform_m}')
+                w(f'\t\t\ta: {cluster_transform_m}')
                 w('\t\t}')
                 w(f'\t\tTransformLink: *16 {{')
                 w(f'\t\t\ta: {link_m}')
@@ -2208,7 +2632,7 @@ class FBXExporter:
         # Include skeleton nodes, synthetic supermodel bone stubs, and mesh nodes.
         identity_bind = '1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1'
         pose_nodes = skeleton_nodes + mesh_nodes_list
-        n_pose = len(pose_nodes) + len(_extra_bone_nodes)
+        n_pose = len(pose_nodes) + len(_extra_bone_nodes) + len(bone_alias_ids)
         w(f'\tPose: {pose_id}, "Pose::BIND_POSES", "BindPose" {{')
         w(f'\t\tType: "BindPose"')
         w(f'\t\tVersion: 100')
@@ -2235,6 +2659,21 @@ class FBXExporter:
             w(f'\t\t\t}}')
             w(f'\t\t}}')
         w('\t}')  # end Pose
+
+        for bname, alias_id in bone_alias_ids.items():
+            alias_node = model.find_node(bname)
+            alias_mat = _world_matrix_col_major(alias_node) if alias_node is not None else identity_bind
+            insert_at = len(lines) - 1
+            alias_pose = [
+                f'\t\tPoseNode:  {{',
+                f'\t\t\tNode: {alias_id}',
+                f'\t\t\tMatrix: *16 {{',
+                f'\t\t\t\ta: {alias_mat}',
+                f'\t\t\t}}',
+                f'\t\t}}',
+            ]
+            for offset, pose_line in enumerate(alias_pose):
+                lines.insert(insert_at + offset, pose_line)
 
         # ── Animation objects (AnimStack / AnimLayer / AnimCurve) ──────────────
         # Build animation data before closing Connections; we need to know all IDs
@@ -2263,11 +2702,18 @@ class FBXExporter:
                 layer_id = new_id()
                 anim_stack_layer.append((anim, stack_id, layer_id))
 
-                # AnimStack – UE5 FBX importer requires the "|<name>" naming convention
-                # to recognise individual animation clips from an FBX with multiple stacks.
+                # Unreal's importer uses the "|<name>" stack convention to
+                # distinguish multiple takes. Unity exposes that separator as
+                # part of the AnimationClip name, so keep Unity/Max/standard
+                # stack names clean and reserve the prefix for Unreal only.
                 anim_length_ticks = int(anim.length * FBX_TICKS_PER_SEC)
-                ue5_stack_name = f"AnimStack::|{anim.name}"  # FBX 7.4 UE5-compatible name
-                w(f'\tAnimationStack: {stack_id}, "{ue5_stack_name}", "" {{')
+                stack_take_name = (
+                    f"|{anim.name}"
+                    if compatibility_profile == self.COMPATIBILITY_UNREAL
+                    else str(anim.name)
+                )
+                fbx_stack_name = f"AnimStack::{stack_take_name}"
+                w(f'\tAnimationStack: {stack_id}, "{fbx_stack_name}", "" {{')
                 w(f'\t\tProperties70:  {{')
                 w(f'\t\t\tP: "LocalStart", "KTime", "Time", "",0')
                 w(f'\t\t\tP: "LocalStop", "KTime", "Time", "",{anim_length_ticks}')
@@ -2287,7 +2733,7 @@ class FBXExporter:
 
                 for anim_node in anim.nodes:
                     base = _base_node_map.get(anim_node.name.lower())
-                    nid  = node_ids.get(anim_node.name)
+                    nid = _bone_model_id(anim_node.name)
                     if nid is None:
                         continue
 
@@ -2329,9 +2775,11 @@ class FBXExporter:
                         w(f'\t\tKeyValueFloat: *{nt} {{')
                         w('\t\t\ta: ' + ','.join(f'{v:.6f}' for v in kvals))
                         w(f'\t\t}}')
-                        # KeyAttrFlags: *1 (one entry covers all keys) — required by Blender
+                        # Compatibility exports use linear keys.  This matches
+                        # Odyssey's sampled controller semantics and avoids cubic
+                        # tangent overshoot in Unity, Unreal, and 3ds Max on facial/limb bones.
                         w(f'\t\tKeyAttrFlags: *1 {{')
-                        w('\t\t\ta: 24776')   # cubic + auto tangents
+                        w(f'\t\t\ta: {4 if linear_animation_keys else 24776}')
                         w(f'\t\t}}')
                         # KeyAttrDataFloat: tangent data (4 floats — required for cubic mode)
                         w(f'\t\tKeyAttrDataFloat: *4 {{')
@@ -2395,49 +2843,38 @@ class FBXExporter:
                                               (bind_pos[0], bind_pos[1], bind_pos[2]),
                                               'Lcl Translation')
 
-                    # Rotation curves (rest-pose delta quaternion → Euler XYZ degrees)
-                    # v7.0 FIX (Finding 1.1 — KotorBlender armature.py cross-ref):
-                    # KotorBlender applies rotation keyframes as DELTAS from rest pose:
-                    #   rotation_delta = rest_rotation.inverted() @ Quaternion(rotation[:4])
-                    # Previously we exported absolute quaternions which breaks in UE5 when
-                    # the rest pose is non-identity.  Now we compute the rest-pose delta
-                    # quaternion before converting to Euler — matching KotorBlender's
-                    # apply_object_keyframes_to_armature() (armature.py:185).
+                    # Rotation curves:
+                    # KotOR orientation keyframes are local absolute quaternions.
+                    # KotorBlender converts them to pose-bone deltas because Blender
+                    # stores a separate edit-bone rest orientation.  FBX Model
+                    # "Lcl Rotation" is the actual local transform property, so
+                    # animation curves must write absolute local Euler values.
                     if rot_times and rot_vals:
-                        # Get rest-pose quaternion from bind node
-                        rest_quat = (0.0, 0.0, 0.0, 1.0)  # identity default
-                        if base and hasattr(base, 'rotation') and base.rotation:
-                            rest_quat = tuple(base.rotation[:4])
-                        # Quaternion inverse: inv(q) = conj(q) / |q|^2
-                        # For unit quaternions: inv(q) = (-x, -y, -z, w)
-                        rqx, rqy, rqz, rqw = rest_quat
-                        rmag2 = rqx*rqx + rqy*rqy + rqz*rqz + rqw*rqw
-                        if rmag2 > 1e-12:
-                            inv_rqx, inv_rqy, inv_rqz, inv_rqw = (
-                                -rqx/rmag2, -rqy/rmag2, -rqz/rmag2, rqw/rmag2)
-                        else:
-                            inv_rqx, inv_rqy, inv_rqz, inv_rqw = 0, 0, 0, 1
-
-                        def _quat_mul(ax, ay, az, aw, bx, by, bz, bw):
-                            """Hamilton product: a * b (quaternion multiply)."""
-                            return (
-                                aw*bx + ax*bw + ay*bz - az*by,
-                                aw*by - ax*bz + ay*bw + az*bx,
-                                aw*bz + ax*by - ay*bx + az*bw,
-                                aw*bw - ax*bx - ay*by - az*bz)
-
-                        # Pre-compute euler angles from rest-pose-delta quaternions
+                        # Pre-compute Euler angles from absolute local quaternions.
+                        # Unity, Unreal, and Max consume FBX Euler curves, so keep each axis
+                        # on the nearest equivalent branch instead of allowing a
+                        # +179 -> -179 discontinuity to spin/deform the skeleton.
                         euler_list = []
                         for qv in rot_vals:
                             if len(qv) >= 4:
-                                # delta = inv(rest_quat) * anim_quat
-                                dx, dy, dz, dw = _quat_mul(
-                                    inv_rqx, inv_rqy, inv_rqz, inv_rqw,
-                                    qv[0], qv[1], qv[2], qv[3])
-                                ex, ey, ez = _quat_to_euler_deg(dx, dy, dz, dw)
+                                ex, ey, ez = _quat_to_euler_deg(qv[0], qv[1], qv[2], qv[3])
                                 euler_list.append((ex, ey, ez))
                             else:
                                 euler_list.append((0.0, 0.0, 0.0))
+                        if linear_animation_keys and len(euler_list) > 1:
+                            continuous = [euler_list[0]]
+                            for current in euler_list[1:]:
+                                previous = continuous[-1]
+                                adjusted = []
+                                for value, prior in zip(current, previous):
+                                    value = float(value)
+                                    while value - prior > 180.0:
+                                        value -= 360.0
+                                    while value - prior < -180.0:
+                                        value += 360.0
+                                    adjusted.append(value)
+                                continuous.append(tuple(adjusted))
+                            euler_list = continuous
                         kvals_r = [
                             [e[axis_i] for e in euler_list]
                             for axis_i in range(3)
@@ -2465,8 +2902,8 @@ class FBXExporter:
         # and Objects.  UE5's FBX importer reads ObjectType counts to pre-allocate
         # internal arrays.  ufbx uses them for validation.
         # Cross-ref: Blender io_scene_fbx/export_fbx_bin.py fbx_definitions_elements()
-        _n_nodeattr  = len(skel_attr_ids)
-        _n_models    = len(node_ids)
+        _n_nodeattr  = len(skel_attr_ids) + len(bone_alias_attr_ids)
+        _n_models    = len(node_ids) + len(bone_alias_ids)
         _n_geometry  = len(mesh_ids)
         _n_material  = len(mat_ids)
         _n_deformer  = len(deform_ids) + sum(len(v) for v in cluster_ids.values())
@@ -2562,6 +2999,8 @@ class FBXExporter:
             nid = node_ids[n.name]
             if n.name in _mesh_nodes_by_name and _mesh_nodes_by_name[n.name].is_skin:
                 w(f'\tC: "OO",{nid},{_root_nid_for_skin_meshes}')
+            elif n.name in bone_alias_ids and n.name in _mesh_nodes_by_name:
+                w(f'\tC: "OO",{nid},{bone_alias_ids[n.name]}')
             elif n.parent and n.parent.name in node_ids:
                 pid = node_ids[n.parent.name]
                 w(f'\tC: "OO",{nid},{pid}')
@@ -2574,17 +3013,41 @@ class FBXExporter:
             if n.name in skel_attr_ids:
                 w(f'\tC: "OO",{skel_attr_ids[n.name]},{node_ids[n.name]}')
 
-        # Synthetic supermodel bone stubs → parent under root node (or scene root 0)
+        # Synthetic supermodel bones retain their real base-skeleton hierarchy.
+        # The highest missing ancestor is attached beneath this model's root.
         _root_nid = 0
         _root_n = next((n for n in model.all_nodes() if n.parent is None), None)
         if _root_n and _root_n.name in node_ids:
             _root_nid = node_ids[_root_n.name]
         for bname in _extra_bone_nodes:
             nid = node_ids[bname]
-            w(f'\tC: "OO",{nid},{_root_nid}')
+            parent_id = _root_nid
+            base_node = _base_skel_node_by_name.get(bname.lower())
+            base_parent_name = str(
+                getattr(getattr(base_node, "parent", None), "name", "") or ""
+            )
+            exported_parent_name = _node_name_for_ref(base_parent_name)
+            if exported_parent_name and exported_parent_name != bname:
+                parent_id = node_ids[exported_parent_name]
+            w(f'\tC: "OO",{nid},{parent_id}')
             # v6.0 FIX: NodeAttribute → synthetic bone connections
             if bname in skel_attr_ids:
                 w(f'\tC: "OO",{skel_attr_ids[bname]},{nid}')
+
+        for bname, alias_id in bone_alias_ids.items():
+            source_node = model.find_node(bname)
+            parent_id = _root_nid
+            parent = getattr(source_node, "parent", None) if source_node is not None else None
+            parent_name = getattr(parent, "name", "")
+            parent_alias_name = _renderable_mesh_name_for_ref(parent_name)
+            parent_node_name = _node_name_for_ref(parent_name)
+            if parent_alias_name in bone_alias_ids:
+                parent_id = bone_alias_ids[parent_alias_name]
+            elif parent_node_name is not None:
+                parent_id = node_ids[parent_node_name]
+            w(f'\tC: "OO",{alias_id},{parent_id}')
+            if bname in bone_alias_attr_ids:
+                w(f'\tC: "OO",{bone_alias_attr_ids[bname]},{alias_id}')
 
         # Geometry → mesh model node
         for n in mesh_nodes_list:
@@ -2602,8 +3065,9 @@ class FBXExporter:
             for bname, cid in cluster_ids.get(n.name, {}).items():
                 w(f'\tC: "OO",{cid},{deform_ids[n.name]}')
                 # Cluster → bone joint node
-                if bname in node_ids:
-                    w(f'\tC: "OO",{node_ids[bname]},{cid}')
+                bone_id = _bone_model_id(bname)
+                if bone_id is not None:
+                    w(f'\tC: "OO",{bone_id},{cid}')
 
         # Texture → material connections
         # Links each Texture object to its Material via the "DiffuseColor" property slot.
@@ -3215,6 +3679,52 @@ class GLTFExporter:
     We flip V on export: v_gltf = 1.0 - v_kotor.
     """
 
+    @staticmethod
+    def _node_bind_world_matrix_4x4(node) -> list[list[float]]:
+        """Build a 4x4 world bind matrix from node.world_transform().
+
+        Returns a row-major 4x4 matrix (rotation+translation, uniform scale=1).
+        """
+        import math as _math
+        wp, wq = node.world_transform()
+        x, y, z, w = float(wq[0]), float(wq[1]), float(wq[2]), float(wq[3])
+        # Quaternion to rotation matrix
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        return [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy), 0.0],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx), 0.0],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy), 0.0],
+            [float(wp[0]), float(wp[1]), float(wp[2]), 1.0],
+        ]
+
+    @staticmethod
+    def _invert_4x4(m: list[list[float]]) -> list[list[float]]:
+        """Invert a row-major 4x4 matrix via Gauss-Jordan elimination."""
+        # Build augmented matrix [m | I]
+        aug = [list(row[:]) + [1.0 if i == j else 0.0 for j in range(4)] for i, row in enumerate(m)]
+        for col in range(4):
+            # Find pivot
+            pivot = col
+            for row in range(col + 1, 4):
+                if abs(aug[row][col]) > abs(aug[pivot][col]):
+                    pivot = row
+            aug[col], aug[pivot] = aug[pivot], aug[col]
+            pv = aug[col][col]
+            if abs(pv) < 1e-12:
+                # Singular — return identity as fallback
+                return [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+            for j in range(8):
+                aug[col][j] /= pv
+            for row in range(4):
+                if row == col:
+                    continue
+                factor = aug[row][col]
+                for j in range(8):
+                    aug[row][j] -= factor * aug[col][j]
+        return [row[4:] for row in aug]
+
     def export(self, model: KotorModel, path: str,
                binary: bool = True, tex_cache=None,
                export_rigging: bool = True) -> bool:
@@ -3294,17 +3804,21 @@ class GLTFExporter:
 
         def _add_accessor(data_bytes: bytes, count: int, type_: str,
                           component_type: int,
-                          min_vals=None, max_vals=None) -> int:
+                          min_vals=None, max_vals=None,
+                          target: int = None) -> int:
             offset = len(bin_data)
             bin_data.extend(data_bytes)
             # Pad to 4-byte alignment
             while len(bin_data) % 4:
                 bin_data.append(0)
-            bv = pygltflib.BufferView(
+            bv_kwargs = dict(
                 buffer=0,
                 byteOffset=offset,
                 byteLength=len(data_bytes),
             )
+            if target is not None:
+                bv_kwargs["target"] = target
+            bv = pygltflib.BufferView(**bv_kwargs)
             bv_idx = len(gltf.bufferViews)
             gltf.bufferViews.append(bv)
             acc = pygltflib.Accessor(
@@ -3363,6 +3877,31 @@ class GLTFExporter:
         gltf_skin = None
         if joint_indices:
             gltf_skin_obj = pygltflib.Skin(name=model.name + "_skin", joints=joint_indices)
+
+            # Compute inverse bind matrices for each joint (glTF 2.0 §5.26).
+            # Without these, Blender/Unreal import the armature + weights but
+            # the bind pose is undefined and deformation is wrong.
+            ibm_buf = bytearray()
+            for mn in all_model_nodes:
+                if mn.name not in gltf_node_idx:
+                    continue
+                gni = gltf_node_idx[mn.name]
+                if gni not in joint_indices:
+                    continue
+                # Build the 4x4 world bind matrix for this bone
+                bone_matrix = self._node_bind_world_matrix_4x4(mn)
+                # Invert it
+                inv = self._invert_4x4(bone_matrix)
+                # glTF stores inverseBindMatrices as column-major MAT4
+                for col in range(4):
+                    for row in range(4):
+                        ibm_buf += st.pack('<f', float(inv[col][row]))
+            if ibm_buf and len(joint_indices) > 0:
+                ibm_acc = _add_accessor(
+                    bytes(ibm_buf), len(joint_indices), "MAT4", 5126,
+                )
+                gltf_skin_obj.inverseBindMatrices = ibm_acc
+
             skin_idx = len(gltf.skins)
             gltf.skins.append(gltf_skin_obj)
             gltf_skin = skin_idx
@@ -3386,7 +3925,8 @@ class GLTFExporter:
             px = [v[0] for v in verts]; py = [v[1] for v in verts]; pz = [v[2] for v in verts]
             pos_acc = _add_accessor(bytes(pos_buf), n_v, "VEC3", 5126,
                                     [min(px), min(py), min(pz)],
-                                    [max(px), max(py), max(pz)])
+                                    [max(px), max(py), max(pz)],
+                                    target=34962)  # ARRAY_BUFFER
 
             # Normal buffer (float32, VEC3)
             norm_acc = None
@@ -3408,7 +3948,8 @@ class GLTFExporter:
             idx_buf = bytearray()
             for f in faces:
                 idx_buf += st.pack('<III', int(f[0]), int(f[1]), int(f[2]))
-            idx_acc = _add_accessor(bytes(idx_buf), n_f * 3, "SCALAR", 5125)
+            idx_acc = _add_accessor(bytes(idx_buf), n_f * 3, "SCALAR", 5125,
+                                    target=34963)  # ELEMENT_ARRAY_BUFFER
 
             # Primitive attributes
             prim_attrs = pygltflib.Attributes(POSITION=pos_acc)
@@ -3463,7 +4004,26 @@ class GLTFExporter:
                             ws = [x / w_sum for x in ws]
                         joints_buf  += st.pack('<BBBB', *js)
                         weights_buf += st.pack('<ffff', *ws)
-                    joints_acc  = _add_accessor(bytes(joints_buf),  n_v, "VEC4", 5121)
+                    # Use UNSIGNED_SHORT (5123) for >255 joints, UNSIGNED_BYTE (5121) otherwise
+                    use_short_joints = len(joint_indices) > 255
+                    joint_fmt = '<HHHH' if use_short_joints else '<BBBB'
+                    joint_type = 5123 if use_short_joints else 5121
+                    joints_buf  = bytearray()
+                    weights_buf = bytearray()
+                    for sd in skin_data:
+                        infl = sd.influences if hasattr(sd, 'influences') else []
+                        infl_sorted = sorted(infl, key=lambda x: x.weight, reverse=True)[:4]
+                        js = [0, 0, 0, 0]
+                        ws = [0.0, 0.0, 0.0, 0.0]
+                        for ci, inf in enumerate(infl_sorted):
+                            js[ci] = _bmap_to_joint.get(int(inf.bone_index), 0)
+                            ws[ci] = float(inf.weight)
+                        w_sum = sum(ws)
+                        if w_sum > 1e-6:
+                            ws = [x / w_sum for x in ws]
+                        joints_buf  += st.pack(joint_fmt, *js)
+                        weights_buf += st.pack('<ffff', *ws)
+                    joints_acc  = _add_accessor(bytes(joints_buf),  n_v, "VEC4", joint_type)
                     weights_acc = _add_accessor(bytes(weights_buf), n_v, "VEC4", 5126)
             if joints_acc is not None:
                 prim_attrs.JOINTS_0  = joints_acc
@@ -3552,7 +4112,16 @@ class GLTFExporter:
                     if tgt_node_idx is None:
                         continue
 
-                    for ctrl in (anim_node.controllers or []):
+                    raw_controllers = anim_node.controllers or []
+                    for ctrl in raw_controllers:
+                        # Normalize legacy dict-keyed controllers to list format
+                        if isinstance(ctrl, int):
+                            legacy = raw_controllers.get(ctrl) if isinstance(raw_controllers, dict) else None
+                            if not isinstance(legacy, dict):
+                                continue
+                            ctrl = legacy
+                        if not isinstance(ctrl, dict):
+                            continue
                         ctype  = ctrl.get('type')
                         times  = ctrl.get('times', [])
                         values = ctrl.get('values', [])
@@ -3616,15 +4185,21 @@ class GLTFExporter:
                 log.warning(f"GLTF export: failed to export animation '{anim.name}': {e}")
 
         # Finalize buffer
-        gltf.buffers.append(pygltflib.Buffer(byteLength=len(bin_data)))
-        gltf.set_binary_blob(bytes(bin_data))
-
-        if binary or path.endswith('.glb'):
-            gltf.save(path if path.endswith('.glb') else path.replace('.gltf', '.glb'))
+        if binary or path.lower().endswith('.glb'):
+            # GLB: binary blob is embedded; buffer must NOT have a uri
+            gltf.buffers.append(pygltflib.Buffer(byteLength=len(bin_data)))
+            gltf.set_binary_blob(bytes(bin_data))
+            out_path = path if path.lower().endswith('.glb') else str(Path(path).with_suffix('.glb'))
+            gltf.save(out_path)
+            log.info(f"GLB export → {Path(out_path).name}")
         else:
+            # GLTF JSON: write binary to a sidecar .bin file with a uri
+            bin_uri = Path(path).with_suffix('.bin').name
+            gltf.buffers.append(pygltflib.Buffer(byteLength=len(bin_data), uri=bin_uri))
+            bin_path = str(Path(path).with_suffix('.bin'))
+            Path(bin_path).write_bytes(bytes(bin_data))
             gltf.save(path)
-
-        log.info(f"GLTF export → {Path(path).name}")
+            log.info(f"GLTF export → {Path(path).name} (+ {Path(bin_path).name})")
         return True
 
     # ── Manual GLTF JSON+BIN path (no external deps) ─────────────────

@@ -119,6 +119,18 @@ class ViewportDragInteractionsMixin:
         self._commit_transform_gizmo_symmetry()
         self._request_render(reason="gizmo drag ended", gizmo=True, selection=True, overlay=True)
 
+    def cancel_selection_marquee(self) -> None:
+        """Dismiss any in-progress authoring selection before runtime input takes over."""
+
+        band = getattr(self, "_selection_rubber_band", None)
+        if band is not None:
+            band.hide()
+        self._mesh_box_start = None
+        self._mesh_box_selecting = False
+        self._marquee_base_selection = []
+        self._joint_marquee_selecting = False
+        self._is_dragging = False
+
     def _press_lmb(self, event) -> None:
         x, y = int(event.position().x()), int(event.position().y())
         self._mx = self._press_x = x
@@ -1032,11 +1044,17 @@ class ViewportDragInteractionsMixin:
                 from core.characters import headless_body_workflow as _wf
             except ImportError:                              # pragma: no cover
                 from src.core.characters import headless_body_workflow as _wf  # type: ignore
+            # Resolve the pivot from the actual selected/transform target node,
+            # not just model.root_node — center-pivot writes _gr_pivot_world onto
+            # the mesh node, so root_node's attribute may be unset.
+            pivot_node = self._renderer.selected_node or getattr(self.model, "root_node", None)
+            pivot_override = getattr(pivot_node, "_gr_pivot_world", None) if pivot_node is not None else None
             result = _wf.apply_external_model_fit_adjustment(
                 self.model,
                 rotation_delta_degrees=rotation_delta,
                 scale_delta=scale_delta,
                 translation_delta=translation_delta,
+                pivot_override=pivot_override,
             )
             if bool(result.get("ok")):
                 self.refresh_model_geometry()

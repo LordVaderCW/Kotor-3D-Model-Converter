@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -26,6 +27,35 @@ def _placements():
     from src.core.modules.authored_module_objects import AuthoredGameplayPlacement, ModuleEntryPoint
 
     return AuthoredGameplayPlacement(entry_point=ModuleEntryPoint(area_resref="grdev01"))
+
+
+def _terrain_stroke_project(resolution: int = 9, *, patterned: bool = False):
+    from src.core.modules.authored_module_objects import AuthoredGameplayPlacement, ModuleEntryPoint
+    from src.core.modules.authored_module_project import create_terrain_room_project
+    from src.core.modules.authored_terrain_builder import TerrainHeightfieldPrimitive
+
+    heights = tuple(
+        tuple(
+            float(((row * 7) + (column * 3)) % 11) * 0.05 if patterned else 0.0
+            for column in range(resolution)
+        )
+        for row in range(resolution)
+    )
+    room_resref = "grstroke_room01"
+    terrain = TerrainHeightfieldPrimitive(
+        room_resref=room_resref,
+        heights=heights,
+        width=float(resolution - 1),
+        depth=float(resolution - 1),
+    )
+    placements = AuthoredGameplayPlacement(entry_point=ModuleEntryPoint(area_resref=room_resref))
+    return create_terrain_room_project(
+        module_root="grstroke",
+        game="K2",
+        display_name="Terrain Stroke Fixture",
+        terrain=terrain,
+        placements=placements,
+    )
 
 
 def test_t2907_flat_terrain_heightfield_builds_mesh_and_walkable_wok() -> None:
@@ -63,6 +93,185 @@ def test_t2907_flat_terrain_heightfield_builds_mesh_and_walkable_wok() -> None:
     assert geometry.wok.walkable_face_count() == 8
     assert geometry.wok.non_walk_face_count() == 0
     assert len(geometry.wok.boundary_edges()) == 8
+
+
+def test_t2907_carved_terrain_hole_serializes_inner_perimeter_and_complete_aabb() -> None:
+    _install_native_payload_paths()
+    import struct
+
+    from src.core.modules.authored_terrain_builder import (
+        TerrainHeightfieldPrimitive,
+        build_terrain_mesh,
+        build_terrain_wok,
+        carve_terrain_hole,
+    )
+    from src.core.modules.module_format import WOKData
+    from src.core.validation.kotor_module_engine_contract import inspect_raw_wok_structure
+
+    terrain = TerrainHeightfieldPrimitive(
+        room_resref="grdev01_hole",
+        width=8.0,
+        depth=8.0,
+        heights=tuple(tuple(0.0 for _column in range(5)) for _row in range(5)),
+    )
+    carved = carve_terrain_hole(terrain, row_index=1, column_index=1)
+    mesh = build_terrain_mesh(carved)
+    wok = build_terrain_wok(carved)
+    raw = wok.to_bytes()
+    fingerprint, report = inspect_raw_wok_structure(carved.room_resref, raw)
+
+    assert len(mesh.faces) == 30
+    assert len(wok.faces) == 30
+    assert struct.unpack_from("<I", raw, 128)[0] == 2
+    assert fingerprint.perimeter_count == 2
+    assert fingerprint.closed_perimeter_count == 2
+    assert fingerprint.aabb_count == 59
+    assert fingerprint.aabb_leaf_count == 30
+    assert fingerprint.aabb_covered_face_count == 30
+    assert fingerprint.aabb_missing_face_count == 0
+    assert not report.has_errors
+    assert len(WOKData.from_bytes(raw).faces) == 30
+
+    boundary_notch = carve_terrain_hole(terrain, row_index=0, column_index=1)
+    assert struct.unpack_from("<I", build_terrain_wok(boundary_notch).to_bytes(), 128)[0] == 1
+
+
+def test_t2907_terrain_holes_reject_malformed_and_out_of_range_cells() -> None:
+    _install_native_payload_paths()
+    import pytest
+
+    from src.core.modules.authored_terrain_builder import (
+        TerrainHeightfieldPrimitive,
+        build_terrain_wok,
+        carve_terrain_hole,
+        normalised_terrain_holes,
+        validate_terrain_heightfield_primitive,
+    )
+
+    heights = tuple(tuple(0.0 for _column in range(4)) for _row in range(4))
+    malformed = TerrainHeightfieldPrimitive(
+        room_resref="grdev01_bad_hole",
+        heights=heights,
+        holes=((1, 1), ("2", 1), (0, 1, 2), (-1, 0)),
+    )
+    validation = validate_terrain_heightfield_primitive(malformed)
+
+    assert validation.ok is False
+    assert any("must use integer" in issue for issue in validation.blocking_issues)
+    assert any("two-integer" in issue for issue in validation.blocking_issues)
+    assert any("outside the valid cell range" in issue for issue in validation.blocking_issues)
+    with pytest.raises(ValueError, match="outside the valid cell range"):
+        build_terrain_wok(malformed)
+    with pytest.raises(ValueError, match="must use integer"):
+        normalised_terrain_holes(((1.5, 1),), row_count=4, column_count=4)
+    with pytest.raises(ValueError, match="outside the valid cell range"):
+        carve_terrain_hole(
+            TerrainHeightfieldPrimitive(room_resref="grdev01_edge", heights=heights),
+            row_index=3,
+            column_index=0,
+        )
+    with pytest.raises(ValueError, match="must be integers"):
+        carve_terrain_hole(
+            TerrainHeightfieldPrimitive(room_resref="grdev01_fraction", heights=heights),
+            row_index=1.25,
+            column_index=1,
+        )
+
+
+def test_t2907_contiguous_diagonal_and_notched_holes_keep_one_walkable_component() -> None:
+    _install_native_payload_paths()
+    import struct
+
+    from src.core.modules.authored_terrain_builder import (
+        TerrainHeightfieldPrimitive,
+        build_terrain_wok,
+        validate_terrain_heightfield_primitive,
+    )
+
+    heights = tuple(tuple(0.0 for _column in range(6)) for _row in range(6))
+    patterns = {
+        "contiguous": ((2, 2), (2, 3)),
+        "diagonal": ((1, 1), (2, 2)),
+        "notched": ((0, 1), (0, 2)),
+    }
+    perimeter_counts: dict[str, int] = {}
+    for label, holes in patterns.items():
+        terrain = TerrainHeightfieldPrimitive(
+            room_resref=f"grdev01_{label}",
+            heights=heights,
+            holes=holes,
+        )
+        validation = validate_terrain_heightfield_primitive(terrain)
+        wok = build_terrain_wok(terrain)
+        raw = wok.to_bytes()
+
+        assert validation.ok is True
+        assert validation.walkable_component_count == 1
+        assert wok.walkable_face_count() == (25 - len(holes)) * 2
+        perimeter_counts[label] = struct.unpack_from("<I", raw, 128)[0]
+
+    assert perimeter_counts["contiguous"] == 2
+    # Diagonal holes meet at one vertex.  The perimeter writer may serialize
+    # that point-touching interior boundary as one closed loop or two; it must
+    # never be rejected as a disconnected walkable floor.
+    assert perimeter_counts["diagonal"] >= 2
+    assert perimeter_counts["notched"] == 1
+
+
+def test_t2907_terrain_carve_rejects_disconnected_islands_without_explicit_review() -> None:
+    _install_native_payload_paths()
+    import pytest
+
+    from src.core.modules.authored_terrain_builder import (
+        TerrainHeightfieldPrimitive,
+        build_terrain_wok,
+        carve_terrain_hole,
+        compile_terrain_room_geometry,
+        validate_terrain_heightfield_primitive,
+    )
+
+    heights = tuple(tuple(0.0 for _column in range(5)) for _row in range(5))
+    nearly_split = TerrainHeightfieldPrimitive(
+        room_resref="grdev01_split",
+        heights=heights,
+        holes=((0, 1), (1, 1), (2, 1)),
+    )
+    with pytest.raises(ValueError, match="2 disconnected walkable WOK islands"):
+        carve_terrain_hole(nearly_split, row_index=3, column_index=1)
+
+    reviewed = carve_terrain_hole(
+        nearly_split,
+        row_index=3,
+        column_index=1,
+        allow_disconnected_walkmesh_islands=True,
+    )
+    validation = validate_terrain_heightfield_primitive(reviewed)
+    geometry = compile_terrain_room_geometry(reviewed)
+
+    assert reviewed.metadata["allow_disconnected_walkmesh_islands"] is True
+    assert validation.ok is True
+    assert validation.walkable_component_count == 2
+    assert any("explicitly reviewed" in warning for warning in validation.warnings)
+    assert geometry.metadata["walkable_component_count"] == 2
+    assert geometry.metadata["allow_disconnected_walkmesh_islands"] is True
+    assert len(build_terrain_wok(reviewed).faces) == 24
+
+
+def test_t2907_terrain_adjacency_rejects_third_owner_nonmanifold_edge() -> None:
+    _install_native_payload_paths()
+    import pytest
+
+    from src.core.modules.authored_terrain_builder import _assign_wok_adjacency
+    from src.core.modules.module_format import WOKFace
+
+    faces = [
+        WOKFace(0, 1, 2, surface=4),
+        WOKFace(1, 0, 3, surface=4),
+        WOKFace(0, 1, 4, surface=4),
+    ]
+
+    with pytest.raises(ValueError, match="non-manifold"):
+        _assign_wok_adjacency(faces)
 
 
 def test_t2907_steep_terrain_triangles_export_as_non_walk() -> None:
@@ -130,8 +339,12 @@ def test_t2907_terrain_project_compiles_through_authored_room_spec() -> None:
     assert project.rooms[0].metadata["primitive"] == "terrain_heightfield"
     assert geometry.metadata["source"] == "src.core.modules.authored_terrain_builder"
     assert geometry.wok.walkable_face_count() == 8
-    assert with_boundaries.wok.non_walk_face_count() == 16
+    assert with_boundaries.wok is geometry.wok
+    assert with_boundaries.wok.walkable_face_count() == 8
+    assert with_boundaries.wok.non_walk_face_count() == 0
     assert with_boundaries.metadata["walkmesh_boundary_wall_faces"] == 16
+    assert with_boundaries.metadata["walkmesh_boundary_helper_faces"] == 16
+    assert with_boundaries.metadata["walkmesh_game_wok_face_policy"] == "floor_only"
 
 
 def test_t2908_terrain_heightfield_sample_edit_operations() -> None:
@@ -196,6 +409,39 @@ def test_t2603_terrain_erase_brush_resets_local_dirty_region() -> None:
     }
     assert erased.metadata["dirty_region_only"] is True
     assert erased.metadata["defer_full_rebuild_until_stroke_end"] is True
+
+
+def test_t2907_terrain_brush_hardness_controls_smooth_falloff() -> None:
+    _install_native_payload_paths()
+
+    from src.core.modules.authored_terrain_builder import TerrainHeightfieldPrimitive, apply_terrain_brush_stroke
+
+    terrain = TerrainHeightfieldPrimitive(
+        room_resref="grfalloff_room01",
+        heights=tuple(tuple(0.0 for _column in range(7)) for _row in range(7)),
+    )
+    soft = apply_terrain_brush_stroke(
+        terrain,
+        brush="raise",
+        points=((3, 3, 1.0),),
+        radius=2,
+        delta=1.0,
+        falloff_hardness=0.0,
+    )
+    hard = apply_terrain_brush_stroke(
+        terrain,
+        brush="raise",
+        points=((3, 3, 1.0),),
+        radius=2,
+        delta=1.0,
+        falloff_hardness=1.0,
+    )
+
+    assert soft.heights[3][3] == 1.0
+    assert 0.0 < soft.heights[3][5] < hard.heights[3][5]
+    assert hard.heights[3][5] == 1.0
+    assert soft.metadata["last_brush_falloff_hardness"] == 0.0
+    assert hard.metadata["last_brush_falloff_hardness"] == 1.0
 
 
 def test_t2603_terrain_slope_brush_creates_controlled_local_grade() -> None:
@@ -300,3 +546,134 @@ def test_t2907_terrain_shape_presets_create_readable_heightfields() -> None:
     assert ramp.heights[0][0] < ramp.heights[-1][0]
     assert len({round(value, 3) for row in terraces.heights for value in row}) >= 3
     assert geometry.wok.walkable_face_count() > 0
+
+
+def test_t2907_terrain_stroke_session_decodes_once_and_serializes_once_at_commit() -> None:
+    _install_native_payload_paths()
+    from src.core.modules.authored_module_kmap_bridge import (
+        authored_project_from_kmap_payload,
+        authored_project_to_kmap_payload,
+    )
+    from src.core.modules.map_studio_terrain_sculpt_session import begin_terrain_sculpt_stroke
+
+    payload = authored_project_to_kmap_payload(_terrain_stroke_project(65))
+    source_payload = copy.deepcopy(payload)
+    session = begin_terrain_sculpt_stroke(payload, room_resref="grstroke_room01")
+    assert session.decode_count == 1
+
+    for column in (28, 30, 32, 34, 36):
+        frame = session.apply_frame(
+            brush="raise",
+            points=((32, column, 1.0),),
+            delta=0.2,
+            radius=2,
+            falloff_hardness=0.65,
+        )
+        assert frame.applied is True
+        assert frame.project_serialized is False
+    assert session.frame_count == 5
+    assert session.serialization_count == 0
+    assert payload == source_payload
+
+    committed = session.commit()
+    assert committed.decode_count == 1
+    assert committed.serialization_count == 1
+    decoded = authored_project_from_kmap_payload(committed.payload)
+    assert decoded.rooms[0].primitive.heights[32][32] > 0.0
+    assert decoded.rooms[0].primitive.metadata["terrain_stroke_committed"] is True
+    assert session.commit() is committed
+    assert session.serialization_count == 1
+
+
+def test_t2907_terrain_stroke_session_tracks_dirty_rectangle_and_dependency_halo() -> None:
+    _install_native_payload_paths()
+    from src.core.modules.map_studio_terrain_sculpt_session import MapStudioTerrainSculptStrokeSession
+
+    session = MapStudioTerrainSculptStrokeSession.from_project(
+        _terrain_stroke_project(9),
+        room_resref="grstroke_room01",
+    )
+    result = session.apply_frame(
+        brush="raise",
+        points=((4, 4, 1.0),),
+        delta=0.5,
+        radius=1,
+        falloff_hardness=1.0,
+    )
+    assert result.dirty_region.to_metadata() == {
+        "min_row": 3,
+        "max_row": 5,
+        "min_column": 3,
+        "max_column": 5,
+        "changed_sample_count": 5,
+        "covered_sample_count": 9,
+        "empty": False,
+    }
+    assert result.dirty_region_with_halo.to_metadata() == {
+        "min_row": 2,
+        "max_row": 6,
+        "min_column": 2,
+        "max_column": 6,
+        "changed_sample_count": 5,
+        "covered_sample_count": 25,
+        "empty": False,
+    }
+    patch = session.dirty_height_patch(result.dirty_region_with_halo)
+    assert len(patch) == 5
+    assert all(len(row) == 5 for row in patch)
+
+
+def test_t2907_terrain_stroke_session_matches_brush_math_and_stays_resolution_local() -> None:
+    _install_native_payload_paths()
+    from src.core.modules.authored_terrain_builder import apply_terrain_brush_stroke
+    from src.core.modules.map_studio_terrain_sculpt_session import MapStudioTerrainSculptStrokeSession
+
+    for brush, kwargs in (
+        ("raise", {"delta": 0.2, "radius": 2, "strength": 0.7}),
+        ("smooth", {"delta": 0.1, "radius": 2, "strength": 0.65, "iterations": 2}),
+        ("erode", {"delta": 0.04, "radius": 2, "strength": 0.8, "iterations": 2}),
+    ):
+        project = _terrain_stroke_project(13, patterned=True)
+        expected = apply_terrain_brush_stroke(
+            project.rooms[0].primitive,
+            brush=brush,
+            points=((6, 6, 1.0), (6, 7, 0.8)),
+            falloff_hardness=0.55,
+            **kwargs,
+        )
+        session = MapStudioTerrainSculptStrokeSession.from_project(
+            project,
+            room_resref="grstroke_room01",
+        )
+        session.apply_frame(
+            brush=brush,
+            points=((6, 6, 1.0), (6, 7, 0.8)),
+            falloff_hardness=0.55,
+            **kwargs,
+        )
+        assert session.commit().primitive.heights == expected.heights
+
+    timings: dict[int, float] = {}
+    changed_counts: dict[int, int] = {}
+    for resolution in (17, 65, 129):
+        session = MapStudioTerrainSculptStrokeSession.from_project(
+            _terrain_stroke_project(resolution),
+            room_resref="grstroke_room01",
+        )
+        center = resolution // 2
+        session.apply_frame(brush="raise", points=((center, center),), delta=0.1, radius=2, force=True)
+        result = session.apply_frame(
+            brush="raise",
+            points=((center, center + 1),),
+            delta=0.1,
+            radius=2,
+            force=True,
+        )
+        timings[resolution] = result.elapsed_ms
+        changed_counts[resolution] = len(result.changed_flat_indices)
+        assert session.serialization_count == 0
+
+    assert changed_counts == {17: 13, 65: 13, 129: 13}
+    # The live brush contract is a 4 ms dirty-buffer budget.  Resolution must
+    # not push a fixed-radius local stroke back onto the old whole-grid path.
+    assert max(timings.values()) < 4.0

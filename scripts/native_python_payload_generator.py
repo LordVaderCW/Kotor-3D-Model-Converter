@@ -192,6 +192,101 @@ def generate_project(project: str) -> None:
     ]
     rc_lines.extend(f'{row["resource_name"]} RCDATA "{row["packaged_path"]}"' for row in rows)
     write_text_if_changed(project_dir / "GhostRiggerPythonPayload.rc", "\n".join(rc_lines) + "\n")
+    ensure_project_payload_items(project, [Path(row["packaged_path"]) for row in rows])
+
+
+def ensure_project_payload_items(project: str, packaged_paths: list[Path]) -> None:
+    project_dir = NATIVE_ROOT / project
+    vcxproj = project_dir / f"{project}.vcxproj"
+    if not vcxproj.exists():
+        return
+
+    text = vcxproj.read_text(encoding="utf-8")
+    match = re.search(r'(<ItemGroup Label="PythonPayload">)(.*?)(</ItemGroup>)', text, flags=re.DOTALL)
+    if not match:
+        raise RuntimeError(f"cannot find Python payload item group in {vcxproj}")
+
+    body = match.group(2)
+    existing = set(re.findall(r'<None Include="([^"]+)"\s*/>', body))
+    required = [
+        str(path).replace("/", "\\")
+        for path in packaged_paths
+    ]
+    missing = [
+        item
+        for item in required
+        if item not in existing
+    ]
+    stale = [
+        item
+        for item in existing
+        if item.startswith("Python\\") and item.endswith(".py") and item not in required
+    ]
+    updated_body = body
+    for item in stale:
+        updated_body = re.sub(
+            rf'<None Include="{re.escape(item)}"\s*/>',
+            "",
+            updated_body,
+        )
+    if missing or stale:
+        addition = "".join(f'<None Include="{item}" />' for item in missing)
+        updated_group = f"{match.group(1)}{updated_body}{addition}{match.group(3)}"
+        updated = text[:match.start()] + updated_group + text[match.end():]
+        write_text_if_changed(vcxproj, updated)
+
+    # Keep Solution Explorer's generated payload view in lockstep with the
+    # manifest/RC/vcxproj.  Several packages predate this generator support,
+    # so add only missing rows and preserve their existing filter layout.
+    filters = project_dir / f"{project}.vcxproj.filters"
+    if not filters.exists():
+        return
+    filter_text = filters.read_text(encoding="utf-8")
+    filter_group = next(
+        (
+            candidate
+            for candidate in re.finditer(
+                r"(<ItemGroup>)(.*?)(</ItemGroup>)",
+                filter_text,
+                flags=re.DOTALL,
+            )
+            if 'GhostRiggerPythonPayload.json' in candidate.group(2)
+        ),
+        None,
+    )
+    if filter_group is None:
+        raise RuntimeError(f"cannot find Python payload filter group in {filters}")
+    filter_body = filter_group.group(2)
+    filter_existing = set(re.findall(r'<None Include="([^"]+)"', filter_body))
+    filter_missing = [item for item in required if item not in filter_existing]
+    filter_stale = [
+        item
+        for item in filter_existing
+        if item.startswith("Python\\") and item.endswith(".py") and item not in required
+    ]
+    updated_filter_body = filter_body
+    for item in filter_stale:
+        updated_filter_body = re.sub(
+            rf'<None Include="{re.escape(item)}">.*?</None>',
+            "",
+            updated_filter_body,
+            flags=re.DOTALL,
+        )
+    if not filter_missing and not filter_stale:
+        return
+    filter_addition = "".join(
+        f'<None Include="{item}"><Filter>{str(Path(item).parent)}</Filter></None>'
+        for item in filter_missing
+    )
+    updated_filter_group = (
+        f"{filter_group.group(1)}{updated_filter_body}{filter_addition}{filter_group.group(3)}"
+    )
+    write_text_if_changed(
+        filters,
+        filter_text[:filter_group.start()]
+        + updated_filter_group
+        + filter_text[filter_group.end():],
+    )
 
 
 def _insert_after_once(text: str, anchor: str, addition: str, exists: str, path: Path) -> str:

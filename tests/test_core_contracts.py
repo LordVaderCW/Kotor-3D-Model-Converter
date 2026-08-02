@@ -12,23 +12,24 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_GUI_DISPLAY_PAYLOAD_ROOT = "native/GhostRigger.Core.GUI.Display/Python"
 _VIEWPORT_WIDGET_SOURCE_FILES = (
-    "src/gui/viewports/viewport_core/widgets/viewport_widget.py",
-    "src/gui/viewports/viewport_core/widgets/state_helpers.py",
-    "src/gui/viewports/viewport_core/widgets/construction.py",
-    "src/gui/viewports/viewport_core/widgets/scene_models.py",
-    "src/gui/viewports/viewport_core/widgets/display_controls.py",
-    "src/gui/viewports/viewport_core/widgets/camera_workflow.py",
-    "src/gui/viewports/viewport_core/widgets/measurement_controls.py",
-    "src/gui/viewports/viewport_core/widgets/transform_camera.py",
-    "src/gui/viewports/viewport_core/widgets/selection_mesh.py",
-    "src/gui/viewports/viewport_core/widgets/history_animation.py",
-    "src/gui/viewports/viewport_core/widgets/event_navigation.py",
-    "src/gui/viewports/viewport_core/widgets/rendering_pipeline.py",
-    "src/gui/viewports/viewport_core/widgets/overlay_layers.py",
-    "src/gui/viewports/viewport_core/widgets/picking_hover.py",
-    "src/gui/viewports/viewport_core/widgets/drag_interactions.py",
-    "src/gui/viewports/viewport_core/widgets/resource_cache.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/viewport_widget.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/state_helpers.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/construction.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/scene_models.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/display_controls.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/camera_workflow.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/measurement_controls.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/transform_camera.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/selection_mesh.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/history_animation.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/event_navigation.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/rendering_pipeline.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/overlay_layers.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/picking_hover.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/drag_interactions.py",
+    f"{_GUI_DISPLAY_PAYLOAD_ROOT}/src/gui/viewports/viewport_core/widgets/resource_cache.py",
 )
 
 
@@ -284,7 +285,8 @@ def test_qt_main_window_starts_ipc_server_with_visual_qa_callbacks() -> None:
     assert '@app.route("/api/set_light_helpers", methods=["POST"])' in server_source
     assert '@app.route("/api/select_helper", methods=["POST"])' in server_source
     assert '@app.route("/api/capture_viewport", methods=["POST"])' in server_source
-    assert '"module_editor": self._open_module_editor_window' in source
+    assert '"module_editor": self._open_stock_module_editor_window' in source
+    assert '"map_studio": self._open_module_editor_window' in source
     assert '"character_builder": self._open_qt_character_builder_window' in source
     assert '"retarget_workbench": self._open_animation_retarget_window' in source
     assert '"unreal_animator": self._open_unreal_animator_window' in source
@@ -3903,7 +3905,8 @@ def test_scene_root_transform_evicts_child_gpu_nodes() -> None:
 
 def test_kmax_scene_composite_keeps_bas_layers_out_of_body_dfs_indices() -> None:
     from src.core.animation.gpu_skinning import MatrixPaletteUploader
-    from src.core.geometry.model_data import KotorModel, ModelNode, NodeFlags
+    from src.core.geometry.model_data import Animation, KotorModel, ModelNode, NodeFlags
+    from src.core.rendering.mesh_render_data import _effective_animation_pose_for_node
     from src.gui.qt_lib.viewports.qt_viewport import QtViewportWidget
     from src.gui.qt_lib.windows.qt_main_window import QtGhostRiggerMainWindow
 
@@ -3925,7 +3928,11 @@ def test_kmax_scene_composite_keeps_bas_layers_out_of_body_dfs_indices() -> None
         parent=head_root,
     )
     head_root.children.append(head_mesh)
-    head = KotorModel(name="pmha01", root_node=head_root)
+    head = KotorModel(
+        name="pmha01",
+        root_node=head_root,
+        animations=[Animation(name="b11a3", length=1.0)],
+    )
 
     window = SimpleNamespace()
     window._find_model_node = MethodType(QtGhostRiggerMainWindow._find_model_node, window)
@@ -3965,6 +3972,26 @@ def test_kmax_scene_composite_keeps_bas_layers_out_of_body_dfs_indices() -> None
     assert getattr(placed_nodes["headhook"], "_gr_source_dfs_index") == 2
     assert getattr(placed_nodes["rhand"], "_gr_source_dfs_index") == 3
     assert getattr(placed_nodes["torso"], "_gr_source_dfs_index") == 4
+
+    placed_head_root = next(
+        node
+        for node in placed_root_nodes
+        if bool(getattr(node, "_gr_bas_attachment_root", False))
+    )
+    assert placed_head_root._gr_bas_attachment_source_model_ref is head
+    assert placed_head_root._gr_bas_attachment_source_model_id == id(head)
+
+    body_pose = SimpleNamespace(
+        nodes={},
+        time=0.5,
+        _gr_animation_source_model_id=id(body),
+        _gr_animation_source_model_name=body.name,
+        _gr_animation_name="b11a3",
+    )
+    placed_head_pose = _effective_animation_pose_for_node(placed_head_root, body_pose)
+    assert placed_head_pose is not None
+    assert placed_head_pose._gr_animation_source_model_id == id(head)
+    assert placed_head_pose._gr_bas_socket_pose is body_pose
 
     uploader = MatrixPaletteUploader(max_bones=8)
     uploader.build_inverse_bind_pose(composite)
@@ -4024,6 +4051,8 @@ def test_kmax_scene_reload_preserves_selected_object_for_pivot_tools() -> None:
     assert "self.select_scene_object(selected_id)" in load_scene_source
     assert "clear_caches" not in append_scene_source
     assert "root.children.append(node)" in append_scene_source
+    assert "self._prewarm_textures(composite)" in append_scene_source
+    assert "self._gpu_texture_snapshot_key = None" in append_scene_source
     assert 'reason="scene object appended"' in append_scene_source
 
 
@@ -4103,9 +4132,14 @@ def test_model_load_worker_uses_single_read_and_gpu_prebuild() -> None:
         QtProgressToast,
         ResourceModelLoadWorker,
     )
-    from src.gui.windows.application_core.shared.workers import load_resource_model_from_game_resources
+    from src.gui.windows.application_core.shared.workers import (
+        load_module_room_models_from_game_resources,
+        load_resource_model_from_game_resources,
+    )
+    from src.io.mdl_auto_import import load_mdl_auto
 
     file_source = inspect.getsource(ModelLoadWorker.run)
+    auto_import_source = inspect.getsource(load_mdl_auto)
     toast_source = inspect.getsource(QtProgressToast)
     window_source = inspect.getsource(QtGhostRiggerMainWindow)
     start_resource_source = inspect.getsource(QtGhostRiggerMainWindow._start_resource_load)
@@ -4113,6 +4147,7 @@ def test_model_load_worker_uses_single_read_and_gpu_prebuild() -> None:
     get_resource_manager_source = inspect.getsource(QtGhostRiggerMainWindow._get_resource_manager)
     resource_source = inspect.getsource(ResourceModelLoadWorker.run)
     resource_loader_source = inspect.getsource(load_resource_model_from_game_resources)
+    module_loader_source = inspect.getsource(load_module_room_models_from_game_resources)
     viewport_preload_source = inspect.getsource(__import__(
         "src.gui.qt_lib.viewports.qt_viewport",
         fromlist=["QtViewportWidget"],
@@ -4120,14 +4155,19 @@ def test_model_load_worker_uses_single_read_and_gpu_prebuild() -> None:
 
     assert "progress = QtCore.Signal(str, int, int)" in inspect.getsource(ModelLoadWorker)
     assert "progress = QtCore.Signal(str, int, int)" in inspect.getsource(ResourceModelLoadWorker)
-    assert "raw = path.read_bytes()" in file_source
-    assert 'raw.decode("utf-8", errors="replace")' in file_source
-    assert "load_model_from_bytes" in file_source
+    assert "load_mdl_auto" in file_source
+    assert "raw = path.read_bytes()" in auto_import_source
+    assert 'raw.decode("utf-8", errors="replace")' in auto_import_source
+    assert "load_model_from_bytes" in auto_import_source
     assert "load_model_from_file" not in file_source
     assert "self.progress.emit" in file_source
     assert "_prebuild_gpu_mesh_data_for_model(model)" in file_source
     assert "self.progress.emit" in resource_source
     assert "_prebuild_gpu_mesh_data_for_model(model)" in resource_loader_source
+    assert "placement_list = list(placements or [])" in module_loader_source
+    assert "mgr = ResourceManager()" in module_loader_source
+    assert "for index, placement in enumerate" in module_loader_source
+    assert "_prebuild_gpu_mesh_data_for_model(model)" in module_loader_source
     assert "load_resource_model_from_game_resources" in resource_source
     assert "_load_resource_model_on_ui_thread" in start_resource_source
     assert "ResourceModelLoadWorker(" not in start_resource_source
@@ -4139,6 +4179,34 @@ def test_model_load_worker_uses_single_read_and_gpu_prebuild() -> None:
     assert "existing is not None" in get_resource_manager_source
     assert "_resource_manager_dirs" in get_resource_manager_source
     assert "tex_cache.get" not in viewport_preload_source
+
+
+def test_module_browser_import_uses_single_batch_scene_refresh() -> None:
+    import inspect
+
+    from src.gui.qt_lib.viewports.qt_viewport import QtViewportWidget
+    from src.gui.qt_lib.windows.qt_main_window import QtGhostRiggerMainWindow
+
+    start_source = inspect.getsource(QtGhostRiggerMainWindow._start_content_browser_module_load)
+    load_source = inspect.getsource(QtGhostRiggerMainWindow._load_module_rooms_on_ui_thread)
+    finish_source = inspect.getsource(QtGhostRiggerMainWindow._finish_module_batch_load)
+    add_source = inspect.getsource(QtGhostRiggerMainWindow._add_loaded_model_to_scene)
+    composite_source = inspect.getsource(QtViewportWidget._build_scene_composite_model)
+    display_source = inspect.getsource(QtViewportWidget.set_module_map_display_defaults)
+
+    assert "_load_module_rooms_on_ui_thread(tuple(placements), action)" in start_source
+    assert "_start_next_module_room_load()" not in start_source
+    assert "load_module_room_models_from_game_resources" in load_source
+    assert "self._finish_module_batch_load(loaded_rooms, action)" in load_source
+    assert "for model, path, placement in rooms:" in finish_source
+    assert "self._refresh_scene_view()" in finish_source
+    assert "set_module_map_display_defaults" in finish_source
+    assert "module_placement=placement" in finish_source
+    assert "clear_scene=False" in finish_source
+    assert "module_placement: ModuleRoomPlacement | None = None" in add_source
+    assert "prebuilt_mesh_count += int(getattr(runtime_model" in composite_source
+    assert '"lightmap_preview"' in display_source
+    assert '"show_lightmap_map"' in display_source
 
 
 def test_qt_realistic_texture_prewarm_loads_detail_textures_without_paint_stall() -> None:
@@ -4191,7 +4259,10 @@ def test_qt_realistic_texture_prewarm_loads_detail_textures_without_paint_stall(
 def test_gpu_auto_clamp_diffuse_is_disabled_for_module_geometry() -> None:
     from types import SimpleNamespace
 
-    from src.core.rendering.gpu_diagnostics_records import _should_auto_clamp_diffuse
+    from src.core.rendering.gpu_diagnostics_records import (
+        _node_uses_single_tile_atlas,
+        _should_auto_clamp_diffuse,
+    )
 
     atlas_like_node = SimpleNamespace(
         txi_clamp_s=False,
@@ -4204,6 +4275,32 @@ def test_gpu_auto_clamp_diffuse_is_disabled_for_module_geometry() -> None:
 
     assert _should_auto_clamp_diffuse(atlas_like_node, is_module=False) is True
     assert _should_auto_clamp_diffuse(atlas_like_node, is_module=True) is False
+
+    # N_Mandalorianf's MandaHelmetMod reaches V=-0.144.  It is still one
+    # character-atlas island and must clamp; repeating it samples the red
+    # opposite edge of N_Mandalorian02 across the collar/chest.
+    mandalorian_atlas_node = SimpleNamespace(
+        txi_clamp_s=False,
+        txi_clamp_t=False,
+        animate_uv=False,
+        txi_proceduretype="",
+        txi_blending=0,
+        uvs=[(0.0, -0.14418), (0.71938, 0.97929)],
+    )
+    assert _node_uses_single_tile_atlas(mandalorian_atlas_node) is True
+    assert _should_auto_clamp_diffuse(mandalorian_atlas_node, is_module=False) is True
+
+    # The stock base-skin nodes are genuinely tiled and must retain repeat.
+    tiled_base_skin_node = SimpleNamespace(
+        txi_clamp_s=False,
+        txi_clamp_t=False,
+        animate_uv=False,
+        txi_proceduretype="",
+        txi_blending=0,
+        uvs=[(-12.86, 0.0), (12.86, 1.0)],
+    )
+    assert _node_uses_single_tile_atlas(tiled_base_skin_node) is False
+    assert _should_auto_clamp_diffuse(tiled_base_skin_node, is_module=False) is False
 
 
 def test_module_mesh_properties_panel_lists_selects_and_hides_meshes() -> None:
@@ -4642,8 +4739,14 @@ def test_moderngl_sprite_material_panel_state_reaches_renderer_shader() -> None:
     assert "sprite_emissive" in _FRAG_SRC
     assert "self._sprite_alpha_source(nd)" in render_source
     assert "not self._has_sprite_material_override(node)" in render_source
-    assert "_node_classification_signature(nodes)" in render_source
-    assert "_node_cache_signature" in invalidate_source
+    assert "_node_classification_signature(nodes)" not in render_source
+    assert "self._node_cache_built_revision != self._node_classification_revision" in render_source
+    assert "len(nodes) != self._node_cache_node_count" in render_source
+    assert "_gr_classification_revision" in render_source
+    revision = renderer._node_classification_revision
+    renderer.invalidate_node_cache()
+    assert renderer._node_classification_revision == revision + 1
+    assert "self._node_classification_revision += 1" in invalidate_source
 
 
 def test_kmax_scene_object_sprite_material_overrides_round_trip() -> None:
@@ -6778,6 +6881,38 @@ def test_wgpu_render_data_generates_area_weighted_normals_when_missing() -> None
     np.testing.assert_allclose(rows[0].normals, np.asarray([(0.0, 0.0, 1.0)] * 3, dtype=np.float32), atol=1e-6)
 
 
+def test_wgpu_render_data_respects_loose_texture_v_orientation_profile() -> None:
+    import numpy as np
+
+    from src.core.rendering.mesh_render_data import iter_mesh_render_data
+
+    node = SimpleNamespace(
+        name="dcc_atlas",
+        vertices=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        normals=[(0.0, 0.0, 1.0)] * 3,
+        uvs=[(0.1, 0.2), (0.9, 0.3), (0.2, 0.8)],
+        uvs_lm=[],
+        faces=[(0, 1, 2)],
+        face_uvs=[],
+        is_skin=False,
+        vertex_space=1,
+        render=True,
+        texture="dcc_atlas",
+        uv_v_flip=True,
+        alpha=1.0,
+    )
+    model = SimpleNamespace(all_nodes=lambda: [node])
+    bottom_left_texture = SimpleNamespace(size=(2, 2), _gr_gpu_uv_v_flip=False)
+
+    row = list(iter_mesh_render_data(model, textures={"dcc_atlas": bottom_left_texture}))[0]
+
+    np.testing.assert_allclose(
+        row.uvs0,
+        np.asarray([(0.1, 0.8), (0.9, 0.7), (0.2, 0.2)], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
 def test_wgpu_skinned_mesh_revision_changes_between_bind_and_lbs_modes(monkeypatch) -> None:
     import numpy as np
 
@@ -7023,7 +7158,8 @@ def test_qt_viewport_exposes_animation_playback_governor_and_live_overlay_skip()
     assert 'dirty_flags.get("scene", False)' in viewport_source
     assert "self._skip_overlay_pixmap_update = True" in viewport_source
     assert "governor is not None and governor.animation_playing" in viewport_source
-    assert "and not governor.animation_playing" in viewport_source
+    assert "and not governor.animation_playing" not in viewport_source
+    assert "if governor is not None and not governor.should_render_now(now):" in viewport_source
     assert "self.canvas.is_live_surface()" in viewport_source
     assert 'getattr(self._renderer, "_anim_pose", None) is not None' in viewport_source
     assert "self._render_timer.setTimerType(QtCore.Qt.PreciseTimer)" in viewport_source
@@ -10281,17 +10417,19 @@ def test_main_window_exposes_module_meshes_as_detachable_dock() -> None:
     assert "self.module_geometry_panel.set_module_browser_only(True)" in layout_source
     assert '"module_meshes"' in layout_source
     assert "self.module_meshes_panel_action" in actions_source
-    assert 'self._icon("module_meshes")' in actions_source
+    assert 'self._icon(MAIN_ACTION_ICON_KEYS["module_meshes"])' in actions_source
     assert "self.mesh_tools_panel_action" in actions_source
     assert 'self._icon("mesh_tools")' in actions_source
     assert "self.output_log_panel_action" in actions_source
     assert 'self._icon("output_log")' in actions_source
     assert "self.python_terminal_panel_action" in actions_source
     assert 'self._icon("python_terminal")' in actions_source
-    assert "modules_menu.addAction(self.module_meshes_panel_action)" in menu_source
-    assert "modules_menu.addAction(self.mesh_tools_panel_action)" in menu_source
-    assert "modules_menu.addAction(self.output_log_panel_action)" in menu_source
-    assert "modules_menu.addAction(self.python_terminal_panel_action)" in menu_source
+    assert 'window_menu = self.menuBar().addMenu("Window")' in menu_source
+    assert "self.module_meshes_panel_action," in menu_source
+    assert "self.mesh_tools_panel_action," in menu_source
+    assert "self.output_log_panel_action," in menu_source
+    assert "self.python_terminal_panel_action," in menu_source
+    assert "self._add_menu_action(window_menu, action)" in menu_source
     assert "self.module_geometry_panel.show_model(self._active_viewport_model())" in refresh_source
     assert "self.viewport.meshSelectionChanged.connect(self.module_geometry_panel.select_module_meshes)" in layout_source
     assert "self.viewport.meshVisibilityChanged.connect(self._on_viewport_mesh_visibility_changed)" in layout_source
@@ -12528,3 +12666,138 @@ def test_wgpu_frustum_culling_keeps_animated_skinned_meshes_visible() -> None:
     )
 
     assert renderer._mesh_data_outside_frustum(mesh, unit_cube_planes) is False
+
+
+def test_main_viewport_lighting_panel_applies_persisted_preview_controls() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from PySide6 import QtWidgets
+
+    from src.core.lighting.settings import LightingSettings
+    from src.gui.qt_lib.panels.qt_lighting_panel import QtLightingPanel
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = QtLightingPanel()
+    calls: list[tuple] = []
+    viewport = SimpleNamespace(
+        set_lighting_mode=lambda mode: calls.append(("lighting", mode)),
+        set_texture_map_enabled=lambda name, enabled: calls.append(("map", name, enabled)),
+        set_lightmap_settings=lambda intensity, mode: calls.append(("lightmap", intensity, mode)),
+        set_shader_complexity_mode=lambda mode: calls.append(("complexity", mode)),
+    )
+    panel._settings = LightingSettings(
+        scene_lighting_mode="fullbright",
+        diffuse_map=True,
+        normal_map=False,
+        environment_map=False,
+        specular_map=True,
+        lightmap_map=True,
+        lightmap_intensity=0.7,
+        lightmap_mode="baked",
+        shader_complexity_mode="lighting_cost",
+    )
+    try:
+        panel.apply_preview_settings_to_viewport(viewport)
+    finally:
+        panel.deleteLater()
+
+    assert calls == [
+        ("lighting", "fullbright"),
+        ("map", "diffuse", True),
+        ("map", "normal", False),
+        ("map", "environment", False),
+        ("map", "specular", True),
+        ("map", "lightmap", True),
+        ("lightmap", 0.7, "baked"),
+        ("complexity", "lighting_cost"),
+    ]
+
+
+def test_main_viewport_lighting_panel_reapplies_one_preview_rig_without_stacking() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from PySide6 import QtWidgets
+
+    from src.core.lighting.settings import LightingSettings
+    from src.gui.qt_lib.panels.qt_lighting_panel import QtLightingPanel
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = QtLightingPanel()
+    panel._settings = LightingSettings(selected_lighting_rig_preset="neutral_studio")
+    model = SimpleNamespace(all_nodes=lambda: [])
+    try:
+        panel.set_model(model)
+        first_nodes = list(getattr(model, "_gr_generated_lights", []) or [])
+        panel.set_model(model)
+        second_nodes = list(getattr(model, "_gr_generated_lights", []) or [])
+    finally:
+        panel.deleteLater()
+
+    assert len(first_nodes) == 3
+    assert len(second_nodes) == 3
+    assert all(str(getattr(node, "source_type", "")) == "GeneratedRig" for node in second_nodes)
+    assert all(bool(getattr(node, "light_enabled", False)) for node in second_nodes)
+    assert all(bool(getattr(node, "_gr_light_deleted", False)) for node in first_nodes)
+
+
+def test_main_viewport_syncs_lighting_on_construction_and_regular_model_load() -> None:
+    from src.gui.windows.application_core.shared.main_layout import MainWindowLayoutMixin
+    from src.gui.windows.application_core.shared.resource_loading import ResourceLoadingMixin
+
+    expected = "self.lighting_panel.apply_preview_settings_to_viewport(self.viewport)"
+    assert expected in inspect.getsource(MainWindowLayoutMixin._build_layout)
+    assert expected in inspect.getsource(ResourceLoadingMixin._on_model_loaded)
+
+
+def test_moderngl_lightmap_preview_mode_preserves_baked_shading() -> None:
+    from src.adapters.rendering.moderngl_renderer_impl import GpuRenderer
+
+    renderer = GpuRenderer()
+    uniforms = {
+        "u_scene_lighting": SimpleNamespace(value=-1),
+        "u_scene_ambient": SimpleNamespace(value=-1.0),
+        "u_scene_light_count": SimpleNamespace(value=-1),
+    }
+
+    renderer.lighting_mode = "lightmap_preview"
+    renderer._upload_scene_lights(None, uniforms, [])
+    assert uniforms["u_scene_lighting"].value == 3
+
+    renderer.lighting_mode = "fullbright"
+    renderer._upload_scene_lights(None, uniforms, [])
+    assert uniforms["u_scene_lighting"].value == 0
+
+    renderer.lighting_mode = "scene"
+    renderer._upload_scene_lights(None, uniforms, [])
+    assert uniforms["u_scene_lighting"].value == 1
+
+
+def test_generated_ambient_preview_lights_are_global_in_moderngl() -> None:
+    from src.adapters.rendering.moderngl_renderer_impl import GpuRenderer
+    from src.core.lighting.lighting_rig_presets import LightingRigPresets
+    from src.core.rendering.gpu_shaders import _FRAG_SRC
+
+    lights = LightingRigPresets.create("exterior_moonlight")
+    ambient = next(light for light in lights if light.type == "ambient")
+    assert ambient.ambient_only is True
+
+    node = SimpleNamespace(
+        is_light=True,
+        light_enabled=True,
+        light_kind="ambient",
+        light_ambient_only=ambient.ambient_only,
+        light_color=ambient.color,
+        light_radius=ambient.radius,
+        light_multiplier=ambient.intensity,
+        light_cone_degrees=ambient.cone_angle,
+        light_area_size=ambient.area_size,
+    )
+    record = GpuRenderer()._scene_light_records(
+        [node],
+        lambda _node: ((1000.0, 1000.0, 1000.0), (0.0, 0.0, 0.0, 1.0)),
+    )[0]
+
+    assert record["kind"] == 4
+    assert record["ambient_only"] == 1
+    assert "else if (kind == 4)" in _FRAG_SRC
+    assert "u_scene_light_ambient_only[i] == 1 || kind == 4" in _FRAG_SRC

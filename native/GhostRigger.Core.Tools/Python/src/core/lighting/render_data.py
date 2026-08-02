@@ -42,6 +42,7 @@ class SceneLightRenderData:
     hovered: bool
     visible: bool
     revision: int
+    helper_visible: bool = True
     active_selected: bool = False
     original_ref: object | None = field(default=None, compare=False)
 
@@ -135,6 +136,53 @@ def build_scene_lighting_render_data(
     )
 
 
+def scene_light_relevance_key(
+    *,
+    position: object,
+    radius: object,
+    intensity: object,
+    reference_position: object | None = None,
+    light_type: object = "point",
+    color_rgb: object = (1.0, 1.0, 1.0),
+) -> tuple[int, float, float, float, float]:
+    """Rank a bounded viewport-light upload around the visible scene focus.
+
+    GPU backends have finite light arrays.  Ranking only by ``radius *
+    intensity`` keeps large distant lights and can discard a smaller light that
+    actually contains the player or camera target.  This deterministic key
+    keeps global directional lights first, then ranks intersecting local lights
+    by their estimated attenuated luminance at ``reference_position``.  When no
+    reference is available it preserves the legacy radius/energy ordering.
+    """
+
+    clean_radius = _finite_non_negative(radius, 0.001, minimum=0.001)
+    clean_intensity = _finite_non_negative(intensity, 0.0)
+    color = _color(color_rgb)
+    luminance = max(0.01, 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2])
+    energy = clean_intensity * luminance
+    raw_kind = str(light_type or "point").strip().lower()
+    kind = raw_kind.replace("aurora_", "")
+
+    if kind == "directional" or raw_kind == "ambient":
+        return (2, energy, clean_radius, 0.0, 0.0)
+
+    reference = _finite_vec3(reference_position)
+    light_position = _finite_vec3(position)
+    if reference is None or light_position is None:
+        return (0, clean_radius * max(0.01, clean_intensity), clean_radius, clean_intensity, 0.0)
+
+    distance = math.sqrt(sum((light_position[index] - reference[index]) ** 2 for index in range(3)))
+    falloff = max(0.0, 1.0 - (distance / clean_radius))
+    if falloff > 0.0:
+        influence = energy * falloff * falloff
+        return (1, influence, -distance, clean_radius, energy)
+
+    # If no uploaded light reaches the focus, prefer the one whose radius is
+    # closest to reaching it; stable sort order resolves exact ties.
+    gap = max(0.0, distance - clean_radius)
+    return (0, -gap, clean_radius * max(0.01, energy), -distance, energy)
+
+
 def light_kind_int(light_type: str) -> int:
     raw = str(light_type or "point").strip().lower()
     if raw == "aurora_ambient":
@@ -156,7 +204,7 @@ def build_light_helper_line_batches(lighting: SceneLightingRenderData | None) ->
         return []
     batches: dict[tuple[float, float, float], list[Vec3]] = {}
     for light in lighting.lights:
-        if not light.visible:
+        if not light.visible or not light.helper_visible:
             continue
         color = _helper_color(light, getattr(lighting, "helper_palette", None))
         vertices = _marker_lines(light)
@@ -171,7 +219,7 @@ def build_light_volume_line_batches(lighting: SceneLightingRenderData | None) ->
         return []
     batches: dict[tuple[float, float, float], list[Vec3]] = {}
     for light in lighting.lights:
-        if not light.visible:
+        if not light.visible or not light.helper_visible:
             continue
         color = _helper_color(light, getattr(lighting, "helper_palette", None))
         vertices = _volume_lines(light)
@@ -235,6 +283,7 @@ def _light_from_node(
         hovered=node is hovered_node,
         visible=not bool(getattr(node, "_gr_light_hidden", False)) and not bool(getattr(node, "_gr_light_deleted", False)),
         revision=int(getattr(node, "_gr_light_revision", 0) or 0),
+        helper_visible=not bool(getattr(node, "_gr_light_helper_hidden", False)),
         original_ref=node,
     )
 
@@ -245,6 +294,7 @@ def _lighting_revision(lights: tuple[SceneLightRenderData, ...], *settings: obje
             light.node_id,
             light.enabled,
             light.visible,
+            light.helper_visible,
             light.selected,
             light.active_selected,
             light.light_type,
@@ -270,6 +320,28 @@ def _ambient_tuple(value: Color | float) -> Color:
         ambient = max(0.0, float(value))
         return (ambient, ambient, ambient)
     return _color(value, fallback=(0.06, 0.06, 0.06))
+
+
+def _finite_non_negative(value: object, fallback: float, *, minimum: float = 0.0) -> float:
+    try:
+        clean = float(value)
+    except (TypeError, ValueError):
+        clean = float(fallback)
+    if not math.isfinite(clean):
+        clean = float(fallback)
+    return max(float(minimum), clean)
+
+
+def _finite_vec3(value: object | None) -> Vec3 | None:
+    if value is None:
+        return None
+    try:
+        seq = tuple(float(channel) for channel in value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if len(seq) < 3 or not all(math.isfinite(channel) for channel in seq[:3]):
+        return None
+    return (seq[0], seq[1], seq[2])
 
 
 def _vec3(value: object, fallback: Vec3 = (0.0, 0.0, 0.0)) -> Vec3:

@@ -17,13 +17,14 @@ Architecture note (Constantine, "Structured Design"):
   are context-free — the same tool works in a Discord bot, VS Code extension,
   CI pipeline, or any other consumer without modification.
 
-  Tool manifest (v3.7 — 74 total):
+  Tool manifest (v3.14 — 169 total):
   Installation   (3): detectInstallations, loadInstallation, kotor_installation_info
   Discovery      (4): listResources, describeResource, kotor_find_resource, kotor_search_resources
   Game data      (3): journalOverview, kotor_lookup_2da, kotor_lookup_tlk
-  GhostRigger    (8): ghostrigger_open_model, ghostrigger_render_model, ghostrigger_model_info,
+  GhostRigger    (9): ghostrigger_open_model, ghostrigger_render_model, ghostrigger_model_info,
                       ghostrigger_list_game_models, ghostrigger_audit,
-                      ghostrigger_export_model_for_unity, ghostrigger_validate_unity_import,
+                      ghostrigger_export_model_for_unity, ghostrigger_export_model_for_unreal,
+                      ghostrigger_validate_unity_import,
                       ghostrigger_run_malak_unity_smoke
   DebugSkinning (25): ghostrigger_debug_launch_app, ghostrigger_debug_close_app,
                       ghostrigger_debug_get_runtime_status, ghostrigger_debug_set_game_library_path,
@@ -39,6 +40,14 @@ Architecture note (Constantine, "Structured Design"):
                       ghostrigger_debug_sample_vertex_influences, ghostrigger_debug_compare_cpu_gpu_skinning,
                       ghostrigger_debug_export_debug_bundle
   Modules        (3): kotor_list_modules, kotor_describe_module, kotor_module_resources
+  Game test      (2): kotor_list_saves, kotor_prepare_save_warp_test
+  Game input     (5): kotor_input_status, kotor_input_click,
+                      kotor_input_type, kotor_capture_window,
+                      kotor_run_save_warp_route
+  Live log       (4): kotor_log_start, kotor_log_status,
+                      kotor_log_stop, kotor_log_analyze
+  DInput hook    (3): kotor_dinput_hook_status, kotor_dinput_hook_install,
+                      kotor_dinput_hook_send
   GFF data       (3): kotor_read_gff, kotor_read_2da, kotor_read_tlk
   AgentDecompile (11): kotor_binary_ping, kotor_binary_info, kotor_list_engine_funcs,
                        kotor_decompile_function, kotor_search_symbols,
@@ -51,10 +60,17 @@ Architecture note (Constantine, "Structured Design"):
                       kotor_describe_jrl, kotor_describe_resource_refs
   Walkmesh       (1): kotor_walkmesh_validation_diagram
   Archives       (2): kotor_list_archive, kotor_extract_resource
+  DebugMaterials (16): material/texture/render assembly debug tools
   Retargeting    (4): ghostrigger_get_retarget_skeleton_info,
                       ghostrigger_build_retarget_map,
                       ghostrigger_list_retarget_animations,
                       ghostrigger_export_unity_fbx
+  ModelPipeline  (3): inspect_mdl, inspect_mdl_ghostrigger,
+                      compare_model_pipelines
+  Legacy surface (52): 51 safe GhostScripter compatibility names plus one
+                       machine-readable compatibility report.  Eight broad
+                       mutation names remain inventoried behind owned,
+                       validated project services rather than arbitrary writes.
 """
 
 from __future__ import annotations
@@ -65,8 +81,10 @@ from kotormcp.utils import json_content
 from kotormcp.tools import (
     installation, discovery, gamedata, ghostrigger,
     debug_skinning, debug_materials,
-    modules, gffdata, decompile, resource, quest,
+    modules, game_test, kotor_input, kotor_live_log, kotor_dinput_hook,
+    gffdata, decompile, resource, quest,
     refs, walkmesh, archives, retargeting, ghostrigger_tools,
+    legacy_ghostscripter,
 )
 
 
@@ -107,15 +125,9 @@ def _model_pipeline_tools() -> List[Dict[str, Any]]:
     ]
 
 
-def get_all_tools() -> List[Dict[str, Any]]:
-    """Return all tool definitions from all tool modules.
+def _native_tools() -> List[Dict[str, Any]]:
+    """Return GhostStudio's native tool definitions before name aliases."""
 
-    Tool count: 74 (v3.7)
-      3  installation  +  4 discovery  +  3 gamedata  +  7 ghostrigger
-    + 25 debug_skinning + 3  modules   +  3 gffdata   + 11 decompile
-    +  2 composite     +  6  refs      +  1 walkmesh  +  2 archives
-    +  4 retargeting   = 74
-    """
     return (
         installation.get_tools()          # 3  installation management
         + discovery.get_tools()           # 4  resource discovery
@@ -123,6 +135,10 @@ def get_all_tools() -> List[Dict[str, Any]]:
         + ghostrigger.get_tools()         # 5  3D model pipeline
         + debug_skinning.get_tools()      # 25 debug skinning bridge
         + modules.get_tools()             # 3  module enumeration
+        + game_test.get_tools()           # 2  live game-test handoff
+        + kotor_input.get_tools()         # 5  live game-window input
+        + kotor_live_log.get_tools()      # 4  live exe-hook logging
+        + kotor_dinput_hook.get_tools()   # 3  DirectInput proxy deployment/input
         + gffdata.get_tools()             # 3  deep GFF/2DA/TLK reads
         + decompile.get_tools()           # 11 AgentDecompile / Ghidra bridge
         + resource.get_tools()            # 1  get_resource: universal accessor
@@ -136,8 +152,22 @@ def get_all_tools() -> List[Dict[str, Any]]:
     )
 
 
+def get_all_tools() -> List[Dict[str, Any]]:
+    """Return 109 native tools plus 60 clean-room compatibility definitions."""
+
+    native = _native_tools()
+    return native + legacy_ghostscripter.get_tools(native)
+
+
 async def handle_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Dispatch tool invocation to the correct handler."""
+    legacy_target = legacy_ghostscripter.resolve_direct_alias(name, arguments)
+    if legacy_target is not None:
+        target_name, adapted_arguments = legacy_target
+        return await handle_tool(target_name, adapted_arguments)
+    if legacy_ghostscripter.handles_service_alias(name):
+        return await legacy_ghostscripter.handle_service_alias(name, arguments)
+
     # ── Installation tools ────────────────────────────────────────────────────
     if name == "detectInstallations":
         return await installation.handle_detect_installations(arguments)
@@ -177,6 +207,8 @@ async def handle_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         return await ghostrigger.handle_audit(arguments)
     if name == "ghostrigger_export_model_for_unity":
         return await ghostrigger.handle_export_model_for_unity(arguments)
+    if name == "ghostrigger_export_model_for_unreal":
+        return await ghostrigger.handle_export_model_for_unreal(arguments)
     if name == "ghostrigger_validate_unity_import":
         return await ghostrigger.handle_validate_unity_import(arguments)
     if name == "ghostrigger_run_malak_unity_smoke":
@@ -204,6 +236,34 @@ async def handle_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         return await modules.handle_describe_module(arguments)
     if name == "kotor_module_resources":
         return await modules.handle_module_resources(arguments)
+    if name == "kotor_list_saves":
+        return await game_test.handle_list_saves(arguments)
+    if name == "kotor_prepare_save_warp_test":
+        return await game_test.handle_prepare_save_warp_test(arguments)
+    if name == "kotor_input_status":
+        return await kotor_input.handle_status(arguments)
+    if name == "kotor_input_click":
+        return await kotor_input.handle_click(arguments)
+    if name == "kotor_input_type":
+        return await kotor_input.handle_type(arguments)
+    if name == "kotor_capture_window":
+        return await kotor_input.handle_capture_window(arguments)
+    if name == "kotor_run_save_warp_route":
+        return await kotor_input.handle_run_save_warp_route(arguments)
+    if name == "kotor_log_start":
+        return await kotor_live_log.handle_start(arguments)
+    if name == "kotor_log_status":
+        return await kotor_live_log.handle_status(arguments)
+    if name == "kotor_log_stop":
+        return await kotor_live_log.handle_stop(arguments)
+    if name == "kotor_log_analyze":
+        return await kotor_live_log.handle_analyze(arguments)
+    if name == "kotor_dinput_hook_status":
+        return await kotor_dinput_hook.handle_status(arguments)
+    if name == "kotor_dinput_hook_install":
+        return await kotor_dinput_hook.handle_install(arguments)
+    if name == "kotor_dinput_hook_send":
+        return await kotor_dinput_hook.handle_send(arguments)
 
     # ── Deep read tools ───────────────────────────────────────────────────────
     if name == "kotor_read_gff":

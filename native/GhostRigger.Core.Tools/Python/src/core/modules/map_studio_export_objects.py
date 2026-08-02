@@ -19,7 +19,11 @@ from .authored_module_project import (
 from .authored_room_composition import AuthoredRoomComposition, PlacedRoomPrimitive
 from .authored_room_floorplan import FloorPlanRoomPrimitive
 from .authored_room_geometry import RectangularRoomPrimitive
-from .authored_terrain_builder import TerrainHeightfieldPrimitive
+from .authored_terrain_builder import (
+    TerrainHeightfieldPrimitive,
+    analyse_terrain_slopes,
+    validate_terrain_heightfield_primitive,
+)
 
 
 @dataclass(frozen=True)
@@ -34,11 +38,42 @@ class MapStudioExportObjectBoundary:
     resources: tuple[tuple[str, str], ...]
     primitive_type: str
     primitive_count: int = 0
+    member_primitive_names: tuple[str, ...] = ()
     helper_mesh_count: int = 0
     render_mesh_count: int = 0
     walkmesh_face_count: int = 0
     walkable_face_count: int = 0
     material_textures: tuple[str, ...] = ()
+    duplicate_special_status: str = "not_authored"
+    duplicate_special_summary: str = "No Duplicate Special authored instances recorded."
+    duplicate_special_batch_count: int = 0
+    duplicate_special_generated_names: tuple[str, ...] = ()
+    duplicate_special_batches: tuple[dict[str, Any], ...] = ()
+    terrain_authoring_status: str = "not_terrain"
+    terrain_authoring_summary: str = "Not an authored terrain heightfield."
+    terrain_last_operation: str = ""
+    terrain_last_brush: str = ""
+    terrain_dirty_region: dict[str, Any] | None = None
+    terrain_height_rows: int = 0
+    terrain_height_columns: int = 0
+    terrain_height_min: float | None = None
+    terrain_height_max: float | None = None
+    terrain_height_range: float | None = None
+    terrain_max_slope_degrees: float | None = None
+    terrain_non_walk_triangle_count: int = 0
+    terrain_validation_status: str = "not_terrain"
+    terrain_validation_summary: str = "Not an authored terrain heightfield."
+    normal_cleanup_status: str = "not_authored"
+    normal_cleanup_summary: str = "No authored floor-plan normal cleanup recorded."
+    normal_cleanup_positive_z: bool | None = None
+    normal_policy_status: str = "default_exporter_normals"
+    normal_policy_summary: str = "Default exporter normals; no authored soften/harden edge policy."
+    edge_normal_policy_targets: tuple[dict[str, Any], ...] = ()
+    bounds_coordinate_space: str = ""
+    bounds_min: tuple[float, float, float] | None = None
+    bounds_max: tuple[float, float, float] | None = None
+    center: tuple[float, float, float] | None = None
+    dimensions: tuple[float, float, float] | None = None
     uv_handoff_recommended: bool = False
     dcc_handoff_status: str = "keep_in_map_studio"
     dcc_handoff_reason: str = ""
@@ -62,11 +97,42 @@ class MapStudioExportObjectBoundary:
             "resources": [[resref, restype] for resref, restype in self.resources],
             "primitive_type": self.primitive_type,
             "primitive_count": self.primitive_count,
+            "member_primitive_names": list(self.member_primitive_names),
             "helper_mesh_count": self.helper_mesh_count,
             "render_mesh_count": self.render_mesh_count,
             "walkmesh_face_count": self.walkmesh_face_count,
             "walkable_face_count": self.walkable_face_count,
             "material_textures": list(self.material_textures),
+            "duplicate_special_status": self.duplicate_special_status,
+            "duplicate_special_summary": self.duplicate_special_summary,
+            "duplicate_special_batch_count": self.duplicate_special_batch_count,
+            "duplicate_special_generated_names": list(self.duplicate_special_generated_names),
+            "duplicate_special_batches": [dict(row) for row in self.duplicate_special_batches],
+            "terrain_authoring_status": self.terrain_authoring_status,
+            "terrain_authoring_summary": self.terrain_authoring_summary,
+            "terrain_last_operation": self.terrain_last_operation,
+            "terrain_last_brush": self.terrain_last_brush,
+            "terrain_dirty_region": dict(self.terrain_dirty_region or {}),
+            "terrain_height_rows": self.terrain_height_rows,
+            "terrain_height_columns": self.terrain_height_columns,
+            "terrain_height_min": self.terrain_height_min,
+            "terrain_height_max": self.terrain_height_max,
+            "terrain_height_range": self.terrain_height_range,
+            "terrain_max_slope_degrees": self.terrain_max_slope_degrees,
+            "terrain_non_walk_triangle_count": self.terrain_non_walk_triangle_count,
+            "terrain_validation_status": self.terrain_validation_status,
+            "terrain_validation_summary": self.terrain_validation_summary,
+            "normal_cleanup_status": self.normal_cleanup_status,
+            "normal_cleanup_summary": self.normal_cleanup_summary,
+            "normal_cleanup_positive_z": self.normal_cleanup_positive_z,
+            "normal_policy_status": self.normal_policy_status,
+            "normal_policy_summary": self.normal_policy_summary,
+            "edge_normal_policy_targets": [dict(row) for row in self.edge_normal_policy_targets],
+            "bounds_coordinate_space": self.bounds_coordinate_space,
+            "bounds_min": list(self.bounds_min) if self.bounds_min is not None else [],
+            "bounds_max": list(self.bounds_max) if self.bounds_max is not None else [],
+            "center": list(self.center) if self.center is not None else [],
+            "dimensions": list(self.dimensions) if self.dimensions is not None else [],
             "uv_handoff_recommended": self.uv_handoff_recommended,
             "dcc_handoff_status": self.dcc_handoff_status,
             "dcc_handoff_reason": self.dcc_handoff_reason,
@@ -89,6 +155,10 @@ def _base_primitive(value: Any) -> Any:
     return value.primitive if isinstance(value, PlacedRoomPrimitive) else value
 
 
+def _placed_primitive_name(value: Any) -> str:
+    return str(getattr(value, "name", "") or "").strip()
+
+
 def _composition_textures(composition: AuthoredRoomComposition) -> tuple[str, ...]:
     textures: list[str] = []
     floor_texture = _primitive_texture(composition.floor)
@@ -99,6 +169,224 @@ def _composition_textures(composition: AuthoredRoomComposition) -> tuple[str, ..
         if texture:
             textures.append(texture)
     return tuple(dict.fromkeys(textures))
+
+
+def _duplicate_special_batches(primitive: Any, metadata: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    primitive_metadata = dict(getattr(primitive, "metadata", {}) or {})
+    values = primitive_metadata.get("duplicate_special_batches")
+    if not isinstance(values, (list, tuple)):
+        values = metadata.get("duplicate_special_batches")
+    batches: list[dict[str, Any]] = []
+    if isinstance(values, (list, tuple)):
+        for value in values:
+            if isinstance(value, dict):
+                batches.append(dict(value))
+    return tuple(batches)
+
+
+def _duplicate_special_generated_names(batches: tuple[dict[str, Any], ...]) -> tuple[str, ...]:
+    names: list[str] = []
+    for batch in batches:
+        values = batch.get("generated_primitive_names")
+        if isinstance(values, (str, bytes)):
+            text = values.decode("utf-8", errors="ignore") if isinstance(values, bytes) else values
+            names.extend(part.strip() for part in text.split(",") if part.strip())
+        elif isinstance(values, (list, tuple)):
+            names.extend(str(value or "").strip() for value in values if str(value or "").strip())
+    return tuple(dict.fromkeys(names))
+
+
+def _duplicate_special_status(batches: tuple[dict[str, Any], ...]) -> str:
+    return "authored_duplicate_instances" if batches else "not_authored"
+
+
+def _duplicate_special_summary(batches: tuple[dict[str, Any], ...]) -> str:
+    if not batches:
+        return "No Duplicate Special authored instances recorded."
+    names = _duplicate_special_generated_names(batches)
+    source_names = tuple(
+        dict.fromkeys(
+            str(batch.get("source_primitive") or "").strip()
+            for batch in batches
+            if str(batch.get("source_primitive") or "").strip()
+        )
+    )
+    source_text = ", ".join(source_names[:3]) if source_names else "selected primitive"
+    suffix = "" if len(source_names) <= 3 else f", +{len(source_names) - 3} more"
+    return (
+        f"Duplicate Special authored {len(names)} modular instance(s) from {source_text}{suffix}; "
+        "instances remain KMAP primitives until an explicit bake/separate/export step."
+    )
+
+
+def _duplicate_special_batches_for_members(
+    batches: tuple[dict[str, Any], ...],
+    member_names: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    if not batches or not member_names:
+        return ()
+    members = set(member_names)
+    filtered: list[dict[str, Any]] = []
+    for batch in batches:
+        generated = set(_duplicate_special_generated_names((batch,)))
+        source = str(batch.get("source_primitive") or "").strip()
+        if generated.intersection(members) or source in members:
+            filtered.append(dict(batch))
+    return tuple(filtered)
+
+
+def _normal_policy_entry(target: str, source: dict[str, Any]) -> dict[str, Any] | None:
+    policy = str(source.get("edge_normal_policy") or "").strip().lower()
+    if not policy:
+        return None
+    edges = source.get("edge_normal_policy_edges")
+    if isinstance(edges, (list, tuple)):
+        edge_values = [int(edge) for edge in edges]
+    else:
+        edge_values = []
+    return {
+        "target": str(target or "room"),
+        "policy": policy,
+        "operation": str(source.get("edge_normal_policy_operation") or ""),
+        "scope": str(source.get("edge_normal_policy_scope") or "all_edges"),
+        "edge_count": int(source.get("edge_normal_policy_edge_count") or 0),
+        "coordinate_space": str(source.get("edge_normal_policy_coordinate_space") or ""),
+        "edges": edge_values,
+    }
+
+
+def _normal_cleanup_positive_z(primitive: Any, metadata: dict[str, Any]) -> bool | None:
+    primitive_metadata = dict(getattr(primitive, "metadata", {}) or {})
+    for source in (primitive_metadata, metadata):
+        if "normal_cleanup_positive_z" in source:
+            return bool(source.get("normal_cleanup_positive_z"))
+    return None
+
+
+def _normal_cleanup_status(positive_z: bool | None) -> str:
+    if positive_z is True:
+        return "authored_positive_z_winding"
+    if positive_z is False:
+        return "authored_negative_z_winding"
+    return "not_authored"
+
+
+def _normal_cleanup_summary(positive_z: bool | None) -> str:
+    if positive_z is True:
+        return "Authored floor-plan normal cleanup targets positive-Z room/WOK winding for export review."
+    if positive_z is False:
+        return (
+            "Authored floor-plan normal cleanup intentionally targets negative-Z winding; "
+            "validate culling and WOK collision before export/game proof."
+        )
+    return "No authored floor-plan normal cleanup recorded."
+
+
+def _normal_policy_targets(primitive: Any, metadata: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    targets: list[dict[str, Any]] = []
+    primitive_metadata = dict(getattr(primitive, "metadata", {}) or {})
+    by_target = primitive_metadata.get("edge_normal_policy_by_target")
+    has_targeted_policy = isinstance(by_target, dict) and bool(by_target)
+    if not has_targeted_policy:
+        room_entry = _normal_policy_entry("room", primitive_metadata) or _normal_policy_entry("room", metadata)
+        if room_entry is not None:
+            targets.append(room_entry)
+    if isinstance(by_target, dict):
+        for target_name in sorted(str(name or "").strip() for name in by_target if str(name or "").strip()):
+            target_entry = by_target.get(target_name)
+            if isinstance(target_entry, dict):
+                entry = _normal_policy_entry(target_name, dict(target_entry))
+                if entry is not None:
+                    targets.append(entry)
+    return tuple(targets)
+
+
+def _normal_policy_targets_for_members(
+    composition: AuthoredRoomComposition,
+    member_names: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    if not member_names:
+        return ()
+    wanted = set(member_names)
+    return tuple(row for row in _normal_policy_targets(composition, {}) if str(row.get("target") or "") in wanted)
+
+
+def _normal_policy_status(targets: tuple[dict[str, Any], ...]) -> str:
+    return "authored_visual_normal_policy" if targets else "default_exporter_normals"
+
+
+def _normal_policy_summary(targets: tuple[dict[str, Any], ...]) -> str:
+    if not targets:
+        return "Default exporter normals; no authored soften/harden edge policy."
+    parts = []
+    for row in targets[:4]:
+        policy = str(row.get("policy") or "authored")
+        target = str(row.get("target") or "room")
+        scope = str(row.get("scope") or "all_edges")
+        edge_count = int(row.get("edge_count") or 0)
+        selected_edges = tuple(row.get("edges") or ())
+        selected_count = len(selected_edges) if selected_edges else edge_count
+        if scope == "selected_edges" and edge_count:
+            parts.append(f"{policy} {selected_count} {target} edge(s)")
+        else:
+            parts.append(f"{policy} {target} {scope}")
+    suffix = "" if len(targets) <= 4 else f"; +{len(targets) - 4} more"
+    return "Authored visual-normal policy: " + "; ".join(parts) + suffix + ". WOK traversal remains validated separately."
+
+
+def _composition_primitives_by_name(composition: AuthoredRoomComposition) -> dict[str, PlacedRoomPrimitive]:
+    return {
+        name: primitive
+        for primitive in tuple(composition.primitives or ())
+        if isinstance(primitive, PlacedRoomPrimitive) and (name := _placed_primitive_name(primitive))
+    }
+
+
+def _group_member_names(group: dict[str, Any]) -> tuple[str, ...]:
+    values = group.get("primitive_names")
+    if isinstance(values, (str, bytes)):
+        text = values.decode("utf-8", errors="ignore") if isinstance(values, bytes) else values
+        return tuple(dict.fromkeys(part.strip() for part in text.split(",") if part.strip()))
+    if isinstance(values, (list, tuple)):
+        return tuple(dict.fromkeys(str(value or "").strip() for value in values if str(value or "").strip()))
+    return ()
+
+
+def _vec3_from_group(group: dict[str, Any], key: str) -> tuple[float, float, float] | None:
+    values = group.get(key)
+    if not isinstance(values, (list, tuple)) or len(values) < 3:
+        return None
+    try:
+        return (float(values[0]), float(values[1]), float(values[2]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _mesh_vertices(mesh: Any) -> tuple[tuple[float, float, float], ...]:
+    vertices: list[tuple[float, float, float]] = []
+    for vertex in tuple(getattr(mesh, "vertices", ()) or ()):
+        if not isinstance(vertex, (list, tuple)) or len(vertex) < 3:
+            continue
+        try:
+            vertices.append((float(vertex[0]), float(vertex[1]), float(vertex[2])))
+        except (TypeError, ValueError):
+            continue
+    return tuple(vertices)
+
+
+def _bounds_from_vertices(
+    vertices: tuple[tuple[float, float, float], ...],
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None:
+    if not vertices:
+        return None
+    xs = tuple(vertex[0] for vertex in vertices)
+    ys = tuple(vertex[1] for vertex in vertices)
+    zs = tuple(vertex[2] for vertex in vertices)
+    bounds_min = (min(xs), min(ys), min(zs))
+    bounds_max = (max(xs), max(ys), max(zs))
+    center = tuple((bounds_min[index] + bounds_max[index]) * 0.5 for index in range(3))  # type: ignore[return-value]
+    dimensions = tuple(max(0.0, bounds_max[index] - bounds_min[index]) for index in range(3))  # type: ignore[return-value]
+    return bounds_min, bounds_max, center, dimensions
 
 
 def _object_kind(primitive: Any, metadata: dict[str, Any]) -> str:
@@ -123,6 +411,94 @@ def _primitive_count(primitive: Any) -> int:
         cols = len(tuple(primitive.heights[0] or ())) if rows else 0
         return rows * cols
     return 1
+
+
+def _terrain_authoring_state(primitive: Any, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return terrain-specific readiness/export facts for status panels."""
+
+    if not isinstance(primitive, TerrainHeightfieldPrimitive):
+        return {
+            "terrain_authoring_status": "not_terrain",
+            "terrain_authoring_summary": "Not an authored terrain heightfield.",
+            "terrain_last_operation": "",
+            "terrain_last_brush": "",
+            "terrain_dirty_region": None,
+            "terrain_height_rows": 0,
+            "terrain_height_columns": 0,
+            "terrain_height_min": None,
+            "terrain_height_max": None,
+            "terrain_height_range": None,
+            "terrain_max_slope_degrees": None,
+            "terrain_non_walk_triangle_count": 0,
+            "terrain_validation_status": "not_terrain",
+            "terrain_validation_summary": "Not an authored terrain heightfield.",
+        }
+
+    primitive_metadata = dict(getattr(primitive, "metadata", {}) or {})
+    rows = tuple(tuple(float(value) for value in tuple(row or ())) for row in tuple(primitive.heights or ()))
+    row_count = len(rows)
+    column_count = len(rows[0]) if rows else 0
+    values = tuple(value for row in rows for value in row)
+    height_min = min(values) if values else None
+    height_max = max(values) if values else None
+    height_range = (float(height_max) - float(height_min)) if height_min is not None and height_max is not None else None
+    last_operation = str(primitive_metadata.get("last_operation") or "").strip() or _source_operation(
+        primitive=primitive,
+        metadata=metadata,
+    )
+    last_brush = str(primitive_metadata.get("last_brush") or "").strip()
+    dirty_region = primitive_metadata.get("last_dirty_region")
+    dirty_payload = dict(dirty_region) if isinstance(dirty_region, dict) else None
+
+    validation = validate_terrain_heightfield_primitive(primitive)
+    if validation.ok:
+        slope_report = analyse_terrain_slopes(primitive)
+        validation_status = "valid_heightfield_needs_gameplay_proof"
+        validation_summary = (
+            f"Terrain heightfield is structurally valid with {slope_report.non_walk_triangle_count} "
+            f"non-walk triangle(s); run WOK/export validation and game proof before calling it game-ready."
+        )
+        max_slope = float(slope_report.max_slope_degrees)
+        non_walk = int(slope_report.non_walk_triangle_count)
+    else:
+        validation_status = "blocked_invalid_heightfield"
+        validation_summary = "; ".join(validation.blocking_issues)
+        max_slope = None
+        non_walk = 0
+
+    if last_brush:
+        changed_count = int((dirty_payload or {}).get("changed_sample_count") or 0)
+        authoring_status = "dirty_region_sculpted"
+        authoring_summary = (
+            f"Last terrain brush '{last_brush}' changed {changed_count} sample(s) in a dirty region; "
+            "full MDL/WOK rebuild waits for validation or staged export."
+        )
+    elif last_operation and last_operation != "authored_room":
+        authoring_status = "heightfield_operation_authored"
+        authoring_summary = (
+            f"Last terrain operation '{last_operation}' changed the heightfield; "
+            "validate slope, WOK faces, placements, and game proof before release."
+        )
+    else:
+        authoring_status = "terrain_heightfield_authored"
+        authoring_summary = "Terrain heightfield is editable in Map Studio; sculpt, validate WOK, then stage export."
+
+    return {
+        "terrain_authoring_status": authoring_status,
+        "terrain_authoring_summary": authoring_summary,
+        "terrain_last_operation": last_operation,
+        "terrain_last_brush": last_brush,
+        "terrain_dirty_region": dirty_payload,
+        "terrain_height_rows": row_count,
+        "terrain_height_columns": column_count,
+        "terrain_height_min": height_min,
+        "terrain_height_max": height_max,
+        "terrain_height_range": height_range,
+        "terrain_max_slope_degrees": max_slope,
+        "terrain_non_walk_triangle_count": non_walk,
+        "terrain_validation_status": validation_status,
+        "terrain_validation_summary": validation_summary,
+    }
 
 
 def _object_notes(*, primitive: Any, metadata: dict[str, Any], resref: str) -> tuple[str, ...]:
@@ -186,6 +562,110 @@ def _dcc_handoff_state(
     return "ready_for_external_uv", "Room boundary can be UV/textured externally while preserving its MDL/MDX/WOK resref triplet."
 
 
+def _composition_group_boundaries(
+    *,
+    composition: AuthoredRoomComposition,
+    resref: str,
+) -> tuple[MapStudioExportObjectBoundary, ...]:
+    """Return export/readiness projections for authored combined primitive groups."""
+
+    groups = tuple(dict(item) for item in tuple(dict(composition.metadata).get("combined_primitive_groups") or ()))
+    if not groups:
+        return ()
+    primitives_by_name = _composition_primitives_by_name(composition)
+    boundaries: list[MapStudioExportObjectBoundary] = []
+    for group_index, group in enumerate(groups, start=1):
+        raw_name = str(group.get("name") or f"combined_primitive_group_{group_index:02d}").strip()
+        group_name = raw_name or f"combined_primitive_group_{group_index:02d}"
+        member_names = _group_member_names(group)
+        missing = tuple(name for name in member_names if name not in primitives_by_name)
+        member_primitives = tuple(primitives_by_name[name] for name in member_names if name in primitives_by_name)
+        textures = tuple(
+            dict.fromkeys(
+                texture
+                for primitive in member_primitives
+                if (texture := _primitive_texture(_base_primitive(primitive)))
+            )
+        )
+        blocking = tuple(
+            f"Combined primitive group '{group_name}' references missing primitive '{name}'."
+            for name in missing
+        )
+        face_count = int(group.get("face_count") or 0)
+        vertex_count = int(group.get("vertex_count") or 0)
+        dimensions = _vec3_from_group(group, "dimensions")
+        normal_targets = _normal_policy_targets_for_members(composition, member_names)
+        normal_cleanup = _normal_cleanup_positive_z(composition, {})
+        duplicate_batches = _duplicate_special_batches_for_members(
+            _duplicate_special_batches(composition, {}),
+            member_names,
+        )
+        dcc_status = "blocked" if blocking else "ready_for_external_uv"
+        dcc_reason = (
+            "Fix missing grouped primitives before using this object group for UV/texturing handoff."
+            if blocking
+            else (
+                "Combined primitive group can be UV/textured as a modder-facing object, "
+                "but it still exports through the parent room until a future bake/separate step."
+            )
+        )
+        notes = (
+            f"Primitive group is authored inside {resref}.mdl/{resref}.mdx/{resref}.wok.",
+            "Topology is preserved as individual primitives; arbitrary baked mesh combine is planned.",
+            f"Group source mesh estimate: {vertex_count} vertices, {face_count} faces.",
+            (
+                f"Group KMAP-world dimensions: {dimensions[0]:.3f} x {dimensions[1]:.3f} x {dimensions[2]:.3f}."
+                if dimensions is not None
+                else "Group KMAP-world dimensions are not recorded yet; recombine the group to refresh bounds."
+            ),
+        )
+        boundaries.append(
+            MapStudioExportObjectBoundary(
+                object_id=f"primitive_group:{resref}:{group_name}",
+                label=f"{group_name} (combined primitive group)",
+                source_room_resref=resref,
+                object_kind="combined_primitive_group",
+                export_resref=resref,
+                resources=((resref, "mdl"), (resref, "mdx"), (resref, "wok")),
+                primitive_type="AuthoredCombinedPrimitiveGroup",
+                primitive_count=len(member_names),
+                member_primitive_names=member_names,
+                helper_mesh_count=0,
+                render_mesh_count=len(member_primitives),
+                walkmesh_face_count=0,
+                walkable_face_count=0,
+                material_textures=textures,
+                duplicate_special_status=_duplicate_special_status(duplicate_batches),
+                duplicate_special_summary=_duplicate_special_summary(duplicate_batches),
+                duplicate_special_batch_count=len(duplicate_batches),
+                duplicate_special_generated_names=_duplicate_special_generated_names(duplicate_batches),
+                duplicate_special_batches=duplicate_batches,
+                normal_cleanup_status=_normal_cleanup_status(normal_cleanup),
+                normal_cleanup_summary=_normal_cleanup_summary(normal_cleanup),
+                normal_cleanup_positive_z=normal_cleanup,
+                normal_policy_status=_normal_policy_status(normal_targets),
+                normal_policy_summary=_normal_policy_summary(normal_targets),
+                edge_normal_policy_targets=normal_targets,
+                bounds_coordinate_space=str(group.get("bounds_coordinate_space") or ""),
+                bounds_min=_vec3_from_group(group, "bounds_min"),
+                bounds_max=_vec3_from_group(group, "bounds_max"),
+                center=_vec3_from_group(group, "center"),
+                dimensions=dimensions,
+                uv_handoff_recommended=True,
+                dcc_handoff_status=dcc_status,
+                dcc_handoff_reason=dcc_reason,
+                resource_boundary_policy="combined_group_within_parent_room",
+                owns_walkmesh=False,
+                source_operation="combine_primitives",
+                source_room_resrefs=(resref,),
+                status="blocked" if blocking else "export_candidate",
+                notes=notes,
+                blocking_messages=blocking,
+            )
+        )
+    return tuple(boundaries)
+
+
 def map_studio_export_object_boundaries(project: AuthoredModuleProject) -> tuple[MapStudioExportObjectBoundary, ...]:
     """Return modder-facing export object boundaries for an authored module."""
 
@@ -201,11 +681,24 @@ def map_studio_export_object_boundaries(project: AuthoredModuleProject) -> tuple
         walkmesh_face_count = 0
         walkable_face_count = 0
         material_textures: tuple[str, ...] = ()
+        normal_cleanup: bool | None = None
+        normal_targets: tuple[dict[str, Any], ...] = ()
+        duplicate_batches: tuple[dict[str, Any], ...] = ()
+        bounds_min: tuple[float, float, float] | None = None
+        bounds_max: tuple[float, float, float] | None = None
+        center: tuple[float, float, float] | None = None
+        dimensions: tuple[float, float, float] | None = None
         try:
             geometry = compile_authored_room_spec(room)
             helpers = tuple(getattr(geometry, "helper_meshes", ()) or ())
             helper_mesh_count = len(helpers)
             render_mesh_count = 1 + helper_mesh_count
+            render_vertices = _mesh_vertices(getattr(geometry, "room_mesh", None))
+            for helper in helpers:
+                render_vertices += _mesh_vertices(helper)
+            bounds = _bounds_from_vertices(render_vertices)
+            if bounds is not None:
+                bounds_min, bounds_max, center, dimensions = bounds
             faces = tuple(getattr(getattr(geometry, "wok", None), "faces", ()) or ())
             walkmesh_face_count = len(faces)
             walkable_face_count = int(getattr(geometry.wok, "walkable_face_count", lambda: 0)())
@@ -216,11 +709,15 @@ def map_studio_export_object_boundaries(project: AuthoredModuleProject) -> tuple
             blocking.append(f"Export object {resref or '(unnamed)'} could not compile: {exc}")
         if isinstance(primitive, AuthoredRoomComposition):
             material_textures = _composition_textures(primitive) or material_textures
+        duplicate_batches = _duplicate_special_batches(primitive, metadata)
+        normal_cleanup = _normal_cleanup_positive_z(primitive, metadata)
+        normal_targets = _normal_policy_targets(primitive, metadata)
         kind = _object_kind(primitive, metadata)
         uv_handoff = kind in {"composition_room", "separated_primitive_object", "floor_plan_room", "rectangular_room"}
         owns_walkmesh = walkmesh_face_count > 0
         source_operation = _source_operation(primitive=primitive, metadata=metadata)
         source_room_resrefs = _source_room_resrefs(metadata, resref)
+        terrain_state = _terrain_authoring_state(primitive, metadata)
         dcc_status, dcc_reason = _dcc_handoff_state(
             uv_handoff_recommended=uv_handoff,
             walkmesh_face_count=walkmesh_face_count,
@@ -242,6 +739,36 @@ def map_studio_export_object_boundaries(project: AuthoredModuleProject) -> tuple
                 walkmesh_face_count=walkmesh_face_count,
                 walkable_face_count=walkable_face_count,
                 material_textures=material_textures,
+                duplicate_special_status=_duplicate_special_status(duplicate_batches),
+                duplicate_special_summary=_duplicate_special_summary(duplicate_batches),
+                duplicate_special_batch_count=len(duplicate_batches),
+                duplicate_special_generated_names=_duplicate_special_generated_names(duplicate_batches),
+                duplicate_special_batches=duplicate_batches,
+                terrain_authoring_status=str(terrain_state["terrain_authoring_status"]),
+                terrain_authoring_summary=str(terrain_state["terrain_authoring_summary"]),
+                terrain_last_operation=str(terrain_state["terrain_last_operation"]),
+                terrain_last_brush=str(terrain_state["terrain_last_brush"]),
+                terrain_dirty_region=terrain_state["terrain_dirty_region"],
+                terrain_height_rows=int(terrain_state["terrain_height_rows"]),
+                terrain_height_columns=int(terrain_state["terrain_height_columns"]),
+                terrain_height_min=terrain_state["terrain_height_min"],
+                terrain_height_max=terrain_state["terrain_height_max"],
+                terrain_height_range=terrain_state["terrain_height_range"],
+                terrain_max_slope_degrees=terrain_state["terrain_max_slope_degrees"],
+                terrain_non_walk_triangle_count=int(terrain_state["terrain_non_walk_triangle_count"]),
+                terrain_validation_status=str(terrain_state["terrain_validation_status"]),
+                terrain_validation_summary=str(terrain_state["terrain_validation_summary"]),
+                normal_cleanup_status=_normal_cleanup_status(normal_cleanup),
+                normal_cleanup_summary=_normal_cleanup_summary(normal_cleanup),
+                normal_cleanup_positive_z=normal_cleanup,
+                normal_policy_status=_normal_policy_status(normal_targets),
+                normal_policy_summary=_normal_policy_summary(normal_targets),
+                edge_normal_policy_targets=normal_targets,
+                bounds_coordinate_space="kmap_world" if bounds_min is not None else "",
+                bounds_min=bounds_min,
+                bounds_max=bounds_max,
+                center=center,
+                dimensions=dimensions,
                 uv_handoff_recommended=uv_handoff,
                 dcc_handoff_status=dcc_status,
                 dcc_handoff_reason=dcc_reason,
@@ -254,6 +781,8 @@ def map_studio_export_object_boundaries(project: AuthoredModuleProject) -> tuple
                 blocking_messages=tuple(blocking),
             )
         )
+        if isinstance(primitive, AuthoredRoomComposition):
+            boundaries.extend(_composition_group_boundaries(composition=primitive, resref=resref))
     return tuple(boundaries)
 
 

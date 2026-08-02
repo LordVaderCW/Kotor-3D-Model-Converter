@@ -94,6 +94,8 @@ class MapStudioToolBeltAction:
     kotor_guardrail: str
     implemented: bool = False
     hotkey: str = ""
+    shortcut_sequence: str = ""
+    shortcut_behavior: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,37 @@ class MapStudioToolBeltPreset:
     label: str
     description: str
     action_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MapStudioToolCommandSearchResult:
+    """One searchable Map Studio command entry for command palettes and pickers."""
+
+    key: str
+    label: str
+    workspace_key: str
+    tool_key: str
+    description: str
+    kotor_guardrail: str
+    hotkey: str
+    shortcut_sequence: str
+    shortcut_behavior: str
+    capability_stage: str
+    resource_impacts: tuple[str, ...]
+    readiness_summary: str
+    implemented: bool
+    score: int
+    display_label: str
+    match_text: str
+
+
+@dataclass(frozen=True)
+class MapStudioToolCapabilitySummary:
+    """Capability-honesty metadata shared by command search and tool routes."""
+
+    capability_stage: str
+    resource_impacts: tuple[str, ...]
+    readiness_summary: str
 
 
 _COMPONENT_MODES: tuple[MapStudioComponentMode, ...] = (
@@ -130,6 +163,12 @@ _COMPONENT_MODES: tuple[MapStudioComponentMode, ...] = (
         "Face",
         "Paint material and WOK surface intent, extrude faces, inset floors, and assign terrain/walkmesh behavior.",
         "Face edits must keep visible geometry and generated WOK surface ids in sync.",
+    ),
+    MapStudioComponentMode(
+        "terrain",
+        "Terrain",
+        "Sculpt terrain heightfield samples and terrain-derived faces with KOTOR walkability feedback.",
+        "Terrain edits must keep authored heightfield, WOK slope intent, and export/proof stale state synchronized.",
     ),
     MapStudioComponentMode(
         "walkmesh",
@@ -226,8 +265,53 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         "Add Primitive",
         "Primitives",
         ("object", "face"),
-        "Add plane, cube, wall, ramp, stair, cylinder, door frame, arch, or terrain patch primitives to the current authored room.",
+        "Add Maya-style plane, cube, sphere, cone, torus, wall, ramp, stair, cylinder, door frame, arch, or terrain patch primitives to the current authored room.",
         "Primitives that affect traversal must declare whether they create walkmesh faces.",
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "universal_transform",
+        "Universal Manipulator",
+        "Transform",
+        ("object", "vertex", "edge", "face"),
+        "Display a selected component bounding box, interactive transform handles, and exact width/depth/height dimensions for modular-kit scaling.",
+        "Transform overlays must use the selected KMAP component bounds and mark MDL/MDX/WOK/export proof stale when committed.",
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "center_pivot",
+        "Center Pivot",
+        "Transform",
+        ("object",),
+        "Move a selected primitive pivot to its local geometry center without moving the visible object.",
+        "Pivot edits must name primitive-local space and keep visible MDL/WOK geometry stable while marking exports stale.",
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "freeze_transform",
+        "Freeze Transform",
+        "Transform",
+        ("object",),
+        "Bake supported unrotated primitive translation and scale into editable primitive dimensions, then reset the transform.",
+        "Freeze Transform is only valid when the parametric primitive can preserve visible geometry without a hidden mesh bake.",
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "object_grid_snap",
+        "Object Grid Snap",
+        "Transform",
+        ("object",),
+        "Snap a selected primitive object's pivot to the authored Map Studio grid without changing topology.",
+        "Object snapping names KMAP/world pivot space and marks MDL/WOK/export proof stale while preserving primitive identity.",
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "object_vertex_snap",
+        "Object Vertex Snap",
+        "Transform",
+        ("object", "vertex"),
+        "Move a selected primitive object so its pivot lands exactly on a vertex from another authored primitive.",
+        "This is a transform-level snap, not a topology weld; it names authored-room composition mesh space and marks exports stale.",
         implemented=True,
     ),
     MapStudioModelingTool(
@@ -253,8 +337,8 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         "Bridge",
         "Component Modeling",
         ("edge",),
-        "Create faces between compatible border edge loops for corridors, door frames, or terrain seams.",
-        "Bridged loops need matching orientation and WOK continuity checks before export.",
+        "Bake a divided polygon strip between exactly two compatible imported-mesh border edges.",
+        "Divisions, taper, twist, smoothing, UV0, and lightmap channels are preserved as static KOTOR geometry; WOK continuity still requires validation.",
         implemented=True,
     ),
     MapStudioModelingTool(
@@ -262,7 +346,7 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         "Snap Vertex",
         "Cleanup",
         ("vertex",),
-        "Move one floor-plan vertex to another vertex or handle without merging topology.",
+        "Move one floor-plan vertex to another vertex or snap selected vertices to the active grid without merging topology.",
         "Snapping is not welding; it moves geometry and marks MDL/WOK/LYT/VIS/PTH proof stale while preserving point identity.",
         implemented=True,
     ),
@@ -282,6 +366,15 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         ("vertex", "edge"),
         "Flatten selected floor-plan vertices onto a shared local X or Y line for clean wall and doorway alignment.",
         "Flattening must keep the footprint convex and valid before MDL/WOK generation.",
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "transform_snap_level",
+        "Transform Snap Level",
+        "Transform",
+        ("vertex", "edge"),
+        "While transforming vertices or expanded edge vertices, align them onto one shared X, Y, or Z level.",
+        "Level snapping is a geometry edit; validate seams, walkmesh triangles, and doorway alignment before export.",
         implemented=True,
     ),
     MapStudioModelingTool(
@@ -363,16 +456,16 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         ("object", "vertex", "edge", "face"),
         "Mirror authored components vertically for ceilings, overhangs, and layered terrain planning.",
         "Vertical mirroring needs explicit MDL/WOK rebuild validation before it can be promoted beyond planning.",
-        implemented=False,
+        implemented=True,
     ),
     MapStudioModelingTool(
         "boolean_a_minus_b",
         "Boolean A - B",
         "Component Modeling",
         ("object", "face"),
-        "Subtract the second selected authored object/primitive from the first selected object.",
-        "Subtraction must be cleaned for manifold geometry before KOTOR MDL/WOK export.",
-        implemented=False,
+        "Subtract the second selected closed polygon surface from the first, preserving UV, normal, lightmap-UV, and material provenance.",
+        "Closed-solid mode rejects open/non-manifold operands atomically; planar architectural rooms keep their dedicated 2.5D subtraction workflow.",
+        implemented=True,
     ),
     MapStudioModelingTool(
         "boolean_b_minus_a",
@@ -381,7 +474,7 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         ("object", "face"),
         "Subtract the first selected authored object/primitive from the second selected object.",
         "Subtraction must be cleaned for manifold geometry before KOTOR MDL/WOK export.",
-        implemented=False,
+        implemented=True,
     ),
     MapStudioModelingTool(
         "insert_edge_loop",
@@ -390,7 +483,7 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         ("edge", "face"),
         "Insert a loop through compatible room or primitive faces for cleaner cuts and bevel support.",
         "Inserted loops must not create sliver WOK faces or broken room seams.",
-        implemented=False,
+        implemented=True,
     ),
     MapStudioModelingTool(
         "cut_slice_insert_edges",
@@ -424,18 +517,18 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         "Lattice",
         "Deformation",
         ("object", "vertex", "face"),
-        "Use a cage-style deformation control for shaping authored room or terrain meshes.",
-        "Lattice edits need baked, validated geometry before KOTOR export; runtime lattice data is not a KOTOR feature.",
-        implemented=False,
+        "Bake a static 2x2x2 trilinear cage into selected imported-mesh vertices, or use the terrain cage on heightfields.",
+        "The imported-mesh subset is a baked 2x2x2 cage without a persistent live deformer handle.",
+        implemented=True,
     ),
     MapStudioModelingTool(
         "shrink_wrap",
         "Shrink Wrap",
         "Walkmesh",
         ("vertex", "face", "walkmesh"),
-        "Adhere selected walkmesh or helper geometry to visible room/terrain surfaces.",
-        "Shrink wrap is intended for manual walkmesh adherence and must not hide off-walkmesh blockers.",
-        implemented=False,
+        "Bake selected imported-mesh vertices onto a Make Live surface, or snap authored gameplay placements onto terrain.",
+        "Imported geometry uses deterministic exhaustive nearest-triangle/vertex projection; a spatial accelerator and live dependency remain future work.",
+        implemented=True,
     ),
     MapStudioModelingTool(
         "reverse_normals",
@@ -453,7 +546,7 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         ("edge", "face"),
         "Soften selected visual mesh edges for smoother lighting across authored geometry.",
         "Softened edges affect viewport/export normals only; WOK geometry still needs hard traversal validation.",
-        implemented=False,
+        implemented=True,
     ),
     MapStudioModelingTool(
         "harden_edges",
@@ -462,7 +555,7 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         ("edge", "face"),
         "Harden selected visual mesh edges for crisp KOTOR hard-surface room silhouettes.",
         "Hardened edges should preserve explicit material and lightmap seams.",
-        implemented=False,
+        implemented=True,
     ),
     MapStudioModelingTool(
         "duplicate_special",
@@ -471,42 +564,60 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
         ("object",),
         "Duplicate selected objects with repeatable transform offsets for columns, walls, stairs, or trim kits.",
         "Duplicated outputs must keep stable KMAP ids and export-object ownership.",
-        implemented=False,
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "duplicate_selected",
+        "Duplicate",
+        "Object Modeling",
+        ("object",),
+        "Duplicate the selected authored primitive using the viewport/modeling belt default offset.",
+        "Duplicated primitives must create durable KMAP state, undo metadata, and stale export/proof tracking.",
+        implemented=True,
+    ),
+    MapStudioModelingTool(
+        "delete_selected",
+        "Delete",
+        "Object Modeling",
+        ("object",),
+        "Delete the selected authored primitive from the active room composition.",
+        "Deletes must preserve undo history and mark generated MDL/MDX/WOK/PTH/LYT/VIS/package proof stale.",
+        implemented=True,
     ),
     MapStudioModelingTool(
         "curve_tool",
         "Curve Tool",
         "Curves",
         ("object", "vertex"),
-        "Author curves for paths, rails, arches, terrain guides, or later extrusion sweeps.",
-        "Curves are construction guides until baked into KOTOR geometry or PTH/path data.",
-        implemented=False,
+        "Author durable KMAP guide curves for paths, rails, terrain ridges, road edges, or later extrusion sweeps.",
+        "Curves are construction guides until another command bakes them into KOTOR geometry, WOK, or PTH/path data.",
+        implemented=True,
     ),
     MapStudioModelingTool(
         "bend_tool",
         "Bend Tool",
         "Deformation",
         ("object", "vertex", "face"),
-        "Bend selected authored geometry for curved corridors, arches, or terrain forms.",
-        "Bend edits need baked, cleaned, and validated geometry before KOTOR export.",
-        implemented=False,
+        "Bake a bounded circular bend into selected imported-mesh vertices, or bend an authored terrain heightfield profile.",
+        "The imported-mesh subset updates normals analytically but does not retain a live deformer handle.",
+        implemented=True,
     ),
     MapStudioModelingTool(
         "combine_objects",
-        "Combine Objects",
+        "Combine Meshes",
         "Object Modeling",
         ("object",),
-        "Combine compatible rectangular floor-plan rooms through the supported room-union workflow; broader primitive/object combine is a future mesh-editing pass.",
-        "Combined output must keep stable KMAP ids, clean room/WOK resource boundaries, explicit export-object names, and a readiness note for stale MDL/MDX/WOK/LYT/VIS/PTH outputs.",
+        "Bake selected authored-object transforms into one true polygon mesh while preserving materials, UVs, normals, provenance, and disconnected shells.",
+        "Combined output keeps a procedural KMAP recipe and explicit single-owner WOK inheritance; generated MDL/MDX/WOK/LYT/VIS/PTH outputs become stale.",
         implemented=True,
     ),
     MapStudioModelingTool(
         "separate_objects",
-        "Separate Objects",
+        "Separate Shells",
         "Object Modeling",
         ("object", "face"),
-        "Split selected authored composition primitives into independent KMAP room/object boundaries for outside UV/texturing workflows.",
-        "Current implementation separates named authored primitives; arbitrary mesh-island separation still needs a later mesh-editing pass.",
+        "Split a Combined Mesh into independently selectable connected polygon-shell objects in the same authored room.",
+        "Use Extract to Export Room for KOTOR room-boundary changes; Separate Shells changes polygon object identity only.",
         implemented=True,
     ),
     MapStudioModelingTool(
@@ -551,6 +662,7 @@ _MODELING_TOOLS: tuple[MapStudioModelingTool, ...] = (
 _SNAP_MODES: tuple[MapStudioSnapMode, ...] = (
     MapStudioSnapMode("grid", "Grid", "Snap moved resources or components to the current Map Studio grid."),
     MapStudioSnapMode("vertex", "Vertex", "Snap a selected vertex, primitive, or placement to another vertex/handle.", "Hold V"),
+    MapStudioSnapMode("level", "Transform Level", "Align selected vertices or edges to one shared X/Y/Z transform level.", "Hold J"),
     MapStudioSnapMode("edge", "Edge", "Snap along an edge or room seam for corridor and doorway alignment."),
     MapStudioSnapMode("face", "Face", "Snap placements or geometry handles to a room or walkmesh face."),
     MapStudioSnapMode("doorhook", "Door / Transition", "Snap rooms to doorway hooks or transition handles for KOTOR module layout."),
@@ -663,6 +775,69 @@ _VIEWPORT_PERFORMANCE_POLICY = MapStudioViewportPerformancePolicy(
 
 _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
     MapStudioToolBeltAction(
+        "blockout_room",
+        "Blockout Room",
+        "geometry",
+        "primitive_room",
+        "Create a composition-ready starter room with a walkable floor plus wall, ramp, stair, and arch blockout geometry.",
+        "This room is meant for Maya-like primitive editing; every added primitive still records KMAP state and stale export proof.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "object",
+        "Object Mode",
+        "geometry",
+        "",
+        "Focus Object mode for selecting, moving, duplicating, deleting, snapping, and transforming authored rooms and primitives.",
+        "Object mode changes selection/edit scope only; committed object edits still preserve KMAP ids and stale generated resources.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "vertex",
+        "Vertex Mode",
+        "geometry",
+        "",
+        "Focus Vertex mode for point snapping, welding, flattening, cleanup, and walkmesh-aware footprint edits.",
+        "Vertex mode changes edit scope only; committed vertex edits must avoid degenerate WOK triangles and cracked room seams.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "edge",
+        "Edge Mode",
+        "geometry",
+        "",
+        "Focus Edge mode for cuts, splits, bridges, bevels, openings, and seam alignment.",
+        "Edge mode changes edit scope only; committed edge edits must preserve portal seams and WOK face boundaries.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "face",
+        "Face Mode",
+        "geometry",
+        "",
+        "Focus Face mode for material/WOK painting, inset, triangulation, face fill, and winding cleanup.",
+        "Face mode changes edit scope only; committed face edits must keep render geometry and WOK surface ids synchronized.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "select",
+        "Select",
+        "geometry",
+        "select",
+        "Persist the active authored room or primitive selection in the KMAP.",
+        "Selection changes are undoable KMAP metadata and do not stale generated runtime resources.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "move",
+        "Move",
+        "geometry",
+        "move",
+        "Move the selected authored room primitive by an explicit KMAP-world delta.",
+        "Primitive movement preserves object identity but stales MDL/MDX/WOK/PTH/LYT/VIS/package/proof output.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
         "create_room",
         "Room",
         "geometry",
@@ -687,6 +862,201 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "add_primitive",
         "Add planes, cubes, walls, ramps, stairs, cylinders, door frames, arches, and blockout parts to the active room.",
         "Traversal-affecting primitives must declare walkmesh intent before export.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "universal_transform",
+        "Ctrl+T",
+        "geometry",
+        "universal_transform",
+        "Activate the Universal Manipulator around the selected mesh or component and show exact width/depth/height dimensions.",
+        "Use selected component bounds as the source of truth for modular-kit scale; committed edits make runtime exports stale.",
+        implemented=True,
+        hotkey="Ctrl+T",
+        shortcut_sequence="Ctrl+T",
+        shortcut_behavior="press",
+    ),
+    MapStudioToolBeltAction(
+        "reset_transform",
+        "Reset Transformations",
+        "geometry",
+        "reset_transform",
+        "Reset selected authored-object translation, rotation, and scale channels to their defaults.",
+        "Reset Transformations intentionally moves the visible object and marks generated runtime resources stale.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "center_pivot",
+        "Center Pivot",
+        "geometry",
+        "center_pivot",
+        "Center the selected primitive pivot in primitive-local space without moving the object.",
+        "Center Pivot compensates translation so rendered MDL/WOK geometry stays fixed while export proof becomes stale.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "zero_pivot",
+        "Zero Pivot",
+        "geometry",
+        "zero_pivot",
+        "Move the selected authored object's pivot to its local origin while compensating translation so geometry stays fixed.",
+        "Pivot edits preserve visible geometry but invalidate transform/export proof.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "freeze_transform",
+        "Freeze",
+        "geometry",
+        "freeze_transform",
+        "Freeze selected primitive transforms into their authored shape or a compiled polygon recipe.",
+        "Visible geometry stays fixed while translation, rotation, scale, and pivot channels return to identity.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "delete_history",
+        "Delete History",
+        "geometry",
+        "delete_history",
+        "Bake supported authored construction history while preserving the current polygon result.",
+        "Baking history must retain source provenance needed by KMAP export and remains one undoable command.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "duplicate_special_options",
+        "Duplicate Special Options",
+        "geometry",
+        "duplicate_special",
+        "Open repeatable duplicate translation, rotation, scale, and count options.",
+        "Each duplicate receives a stable KMAP object id and independently exportable ownership metadata.",
+        implemented=True,
+        hotkey="Ctrl+Shift+D",
+        shortcut_sequence="Ctrl+Shift+D",
+        shortcut_behavior="press",
+    ),
+    MapStudioToolBeltAction(
+        "multi_cut",
+        "Multi-Cut",
+        "geometry",
+        "multi_cut",
+        "Enter a persistent two-anchor cut context with non-mutating structural preview across connected coplanar triangles.",
+        "Enter creates one undoable cut; Backspace removes the last anchor and Escape clears before exiting. Chained turns and slice gestures remain disabled.",
+        implemented=True,
+        hotkey="Ctrl+X",
+        shortcut_sequence="Ctrl+X",
+        shortcut_behavior="press",
+    ),
+    MapStudioToolBeltAction(
+        "target_weld",
+        "Target Weld",
+        "geometry",
+        "target_weld",
+        "Pick a source vertex or edge and then an explicit target component to merge them.",
+        "Welding updates coincident seam copies, drops degenerates, and requires WOK review.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "make_hole",
+        "Make Hole",
+        "geometry",
+        "make_hole",
+        "Cut the first selected face with the outline of a second selected face.",
+        "The result must remain planar, manifold, triangulated, and explicitly reviewed for WOK generation.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "wrap",
+        "Wrap",
+        "geometry",
+        "wrap",
+        "Capture a Make Live driver baseline and bake its inverse-distance vertex deltas into selected target geometry.",
+        "Map Studio records audit metadata only; no live dependency graph is retained and KOTOR export receives static geometry.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "connect_components",
+        "Connect Components",
+        "geometry",
+        "connect_components",
+        "Connect selected vertices or edges by inserting polygon edges.",
+        "Inserted edges must preserve face winding and all vertex/corner attribute channels.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "select_triangles",
+        "Select Triangle Faces",
+        "geometry",
+        "select_triangles",
+        "Select triangle regions on the current editable imported surface.",
+        "Selection-only commands do not dirty runtime output.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "select_quads",
+        "Select Quad Faces",
+        "geometry",
+        "select_quads",
+        "Select coplanar adjacent triangle pairs that form quad regions.",
+        "Selection inference is viewport-only and does not rewrite KOTOR triangulation.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "convert_contained_faces",
+        "Convert to Contained Faces",
+        "geometry",
+        "convert_contained_faces",
+        "Convert selected vertices or edges to faces whose complete vertex set is contained by the selection.",
+        "Selection conversion does not mutate KMAP or generated runtime resources.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "make_live",
+        "Make Live",
+        "geometry",
+        "make_live",
+        "Use the selected mesh as the active projection and retopology surface.",
+        "Live state is authoring metadata; it does not alter or export the source mesh.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "quad_draw",
+        "Quad Draw",
+        "geometry",
+        "quad_draw",
+        "Place four ordered points on the active live surface and create an auto-welded retopology quad.",
+        "Committed quads stay separate from the live reference and become ordinary KMAP-authored triangulated geometry with explicit material and WOK intent.",
+        implemented=True,
+        hotkey="Ctrl+Q",
+        shortcut_sequence="Ctrl+Q",
+        shortcut_behavior="press",
+    ),
+    MapStudioToolBeltAction(
+        "object_grid_snap",
+        "Obj Snap",
+        "geometry",
+        "object_grid_snap",
+        "Snap the selected primitive pivot to the authored Map Studio grid.",
+        "Object snapping moves the primitive as an object and does not weld or rewrite mesh topology.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "object_vertex_snap",
+        "Obj V Snap",
+        "geometry",
+        "object_vertex_snap",
+        "Snap the selected primitive pivot to a vertex on another authored primitive.",
+        "Object vertex snapping preserves primitive topology; use floor-plan Vertex Snap when you intend to move/weld room vertices.",
+        implemented=True,
+        hotkey="Hold V",
+        shortcut_sequence="V",
+        shortcut_behavior="hold_modifier",
+    ),
+    MapStudioToolBeltAction(
+        "floor",
+        "Floor",
+        "geometry",
+        "add_primitive",
+        "Add a flat walkable floor/platform primitive to the active authored room.",
+        "Floors create WOK faces, so their surface type and material intent must remain valid before export.",
         implemented=True,
     ),
     MapStudioToolBeltAction(
@@ -744,6 +1114,33 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         implemented=True,
     ),
     MapStudioToolBeltAction(
+        "sphere",
+        "Sphere",
+        "geometry",
+        "add_primitive",
+        "Add a Maya-style UV sphere with editable radius and axis/height subdivisions.",
+        "Spheres are visual room geometry and must retain nondegenerate UVs and normalized outward vertex normals.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "cone",
+        "Cone",
+        "geometry",
+        "add_primitive",
+        "Add a Maya-style capped cone with editable radius, height, side subdivisions, and cap subdivisions.",
+        "Cone caps use hard planar normals while side vertices use smooth outward normals; it is not a walkmesh surface by default.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "torus",
+        "Torus",
+        "geometry",
+        "add_primitive",
+        "Add a Maya-style torus with editable ring/section radii and independent subdivisions.",
+        "The main radius must remain larger than the section radius so the authored KOTOR mesh does not self-intersect.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
         "door_frame",
         "Door Frame",
         "geometry",
@@ -789,6 +1186,15 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         implemented=True,
     ),
     MapStudioToolBeltAction(
+        "split",
+        "Split",
+        "geometry",
+        "knife_split",
+        "Split the selected floor-plan room along the chosen axis into separate exportable KOTOR room pieces.",
+        "Split pieces keep authored room ownership, WOK/PTH/LYT/VIS membership, undo history, and stale export/proof tracking.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
         "opening",
         "Opening",
         "geometry",
@@ -824,6 +1230,17 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "Snapping is not welding; it must preserve point identity and avoid degenerate footprints or invalid WOK boundaries.",
         implemented=True,
         hotkey="Hold V",
+        shortcut_sequence="V",
+        shortcut_behavior="hold_modifier",
+    ),
+    MapStudioToolBeltAction(
+        "grid_snap",
+        "Grid Snap",
+        "geometry",
+        "snap_vertices",
+        "Snap selected floor-plan vertices to the authored Map Studio grid without welding topology.",
+        "Grid snapping is a geometry edit; validate seams, WOK, staged export, and game proof after snapping.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "weld",
@@ -842,6 +1259,18 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "Align selected vertices to a shared local X or Y line for walls and door seams.",
         "Flattening is blocked when it would make the room footprint invalid.",
         implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "transform_snap_level",
+        "Level Snap",
+        "geometry",
+        "transform_snap_level",
+        "Hold J with transform active to align selected vertices or edges onto one shared transform level.",
+        "Level snapping should be followed by seam, WOK, and geometry validation before export.",
+        implemented=True,
+        hotkey="Hold J",
+        shortcut_sequence="J",
+        shortcut_behavior="hold_modifier",
     ),
     MapStudioToolBeltAction(
         "cleanup",
@@ -871,12 +1300,30 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         implemented=True,
     ),
     MapStudioToolBeltAction(
+        "cleanup_normals",
+        "Cleanup Normals",
+        "geometry",
+        "cleanup_normals",
+        "Orient selected floor-plan face winding for predictable generated room/WOK normals.",
+        "Normal cleanup is KOTOR export-facing and must remain validated separately from visual edge smoothing.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "triangulate_face",
+        "Triangulate Face",
+        "geometry",
+        "triangulate_face",
+        "Triangulate the active floor-plan face deterministically before MDL/WOK validation.",
+        "Triangulation is an export-facing cleanup step; WOK and room validation must still run afterward.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
         "mirror",
         "Mirror",
         "geometry",
         "mirror_footprint",
-        "Mirror the active floor-plan footprint across local X or Y for symmetrical blockout.",
-        "Mirror remains room-footprint scoped in this first pass and reuses KOTOR floor-plan validation.",
+        "Mirror an editable imported-mesh surface across local X/Y/Z, or mirror a floor-plan footprint for blockout.",
+        "Imported surfaces support copy/cut plus explicit seam tolerance; generated WOK remains a separate validation gate.",
         implemented=True,
     ),
     MapStudioToolBeltAction(
@@ -886,6 +1333,15 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "bevel_inset",
         "Round or chamfer authored room corners during blockout.",
         "Tiny bevels that collapse walkmesh triangles must be rejected before export.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "inset",
+        "Inset",
+        "geometry",
+        "bevel_inset",
+        "Inset the selected authored floor plan for inner walls, trim, pits, or raised platforms.",
+        "Insets must preserve room boundaries and reject collapsed or self-intersecting WOK candidates.",
         implemented=True,
     ),
     MapStudioToolBeltAction(
@@ -902,9 +1358,9 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "A - B",
         "geometry",
         "boolean_a_minus_b",
-        "Subtract selected object B from selected object A.",
-        "Boolean subtraction needs manifold cleanup before MDL/WOK export.",
-        implemented=False,
+        "Subtract selected closed surface B from selected closed surface A, or use planar room subtraction for architectural sheets.",
+        "The result must be a deterministic closed two-manifold; WOK and lightmaps are marked stale before MDL/WOK export.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "boolean_b_minus_a",
@@ -913,7 +1369,7 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "boolean_b_minus_a",
         "Subtract selected object A from selected object B.",
         "Boolean subtraction needs manifold cleanup before MDL/WOK export.",
-        implemented=False,
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "mirror_x",
@@ -939,8 +1395,8 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "geometry",
         "mirror_z",
         "Mirror authored components vertically.",
-        "Vertical mirroring is planned until backed by deterministic MDL/WOK validation.",
-        implemented=False,
+        "Mirror Z reflects terrain heightfields around a horizontal plane; arbitrary mesh mirroring remains planned.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "insert_edge_loop",
@@ -949,7 +1405,7 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "insert_edge_loop",
         "Insert an edge loop through compatible room or primitive faces.",
         "Loop insertion must avoid sliver WOK faces and broken seams.",
-        implemented=False,
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "cut_slice_insert_edges",
@@ -983,18 +1439,18 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "Lattice",
         "geometry",
         "lattice",
-        "Use a cage-style deformation control for authored geometry.",
-        "Lattice data must be baked; KOTOR has no runtime lattice primitive.",
-        implemented=False,
+        "Bake a static 2x2x2 cage into selected imported geometry, or apply a terrain heightfield cage.",
+        "KOTOR has no runtime lattice primitive; Map Studio exports only the baked polygon/heightfield result.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "shrink_wrap",
         "Shrink Wrap",
         "walkmesh",
         "shrink_wrap",
-        "Adhere selected walkmesh/helper geometry to visible surfaces.",
-        "Shrink wrap is planned for manual walkmesh adherence and still needs validation.",
-        implemented=False,
+        "Bake selected imported geometry onto a Make Live surface, or project authored gameplay placements onto terrain.",
+        "Imported geometry uses deterministic nearest-triangle/vertex projection and must be reviewed for WOK changes.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "reverse_normals",
@@ -1010,18 +1466,18 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "Soften",
         "geometry",
         "soften_edges",
-        "Soften selected visual edges.",
-        "Softened normals are planned for visual export, not WOK traversal.",
-        implemented=False,
+        "Soften selected visual edges and record authored visual-normal intent for the export boundary.",
+        "Softened normals are KMAP/export-readiness metadata for visual shading; WOK traversal remains validated separately.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "harden_edges",
         "Harden",
         "geometry",
         "harden_edges",
-        "Harden selected visual edges.",
-        "Hardened normals are planned for visual export and lightmap seams.",
-        implemented=False,
+        "Harden selected visual edges and record authored visual-normal intent for hard-surface silhouettes.",
+        "Hardened normals are KMAP/export-readiness metadata for visual seams; WOK traversal and game-tested lighting remain separate gates.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "duplicate_special",
@@ -1030,42 +1486,60 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "duplicate_special",
         "Duplicate selected objects with repeatable transform offsets.",
         "Duplicate Special must preserve stable KMAP ids and export ownership.",
-        implemented=False,
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "duplicate_selected",
+        "Duplicate",
+        "geometry",
+        "duplicate_selected",
+        "Duplicate the selected authored primitive with the viewport/modeling belt default offset.",
+        "Duplicate creates stable KMAP primitive state and marks generated exports/proof stale.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "delete_selected",
+        "Delete",
+        "geometry",
+        "delete_selected",
+        "Delete the selected authored primitive from the active room composition.",
+        "Delete records undo metadata and marks generated exports/proof stale.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "curve_tool",
         "Curve",
         "geometry",
         "curve_tool",
-        "Create construction curves for paths, rails, guides, or sweeps.",
-        "Curves are planned guides until baked into KOTOR geometry or path data.",
-        implemented=False,
+        "Create an authored KMAP guide curve for paths, rails, terrain shaping, or later sweep tools.",
+        "Curve guides are previewable authoring data; they are not KOTOR runtime geometry until baked by another tool.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "bend_tool",
         "Bend",
         "geometry",
         "bend_tool",
-        "Bend selected authored geometry.",
-        "Bend output must be baked, cleaned, and validated before export.",
-        implemented=False,
+        "Bake a bounded bend into selected imported geometry, or bend the selected terrain heightfield profile.",
+        "The imported-mesh result is static and retains no Maya-style live deformer handle.",
+        implemented=True,
     ),
     MapStudioToolBeltAction(
         "combine",
-        "Combine",
+        "Combine Meshes",
         "geometry",
         "combine_objects",
-        "Focus object-combine tools for merging compatible rooms/primitives into an exportable object.",
-        "Combining must preserve KMAP ids, room resource boundaries, and generated WOK ownership.",
+        "Combine selected authored objects into one procedural polygon mesh.",
+        "Combining preserves source recipes and assigns WOK ownership exactly once.",
         implemented=True,
     ),
     MapStudioToolBeltAction(
         "separate",
-        "Separate",
+        "Separate Shells",
         "geometry",
         "separate_objects",
-        "Split a selected authored primitive into its own exportable KMAP room/object boundary.",
-        "Select an authored composition primitive first; arbitrary raw mesh-face separation is a future mesh-editing slice.",
+        "Split a selected Combined Mesh into connected polygon-shell objects in the same room.",
+        "Select a Combined Mesh first; use Extract to Export Room for a new KOTOR room boundary.",
         implemented=True,
     ),
     MapStudioToolBeltAction(
@@ -1203,6 +1677,33 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
         "paint_wok",
         "Paint walkable, blocked, door, water, and material surface intent.",
         "The player start, transitions, and placeables should sit on valid WOK faces.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "paint_wok",
+        "Paint WOK Surface",
+        "walkmesh",
+        "paint_wok",
+        "Assign a KOTOR WOK surface id to the active room floor or selected walkmesh-producing primitive.",
+        "Painted surface intent dirties generated WOK, PTH pathing, staged export, install handoff, and game proof.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "texture_paint",
+        "Texture Paint",
+        "geometry",
+        "",
+        "Open Texture Paint, assign a unique project TGA to a visible face, and paint through diffuse UV0.",
+        "Texture strokes preserve source game data, WOK, PTH, and lightmap UVs while dirtying the custom texture, room MDL material reference, export, and proof evidence.",
+        implemented=True,
+    ),
+    MapStudioToolBeltAction(
+        "paint_material",
+        "Paint Material",
+        "geometry",
+        "paint_material",
+        "Assign KOTOR texture/material intent to the active room or selected authored primitive.",
+        "Material edits preserve existing WOK surface intent while dirtying generated MDL/MDX/WOK/PTH/LYT/VIS export and proof evidence.",
         implemented=True,
     ),
     MapStudioToolBeltAction(
@@ -1372,28 +1873,62 @@ _TOOL_BELT_ACTIONS: tuple[MapStudioToolBeltAction, ...] = (
 
 _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
     MapStudioToolBeltPreset(
+        "maya_modeling",
+        "Maya Modeling",
+        "The user's Maya Custom shelf order, backed by KMAP-safe Map Studio commands.",
+        (
+            "reset_transform", "center_pivot", "zero_pivot", "separate", "combine", "fill_hole",
+            "mirror", "bevel", "bridge", "extrude", "merge_components", "multi_cut",
+            "insert_edge_loop", "target_weld", "make_hole", "lattice", "wrap", "shrink_wrap",
+            "reverse_normals", "soften_edges", "harden_edges", "connect_components",
+            "boolean_a_minus_b", "bend_tool", "delete_history", "duplicate_special_options",
+            "freeze_transform", "select_triangles", "select_quads", "convert_contained_faces",
+            "make_live", "quad_draw",
+        ),
+    ),
+    MapStudioToolBeltPreset(
         "blockout",
         "Blockout",
         "Primitives, snapping, welding, and validation for fast room/corridor layout.",
         (
+            "object",
+            "vertex",
+            "edge",
+            "face",
+            "select",
+            "move",
+            "blockout_room",
             "create_room",
             "corridor",
+            "floor",
             "plane",
             "wall",
             "cube",
             "cylinder",
+            "sphere",
+            "cone",
+            "torus",
             "ramp",
             "stairs",
             "door_frame",
             "arch",
+            "terrain_patch",
             "primitive",
+            "universal_transform",
+            "center_pivot",
+            "freeze_transform",
+            "object_grid_snap",
+            "object_vertex_snap",
             "extrude",
             "bridge",
             "cut",
+            "split",
             "opening",
             "opening_marker",
             "fill",
             "vertex_snap",
+            "grid_snap",
+            "transform_snap_level",
             "weld",
             "flatten",
             "mirror",
@@ -1401,8 +1936,11 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
             "separate",
             "cleanup",
             "triangulate",
+            "triangulate_face",
             "normals",
+            "cleanup_normals",
             "bevel",
+            "inset",
             "boolean",
             "boolean_a_minus_b",
             "boolean_b_minus_a",
@@ -1418,6 +1956,11 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
             "soften_edges",
             "harden_edges",
             "duplicate_special",
+            "duplicate_selected",
+            "delete_selected",
+            "paint_wok",
+            "texture_paint",
+            "paint_material",
             "validate",
         ),
     ),
@@ -1426,14 +1969,30 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
         "Component Modeling",
         "Vertex/edge/face cleanup tools for refining authored module geometry.",
         (
+            "object",
+            "vertex",
+            "edge",
+            "face",
+            "select",
+            "move",
+            "floor",
             "plane",
             "wall",
             "cube",
+            "sphere",
+            "cone",
+            "torus",
             "door_frame",
             "arch",
+            "universal_transform",
+            "center_pivot",
+            "freeze_transform",
+            "object_grid_snap",
+            "object_vertex_snap",
             "extrude",
             "bridge",
             "cut",
+            "split",
             "cut_slice_insert_edges",
             "insert_edge_loop",
             "opening",
@@ -1441,6 +2000,8 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
             "fill",
             "fill_hole",
             "vertex_snap",
+            "grid_snap",
+            "transform_snap_level",
             "weld",
             "merge_components",
             "flatten",
@@ -1452,20 +2013,27 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
             "separate",
             "cleanup",
             "triangulate",
+            "triangulate_face",
             "normals",
+            "cleanup_normals",
             "reverse_normals",
             "soften_edges",
             "harden_edges",
             "bevel",
+            "inset",
             "boolean",
             "boolean_a_minus_b",
             "boolean_b_minus_a",
             "lattice",
             "shrink_wrap",
             "duplicate_special",
+            "duplicate_selected",
+            "delete_selected",
             "curve_tool",
             "bend_tool",
             "walkmesh",
+            "paint_wok",
+            "paint_material",
             "validate",
         ),
     ),
@@ -1489,6 +2057,8 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
             "sculpt_erode",
             "sculpt_noise",
             "walkmesh",
+            "paint_wok",
+            "paint_material",
             "entry_point",
             "place",
             "placeable",
@@ -1518,6 +2088,8 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
             "script",
             "light",
             "walkmesh",
+            "paint_wok",
+            "paint_material",
             "validate",
         ),
     ),
@@ -1532,6 +2104,8 @@ _TOOL_BELT_PRESETS: tuple[MapStudioToolBeltPreset, ...] = (
             "launch_handoff",
             "record_proof",
             "walkmesh",
+            "paint_wok",
+            "paint_material",
             "entry_point",
             "place",
             "placeable",
@@ -1632,6 +2206,143 @@ def map_studio_tool_belt_actions_for_preset(
         if action is not None and action not in actions:
             actions.append(action)
     return tuple(actions)
+
+
+def _tool_capability_stage(action: MapStudioToolBeltAction) -> str:
+    if not bool(action.implemented):
+        return "planned"
+    key = str(action.key or "")
+    if key == "stage_module":
+        return "export_candidate"
+    if key in {"install_module", "launch_handoff"}:
+        return "installed_for_game_test_handoff"
+    if key == "record_proof":
+        return "game_tested_evidence_handoff"
+    return "previewable"
+
+
+def _tool_resource_impacts(action: MapStudioToolBeltAction) -> tuple[str, ...]:
+    key = str(action.key or "")
+    workspace = str(action.workspace_key or "")
+    if key == "validate":
+        return ("ValidationBus", "readiness")
+    if key in {"stage_module", "install_module", "launch_handoff", "record_proof"}:
+        return ("ExportJob", ".mod", "proof_manifest")
+    if workspace == "placements":
+        return ("KMAP", "GIT", "PTH", ".mod")
+    if workspace == "lighting":
+        return ("KMAP", "LYT", "VIS", "MDL", ".mod")
+    if workspace == "scripts":
+        return ("KMAP", "ARE", "IFO", ".mod")
+    if workspace in {"terrain", "walkmesh"}:
+        return ("KMAP", "MDL", "MDX", "WOK", "PTH", ".mod")
+    if workspace == "export":
+        return ("ValidationBus", "ExportJob", ".mod", "proof_manifest")
+    return ("KMAP", "MDL", "MDX", "WOK", "LYT", "VIS", "PTH", ".mod")
+
+
+def _tool_readiness_summary(action: MapStudioToolBeltAction) -> str:
+    stage = _tool_capability_stage(action)
+    impacts = ", ".join(_tool_resource_impacts(action))
+    if stage == "planned":
+        return "Planned; do not present as usable until a command, validation impact, and export/readiness impact exist."
+    if stage == "export_candidate":
+        return f"Creates an export candidate through staged validation/export flow; resources: {impacts}."
+    if stage == "installed_for_game_test_handoff":
+        return f"Prepares install/launch handoff for game testing; not game-tested proof by itself; resources: {impacts}."
+    if stage == "game_tested_evidence_handoff":
+        return f"Records or prepares game-test evidence handoff; only accepted in-game evidence makes the module game-tested; resources: {impacts}."
+    return f"Previewable Map Studio edit/query; affected resources must be revalidated before export or game proof: {impacts}."
+
+
+def map_studio_tool_capability_summary(action: MapStudioToolBeltAction) -> MapStudioToolCapabilitySummary:
+    """Return capability/readiness metadata for one Map Studio action."""
+
+    return MapStudioToolCapabilitySummary(
+        capability_stage=_tool_capability_stage(action),
+        resource_impacts=_tool_resource_impacts(action),
+        readiness_summary=_tool_readiness_summary(action),
+    )
+
+
+def map_studio_tool_command_search(
+    query: str = "",
+    *,
+    limit: int = 50,
+    include_planned: bool = False,
+) -> tuple[MapStudioToolCommandSearchResult, ...]:
+    """Return a deterministic searchable command index for Map Studio tools."""
+
+    raw_query = str(query or "").strip().lower()
+    tokens = tuple(token for token in raw_query.replace("_", " ").split() if token)
+    results: list[MapStudioToolCommandSearchResult] = []
+    for action in _TOOL_BELT_ACTIONS:
+        if not include_planned and not action.implemented:
+            continue
+        workspace = str(action.workspace_key or "map").replace("_", " ")
+        capability = map_studio_tool_capability_summary(action)
+        searchable = " ".join(
+            (
+                action.key,
+                action.label,
+                workspace,
+                action.tool_key,
+                action.description,
+                action.kotor_guardrail,
+                action.hotkey,
+                action.shortcut_sequence,
+                action.shortcut_behavior,
+                capability.capability_stage,
+                " ".join(capability.resource_impacts),
+                capability.readiness_summary,
+            )
+        ).lower()
+        if tokens and not all(token in searchable for token in tokens):
+            continue
+        score = 1
+        label_lower = action.label.lower()
+        key_lower = action.key.lower()
+        if raw_query:
+            if raw_query == key_lower or raw_query == label_lower:
+                score += 100
+            if key_lower.startswith(raw_query) or label_lower.startswith(raw_query):
+                score += 50
+            if raw_query in key_lower or raw_query in label_lower:
+                score += 25
+            for token in tokens:
+                if key_lower.startswith(token) or label_lower.startswith(token):
+                    score += 10
+                elif token in searchable:
+                    score += 3
+        if action.implemented:
+            score += 5
+        display_label = f"{action.label} [{workspace}]"
+        if action.hotkey:
+            display_label = f"{display_label} - {action.hotkey}"
+        results.append(
+            MapStudioToolCommandSearchResult(
+                key=action.key,
+                label=action.label,
+                workspace_key=action.workspace_key,
+                tool_key=action.tool_key,
+                description=action.description,
+                kotor_guardrail=action.kotor_guardrail,
+                hotkey=action.hotkey,
+                shortcut_sequence=action.shortcut_sequence,
+                shortcut_behavior=action.shortcut_behavior,
+                capability_stage=capability.capability_stage,
+                resource_impacts=capability.resource_impacts,
+                readiness_summary=capability.readiness_summary,
+                implemented=action.implemented,
+                score=score,
+                display_label=display_label,
+                match_text=searchable,
+            )
+        )
+    ordered = sorted(results, key=lambda item: (-item.score, item.label.lower(), item.key))
+    if limit <= 0:
+        return tuple(ordered)
+    return tuple(ordered[: int(limit)])
 
 
 def map_studio_modeling_tool_summary(

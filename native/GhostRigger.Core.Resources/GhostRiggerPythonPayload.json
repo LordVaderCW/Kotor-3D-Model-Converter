@@ -2,7 +2,7 @@
     "schema": "ghostrigger_python_payload.v1",
     "phase": "P1.5 embedded python payload",
     "project": "GhostRigger.Core.Resources",
-    "file_count": 16,
+    "file_count": 21,
     "originals_remain_in_src": true,
     "files": [
         {
@@ -27,7 +27,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_ASSETS_RESOURCE_MANAGER",
             "source_path": "src/core/assets/resource_manager.py",
             "packaged_path": "Python/src/core/assets/resource_manager.py",
-            "sha256": "a7ec33e2c5817e63c2c81adf84be69c6ba444db172e4b6c9352e972b23520359"
+            "sha256": "f315d584449cccb77df10db46d5ec3e2d09a17ecf2c02a260b3c26f034fd3091"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GAME_INIT",
@@ -39,7 +39,7 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_GAME_GAME_LIBRARY_EXT",
             "source_path": "src/core/game/game_library_ext.py",
             "packaged_path": "Python/src/core/game/game_library_ext.py",
-            "sha256": "859fc6a1904c4b2fa18c066e99c4d22062fd3409100c3f188d13926ca3c48fff"
+            "sha256": "87b91541c79d6d26c0609700728c6cfc645340acc12c459ef5a1881138dc2fb9"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GAME_IMPORT_NORMALISATION",
@@ -51,19 +51,25 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_GAME_KOTOR_INSTALL",
             "source_path": "src/core/game/kotor_install.py",
             "packaged_path": "Python/src/core/game/kotor_install.py",
-            "sha256": "947e855a8fedb8fb2bd2c42277cfec49c068d3b837ee62986e52127864bc16f2"
+            "sha256": "318608e2f0ed19898cf6ea231f97de8988e8bb881ec273ce6f0803c7a2a4f223"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GAME_KOTOR_LOADER",
             "source_path": "src/core/game/kotor_loader.py",
             "packaged_path": "Python/src/core/game/kotor_loader.py",
-            "sha256": "a54e20a03a02ad366b7d80dbc274365f540e30fad8951d32ff8a58a9b20e9c98"
+            "sha256": "3f2c69f8913165df5cf9b8de7576ef62a8ec05c65d21c1b2e7493b86b54c0638"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GAME_PYKOTOR_BRIDGE",
             "source_path": "src/core/game/pykotor_bridge.py",
             "packaged_path": "Python/src/core/game/pykotor_bridge.py",
             "sha256": "39e373906d37968d202c34f40edbb4861656a2d659191e64d770c8c28918f924"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_GAME_PYKOTOR_GFF_RUNTIME_FIX",
+            "source_path": "src/core/game/pykotor_gff_runtime_fix.py",
+            "packaged_path": "Python/src/core/game/pykotor_gff_runtime_fix.py",
+            "sha256": "f9d0637d986bb355a04cc482c7b32abb1f64b39f17ec1aa71ea96fba33c33d6d"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GAME_PYKOTOR_MDL_IO_FIX",
@@ -75,13 +81,31 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_RESOURCES_INIT",
             "source_path": "src/core/resources/__init__.py",
             "packaged_path": "Python/src/core/resources/__init__.py",
-            "sha256": "b872fa553676a74f18a232694aea5665a5a1acbeee4a5c8a03a6f58d8829ae76"
+            "sha256": "969e411f4b8c419f9faacbc072f615607ade2df12569f7c388e7db36cbd9c13f"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_RESOURCES_GAME_RESOURCE_PROVIDER",
             "source_path": "src/core/resources/game_resource_provider.py",
             "packaged_path": "Python/src/core/resources/game_resource_provider.py",
-            "sha256": "f36cafda7c61df4e11a64dbb3a612384e9f34893bb0741887d17dd37b9cac9c6"
+            "sha256": "b02b90ff851d70042f893ea753a9195828e8907719db979554e093be125d7ba2"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_RESOURCES_HEAD_DONOR_CATALOG",
+            "source_path": "src/core/resources/head_donor_catalog.py",
+            "packaged_path": "Python/src/core/resources/head_donor_catalog.py",
+            "sha256": "fbf21546f012c35c40d1854ee131ae29d3a2f75785a6d845d0b05817e5dbc0f7"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_RESOURCES_HEAD_GAME_INSTALL",
+            "source_path": "src/core/resources/head_game_install.py",
+            "packaged_path": "Python/src/core/resources/head_game_install.py",
+            "sha256": "695a0ad08815faca32da40077f27ebf82c80b56a493e2221942d4ab2a87b1b68"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_RESOURCES_PLACEABLE_LIBRARY",
+            "source_path": "src/core/resources/placeable_library.py",
+            "packaged_path": "Python/src/core/resources/placeable_library.py",
+            "sha256": "7fd2405e28f5d546706b137e8493275adf9a0af87690f86b660737385ed0b211"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_RESOURCES_INIT",
@@ -100,6 +124,12 @@
             "source_path": "src/resources/game_library.py",
             "packaged_path": "Python/src/resources/game_library.py",
             "sha256": "ba903d7c5b33ab66b52a01e64af9d8d05b1374964d78b401fc6d05eb73044392"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_RESOURCES_KOTOR_UTC_TEMPLATE_CATALOG",
+            "source_path": "src/resources/kotor_utc_template_catalog.py",
+            "packaged_path": "Python/src/resources/kotor_utc_template_catalog.py",
+            "sha256": "7f30c46977ea6b92c42c43c5f2bcbf223d4dd729fe80d4e91a92d405a5f6c5d1"
         }
     ]
 }

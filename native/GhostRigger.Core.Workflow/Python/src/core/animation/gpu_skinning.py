@@ -310,6 +310,29 @@ def _mat4_rotation_only_py(m: List[List[float]]) -> List[List[float]]:
     ]
 
 
+def _mat4_batch_mul_np(
+    left: List[List[List[float]]],
+    right: List[List[List[float]]],
+):
+    """Multiply equally sized 4x4 batches in float64 when NumPy is present.
+
+    Keeping the input and result in float64 preserves the scalar palette path's
+    precision until the existing float32 GPU packing boundary.  Returning
+    ``None`` retains the pure-Python fallback used by embedded runtimes without
+    NumPy and gives correctness tests a direct scalar reference path.
+    """
+    if not _NUMPY or not left:
+        return None
+    try:
+        left_arr = np.asarray(left, dtype=np.float64)
+        right_arr = np.asarray(right, dtype=np.float64)
+        if left_arr.shape != right_arr.shape or left_arr.ndim != 3 or left_arr.shape[1:] != (4, 4):
+            return None
+        return np.matmul(left_arr, right_arr)
+    except Exception:
+        return None
+
+
 def _scene_root_source_relative_position(node, position, *, pose_space: bool) -> tuple[float, float, float]:
     """Return scene-object root position in source-model space.
 
@@ -428,6 +451,16 @@ class MatrixPaletteUploader:
         self._skin_palette_formula: str = ""
         self._skin_inverse_bind_source: str = ""
         self._skin_profile_reason: str = ""
+        # Immutable bind-world matrices are built alongside ``_inv_bind``.
+        # Retaining them avoids rebuilding and reinverting the skin node's
+        # parent chain for every new animation pose.
+        self._bind_world_by_name: Dict[str, List[List[float]]] = {}
+        self._bind_local_stamp_by_name: Dict[str, tuple] = {}
+        # Row-major float32 palette and padded column-major bytes for the most
+        # recently computed pose.  Renderer callers consume both immediately;
+        # caching them avoids repacking the same palette twice in BAS paths.
+        self._palette_numpy_cache = None
+        self._flat_bytes_cache: Optional[bytes] = None
 
     # ── Build inverse bind-pose ───────────────────────────────────────────────
 
@@ -460,6 +493,10 @@ class MatrixPaletteUploader:
         self._node_lookup.clear()
         self._node_parent.clear()
         self._name_to_dfs_index.clear()
+        self._bind_world_by_name.clear()
+        self._bind_local_stamp_by_name.clear()
+        self._palette_numpy_cache = None
+        self._flat_bytes_cache = None
         self._model_name = ""
         self._model_supermodel = ""
         self._model_node_count = 0
@@ -503,6 +540,12 @@ class MatrixPaletteUploader:
             if not name:
                 continue
             name_lower = name.lower()
+            # Keep the first native node for duplicate Odyssey names. K2 PFBCM
+            # nests a helper named ``lhand_g`` below the actual wrist joint;
+            # last-wins lookup made that helper appear to parent itself and
+            # detached the animated hand from the forearm.
+            if name_lower in self._node_lookup:
+                continue
             self._node_lookup[name_lower] = node
             source_dfs_idx = getattr(node, "_gr_source_dfs_index", None)
             if isinstance(source_dfs_idx, int) and source_dfs_idx >= 0:
@@ -520,6 +563,7 @@ class MatrixPaletteUploader:
                         "MatrixPaletteUploader: ignoring self-parent cycle on %s",
                         name,
                     )
+            self._bind_local_stamp_by_name[name_lower] = self._bind_local_transform_stamp(node)
 
         # Compute world-space bind matrices by walking parent chains.
         # Cache computed world bind matrices to avoid redundant chain walks.
@@ -583,6 +627,8 @@ class MatrixPaletteUploader:
             if not name:
                 continue
             name_lower = name.lower()
+            if self._node_lookup.get(name_lower) is not node:
+                continue
 
             # Compute world-space bind matrix and invert
             world_bind_m = _get_world_bind(name_lower)
@@ -596,9 +642,45 @@ class MatrixPaletteUploader:
                 self._bone_order.append(name_lower)
             count += 1
 
+        # Every named node above has forced its bind chain into this cache.
+        # Copy the mapping so per-skin palette computation can use the exact
+        # matrices and inverses already produced by this build pass.
+        self._bind_world_by_name = dict(_world_bind_cache)
+
         self._dirty = True
         log.debug(f"MatrixPaletteUploader: built {count} world-space inverse bind-pose matrices")
         return count
+
+    @staticmethod
+    def _bind_local_transform_stamp(node) -> tuple:
+        """Return the bind inputs whose stability permits world-bind reuse."""
+        pos = getattr(node, 'position', (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+        quat = getattr(node, 'rotation', (0.0, 0.0, 0.0, 1.0)) or (0.0, 0.0, 0.0, 1.0)
+        pos = _scene_root_source_relative_position(node, pos, pose_space=False)
+        parent = getattr(node, 'parent', None)
+        return (
+            tuple(float(value) for value in pos[:3]),
+            tuple(float(value) for value in quat[:4]),
+            id(parent) if parent is not None else 0,
+            str(getattr(parent, 'name', '') or '').lower() if parent is not None else '',
+            int(getattr(node, '_gr_revision', 0) or 0),
+        )
+
+    def _bind_chain_matches_build(self, node_name_lower: str) -> bool:
+        """Return whether a node and its ancestors still match the build pass."""
+        active: set[str] = set()
+        current = node_name_lower
+        while current:
+            if current in active:
+                return False
+            active.add(current)
+            node = self._node_lookup.get(current)
+            if node is None:
+                return False
+            if self._bind_local_stamp_by_name.get(current) != self._bind_local_transform_stamp(node):
+                return False
+            current = self._node_parent.get(current, '')
+        return True
 
     # ── Compute palette for current pose ─────────────────────────────────────
 
@@ -893,6 +975,20 @@ class MatrixPaletteUploader:
         preferred_layout = str(getattr(profile, 'preferred_qbone_layout', 'dfs') or 'dfs')
         preferred_formula = str(getattr(profile, 'preferred_formula', _SKIN_FORMULA_G5) or _SKIN_FORMULA_G5)
 
+        if bool(getattr(skin_node, '_gr_kotor_inverse_bind_qt', False)) and bone_map and qt_count >= len(bone_map):
+            # T2555: split region nodes carry compact per-slot rows rebuilt
+            # under the ENGINE convention (inverse(bone_world)*skin_world,
+            # WXYZ, used directly — the T2550 writer contract).  F1 would
+            # invert them a second time and double-transform every vertex;
+            # G5 consumes them directly, and its compact-layout guard indexes
+            # them by slot instead of DFS.
+            self._skin_profile_reason = (
+                f"species:{species} auto:compact_engine_inverse_bind "
+                f"model={self._model_name or '?'} qt={qt_count} "
+                f"bone_map={len(bone_map)}"
+            )
+            return _SKIN_FORMULA_G5
+
         if preferred_layout == "compact" and bone_map and qt_count >= len(bone_map):
             self._skin_profile_reason = (
                 f"species:{species} auto:compact_qbone model={self._model_name or '?'} "
@@ -972,7 +1068,16 @@ class MatrixPaletteUploader:
         # preview skinning, matching compute_palette(..., anim_base_pose=...).
         if anim_base_pose is not None:
             self.set_bind_pose_from_anim(anim_base_pose)
+        elif self._inv_bind_anim is not None:
+            # Animation-derived inverse binds are valid only while the caller
+            # supplies that animation's base pose.  BAS head attachments keep
+            # evaluating a skin palette after set_animation_pose(None), so a
+            # cached talk-pose bind would otherwise be combined with the
+            # static hierarchy and collapse the model when dialogue stops.
+            self.set_bind_pose_from_anim(None)
         self._palette = []
+        self._palette_numpy_cache = None
+        self._flat_bytes_cache = None
         self._skin_local_inv_bind_by_slot = {}
         self._skin_local_direct_bind_by_slot = {}
         self._skin_bind_matrix = None
@@ -1016,8 +1121,19 @@ class MatrixPaletteUploader:
                 pass
         active_inv_bind = self._inv_bind_anim if self._inv_bind_anim is not None else self._inv_bind
         skin_key = str(getattr(skin_node, 'name', '') or '').lower()
-        if skin_key:
+        if (
+            skin_key
+            and skin_key in self._bind_world_by_name
+            and self._bind_chain_matches_build(skin_key)
+        ):
+            skin_bind = self._bind_world_by_name[skin_key]
+            inv_skin_bind = self._inv_bind.get(skin_key, _mat4_identity_py())
+        elif skin_key:
             skin_bind = self._world_pose_matrix(skin_key, {}, {})
+            try:
+                inv_skin_bind = _mat4_invert_py(skin_bind)
+            except Exception:
+                inv_skin_bind = _mat4_identity_py()
         else:
             pos = getattr(skin_node, 'position', (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
             quat = getattr(skin_node, 'rotation', (0.0, 0.0, 0.0, 1.0)) or (0.0, 0.0, 0.0, 1.0)
@@ -1025,10 +1141,10 @@ class MatrixPaletteUploader:
                 _mat4_translate_py(float(pos[0]), float(pos[1]), float(pos[2])),
                 _quat_to_mat4(tuple(float(v) for v in quat[:4])),
             )
-        try:
-            inv_skin_bind = _mat4_invert_py(skin_bind)
-        except Exception:
-            inv_skin_bind = _mat4_identity_py()
+            try:
+                inv_skin_bind = _mat4_invert_py(skin_bind)
+            except Exception:
+                inv_skin_bind = _mat4_identity_py()
         self._skin_bind_matrix = skin_bind
         self._skin_bind_inverse_matrix = inv_skin_bind
         skin_bind_rot_only: Optional[List[List[float]]] = None
@@ -1071,9 +1187,13 @@ class MatrixPaletteUploader:
         )
         cached_binds = getattr(skin_node, "_gr_static_skin_bind_cache", None)
         if isinstance(cached_binds, dict) and cached_binds.get("key") == bind_cache_key:
-            static_bind_by_slot = dict(cached_binds.get("binds", {}) or {})
+            static_bind_by_slot = cached_binds.get("binds", {}) or {}
         else:
             static_bind_by_slot = {}
+            cached_binds = None
+        palette_world_matrices: List[List[List[float]]] = []
+        palette_inverse_binds: List[List[List[float]]] = []
+        palette_names: List[str] = []
         for idx, bname in enumerate(bone_map[:self._max_bones]):
             bkey = str(bname or '').lower()
             world_pose_m = (
@@ -1092,12 +1212,26 @@ class MatrixPaletteUploader:
                     # the bone is missing from the lookup so a malformed
                     # bone_map entry never crashes the renderer.
                     dfs_idx = self._name_to_dfs_index.get(bkey, -1) if bkey else -1
-                    if 0 <= dfs_idx < len(qbones) and dfs_idx < len(tbones):
+                    # T2555: MDL-loaded models carry full DFS-indexed qBone/
+                    # tBone arrays (len == model node count), but Character
+                    # Builder split parts carry COMPACT per-slot rows
+                    # (len == bone_map, recomputed at split under the same
+                    # inverse(bone_world)*skin_world convention).  Indexing a
+                    # compact array with a DFS index silently reads another
+                    # bone's bind row for early-DFS bones (torso_g, pelvis_g)
+                    # and identity for the rest — the K1 c_ithorian preview
+                    # exploded to 450x edge stretch this way.
+                    compact_layout = (
+                        len(qbones) == len(bone_map)
+                        and len(qbones) < int(self._model_node_count or 0)
+                    )
+                    row_idx = idx if compact_layout else dfs_idx
+                    if 0 <= row_idx < len(qbones) and row_idx < len(tbones):
                         inv_bind = self.qbone_inverse_bind_matrix_g5(
-                            qbones[dfs_idx], tbones[dfs_idx],
+                            qbones[row_idx], tbones[row_idx],
                         )
                         direct_bind = self.qbone_direct_bind_matrix(
-                            qbones[dfs_idx], tbones[dfs_idx],
+                            qbones[row_idx], tbones[row_idx],
                         )
                     else:
                         inv_bind = _mat4_identity_py()
@@ -1117,6 +1251,9 @@ class MatrixPaletteUploader:
                     static_bind_by_slot[idx] = (inv_bind, direct_bind)
             self._skin_local_inv_bind_by_slot[idx] = inv_bind
             self._skin_local_direct_bind_by_slot[idx] = direct_bind
+            palette_world_matrices.append(world_pose_m)
+            palette_inverse_binds.append(inv_bind)
+            palette_names.append(str(bname or ''))
             if active_formula == _SKIN_FORMULA_F11 and skin_bind_rot_only is not None and inv_skin_bind_rot_only is not None:
                 skin_m = _mat4_mul_py(
                     inv_skin_bind_rot_only,
@@ -1125,20 +1262,47 @@ class MatrixPaletteUploader:
                         _mat4_mul_py(inv_bind, skin_bind_rot_only),
                     ),
                 )
+                self._palette.append(BoneMatrix(
+                    flat_col=_mat4_to_flat_col(skin_m),
+                    bone_name=str(bname or ''),
+                    bone_index=idx,
+                ))
+
+        # F1 (production) and G5 both use the textbook LBS shape
+        # ``world_pose_m * inv_bind``. Batch only this final independent
+        # multiply; hierarchy evaluation above remains in canonical order.
+        palette_rows = None
+        if active_formula != _SKIN_FORMULA_F11:
+            palette_rows = _mat4_batch_mul_np(
+                palette_world_matrices,
+                palette_inverse_binds,
+            )
+            if palette_rows is not None:
+                for idx, bname in enumerate(palette_names):
+                    self._palette.append(BoneMatrix(
+                        flat_col=palette_rows[idx].T.reshape(16).tolist(),
+                        bone_name=bname,
+                        bone_index=idx,
+                    ))
             else:
-                # F1 (production) and G5 both use the textbook LBS shape
-                # ``world_pose_m * inv_bind``. The semantic difference is
-                # entirely in how ``inv_bind`` is constructed above.
-                skin_m = _mat4_mul_py(world_pose_m, inv_bind)
-            self._palette.append(BoneMatrix(
-                flat_col=_mat4_to_flat_col(skin_m),
-                bone_name=str(bname or ''),
-                bone_index=idx,
-            ))
+                for idx, (bname, world_pose_m, inv_bind) in enumerate(zip(
+                    palette_names,
+                    palette_world_matrices,
+                    palette_inverse_binds,
+                )):
+                    skin_m = _mat4_mul_py(world_pose_m, inv_bind)
+                    self._palette.append(BoneMatrix(
+                        flat_col=_mat4_to_flat_col(skin_m),
+                        bone_name=bname,
+                        bone_index=idx,
+                    ))
         try:
-            setattr(skin_node, "_gr_static_skin_bind_cache", {"key": bind_cache_key, "binds": static_bind_by_slot})
+            if cached_binds is None:
+                cached_binds = {"key": bind_cache_key, "binds": static_bind_by_slot}
+                setattr(skin_node, "_gr_static_skin_bind_cache", cached_binds)
         except Exception:
             pass
+        self._cache_palette_numpy_outputs(palette_rows)
         self._dirty = True
         return self._palette
 
@@ -1180,6 +1344,8 @@ class MatrixPaletteUploader:
         if anim_base_pose is not None:
             self.set_bind_pose_from_anim(anim_base_pose)
         self._palette = []
+        self._palette_numpy_cache = None
+        self._flat_bytes_cache = None
 
         # FIX-SKIN-BINDPOSE: When anim_pose is None (no animation), the
         # palette must be all-identity.  KotOR skin vertices are stored in
@@ -1283,6 +1449,40 @@ class MatrixPaletteUploader:
 
     # ── NumPy fast-path ───────────────────────────────────────────────────────
 
+    def _cache_palette_numpy_outputs(self, row_major_matrices=None) -> None:
+        """Cache row-major matrices and their padded GPU byte representation."""
+        self._palette_numpy_cache = None
+        self._flat_bytes_cache = None
+        if not _NUMPY or not self._palette:
+            return
+        try:
+            if row_major_matrices is None:
+                rows = np.asarray(
+                    [
+                        [
+                            [bm.flat_col[c * 4 + r] for c in range(4)]
+                            for r in range(4)
+                        ]
+                        for bm in self._palette
+                    ],
+                    dtype=np.float32,
+                )
+            else:
+                rows = np.asarray(row_major_matrices, dtype=np.float32)
+            if rows.ndim != 3 or rows.shape[1:] != (4, 4):
+                return
+            count = min(len(rows), self._max_bones)
+            rows = np.ascontiguousarray(rows[:count], dtype=np.float32)
+            self._palette_numpy_cache = rows
+            identity_flat = np.eye(4, dtype=np.float32).reshape(16)
+            padded = np.tile(identity_flat, self._max_bones)
+            if count:
+                padded[:count * 16] = rows.transpose(0, 2, 1).reshape(-1)
+            self._flat_bytes_cache = padded.tobytes()
+        except Exception:
+            self._palette_numpy_cache = None
+            self._flat_bytes_cache = None
+
     def as_numpy_array(self) -> Optional['np.ndarray']:
         """Return the palette as a float32 NumPy array of shape (N, 4, 4).
 
@@ -1291,6 +1491,8 @@ class MatrixPaletteUploader:
         """
         if not _NUMPY or not self._palette:
             return None
+        if self._palette_numpy_cache is not None:
+            return self._palette_numpy_cache.copy()
         n = len(self._palette)
         arr = np.zeros((n, 4, 4), dtype=np.float32)
         for i, bm in enumerate(self._palette):
@@ -1307,6 +1509,8 @@ class MatrixPaletteUploader:
         Layout: N × 16 × float32 (column-major per matrix, std430).
         Pads to ``max_bones`` with identity matrices.
         """
+        if self._flat_bytes_cache is not None:
+            return self._flat_bytes_cache
         flat: List[float] = []
         for bm in self._palette:
             flat.extend(bm.flat_col)

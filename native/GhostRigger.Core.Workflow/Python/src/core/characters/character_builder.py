@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Dict, Set
 
@@ -291,8 +292,21 @@ def load_game_skeleton_source(
 
     try:
         inst = KotorInstallation(root)
-        mdl_bytes = inst.get_mdl(name)
-        mdx_bytes = inst.get_mdx(name) or b""
+        # Prefer the KEY/BIF base archives: the user's Override folder holds
+        # their own exported models, and a rig reference must be the true
+        # vanilla DAG, not whatever custom export currently shadows it.
+        source_layer = "base_game_archive"
+        get_mdl_bif = getattr(inst, "get_mdl_bif", None)
+        mdl_bytes = get_mdl_bif(name) if callable(get_mdl_bif) else None
+        if mdl_bytes:
+            get_mdx_bif = getattr(inst, "get_mdx_bif", None)
+            mdx_bytes = (
+                get_mdx_bif(name) if callable(get_mdx_bif) else None
+            ) or b""
+        else:
+            source_layer = "game_library"
+            mdl_bytes = inst.get_mdl(name)
+            mdx_bytes = inst.get_mdx(name) or b""
         if not mdl_bytes:
             log.warning("load_game_skeleton_source: %s not found in %s", name, root)
             return None
@@ -302,7 +316,7 @@ def load_game_skeleton_source(
             model.name = getattr(model, "name", None) or name
             setattr(model, "_gr_source_resref", name)
             setattr(model, "_gr_source_game", "K2" if gv == GameVersion.K2 else "K1")
-            setattr(model, "_gr_source_layer", "game_library")
+            setattr(model, "_gr_source_layer", source_layer)
             setattr(model, "_gr_source_game_dir", root)
             setattr(
                 model,
@@ -316,6 +330,291 @@ def load_game_skeleton_source(
     except Exception as exc:
         log.error("load_game_skeleton_source: failed for %s/%s: %s", game, name, exc)
         return None
+
+
+def log_character_builder_event(event: str, **fields: Any) -> None:
+    """Emit one structured Character Builder diagnostic event.
+
+    These logs are intentionally compact JSON inside the normal GhostRigger log
+    stream.  A live retest can filter for ``CHARBUILDER-DIAG`` and see which
+    source mesh, base skeleton, donor skin rows, bone-map slots, and preview
+    gates were actually used.
+    """
+
+    payload = {"event": str(event or "unknown")}
+    payload.update({str(key): _diag_safe(value) for key, value in fields.items()})
+    try:
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        text = json.dumps({"event": payload["event"], "error": "diag_serialize_failed"})
+    log.info("CHARBUILDER-DIAG %s", text)
+
+
+def summarize_model_for_character_builder(model: Any) -> dict:
+    """Return a small diagnostic summary for a KOTOR/imported model."""
+
+    nodes = _model_nodes_for_diag(model)
+    mesh_nodes = [
+        node for node in nodes
+        if bool(getattr(node, "vertices", None))
+    ]
+    skin_nodes = [
+        node for node in nodes
+        if bool(getattr(node, "is_skin", False))
+        and bool(getattr(node, "vertices", None))
+        and bool(getattr(node, "skin_data", None))
+        and bool(getattr(node, "bone_map", None))
+    ]
+    return {
+        "name": str(getattr(model, "name", "") or ""),
+        "source_resref": str(getattr(model, "_gr_source_resref", "") or ""),
+        "requested_resref": str(getattr(model, "_gr_requested_resref", "") or ""),
+        "target_resref": str(getattr(model, "_gr_target_resref", "") or ""),
+        "source_game": str(getattr(model, "_gr_source_game", "") or ""),
+        "supermodel": str(getattr(model, "supermodel", "") or "NULL"),
+        "node_count": len(nodes),
+        "mesh_node_count": len(mesh_nodes),
+        "vertex_count": sum(len(list(getattr(node, "vertices", []) or [])) for node in mesh_nodes),
+        "face_count": sum(len(list(getattr(node, "faces", []) or [])) for node in mesh_nodes),
+        "bounds": _diag_bounds_for_nodes(mesh_nodes),
+        "skin": _skin_donor_summary(model),
+    }
+
+
+def _resolve_template_weight_donor(template_model: Any, game: str) -> tuple[Any, str, dict]:
+    """Return a donor model with usable skin rows for weight transfer.
+
+    The selected skeleton seen in the viewport can be skeleton-only.  Binding
+    needs the real native render payload too, because donor surface weights are
+    what prevent a creature replacement from collapsing to a rigid one-bone
+    bind.  When the active template has no usable donor skin, reload the real
+    game MDL by its source/target resref and use that only as the weight donor.
+    """
+
+    summary = _skin_donor_summary(template_model)
+    if _skin_donor_summary_is_usable(summary):
+        return template_model, "selected_template", summary
+
+    for resref in _template_resref_candidates(template_model):
+        donor = load_game_skeleton_source(resref, game=game)
+        donor_summary = _skin_donor_summary(donor)
+        if _skin_donor_summary_is_usable(donor_summary):
+            return donor, f"reloaded_game_mdl:{resref}", donor_summary
+
+    return template_model, "selected_template_no_usable_skin", summary
+
+
+def _template_resref_candidates(model: Any) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    values = [
+        getattr(model, "_gr_source_resref", ""),
+        getattr(model, "_gr_variant_source_resref", ""),
+        getattr(model, "_gr_requested_resref", ""),
+        getattr(model, "_gr_target_resref", ""),
+    ]
+    if (
+        getattr(model, "_gr_source_layer", "")
+        or getattr(model, "_gr_source_game", "")
+        or any(str(value or "").strip() for value in values)
+    ):
+        values.append(getattr(model, "name", ""))
+    for value in values:
+        token = str(value or "").strip().lower()
+        token = "".join(ch for ch in token if ch.isalnum() or ch == "_")
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def _skin_donor_summary(model: Any) -> dict:
+    nodes = _model_nodes_for_diag(model)
+    skin_nodes = []
+    for node in nodes:
+        verts = list(getattr(node, "vertices", []) or [])
+        skin_rows = list(getattr(node, "skin_data", []) or [])
+        bone_map = list(getattr(node, "bone_map", []) or [])
+        if not bool(getattr(node, "is_skin", False)):
+            continue
+        if not verts or not skin_rows or not bone_map:
+            continue
+        skin_nodes.append((node, verts, skin_rows, bone_map))
+    return {
+        "model_name": str(getattr(model, "name", "") or ""),
+        "skin_node_count": len(skin_nodes),
+        "skin_vertices": sum(len(item[1]) for item in skin_nodes),
+        "skin_rows": sum(len(item[2]) for item in skin_nodes),
+        "max_bone_map": max((len(item[3]) for item in skin_nodes), default=0),
+        "skin_node_names": [
+            str(getattr(item[0], "name", "") or "")
+            for item in skin_nodes[:8]
+        ],
+    }
+
+
+def _skin_donor_summary_is_usable(summary: dict) -> bool:
+    return (
+        int(summary.get("skin_node_count") or 0) > 0
+        and int(summary.get("skin_rows") or 0) > 0
+        and int(summary.get("max_bone_map") or 0) > 0
+    )
+
+
+def _model_nodes_for_diag(model: Any) -> list[Any]:
+    if model is None:
+        return []
+    all_nodes = getattr(model, "all_nodes", None)
+    if callable(all_nodes):
+        try:
+            return list(all_nodes())
+        except Exception:
+            return []
+    root = getattr(model, "root_node", None)
+    return [root] if root is not None else []
+
+
+def _node_names_for_character_builder(model: Any, *, limit: int = 32) -> list[str]:
+    return [
+        str(getattr(node, "name", "") or "")
+        for node in _model_nodes_for_diag(model)[: max(0, int(limit))]
+    ]
+
+
+def _ensure_template_rig_root_model(
+    result_model: Any,
+    *,
+    mesh_model: Any,
+    template_model: Any,
+    skel_root: Any,
+    supermodel: str,
+) -> tuple[Any, bool]:
+    """Ensure the generated rig model walks the cloned native skeleton DAG.
+
+    Some imported model wrappers can carry cached node lists.  Setting
+    ``root_node`` on a deep copy then leaves ``all_nodes()`` reporting the old
+    two-node import hierarchy even though the cloned KOTOR skeleton object
+    exists.  Binding against that stale walk collapses creature skins to one
+    fallback slot.  Verify the walk and rebuild a clean KotorModel shell when
+    the selected skeleton root is not active.
+    """
+
+    try:
+        result_model.root_node = skel_root
+    except Exception:
+        pass
+    result_model.supermodel = str(supermodel or "NULL")
+    if _model_walk_contains_root(result_model, skel_root):
+        return result_model, False
+
+    try:
+        from src.core.geometry.model_data import KotorModel  # type: ignore
+    except Exception:  # pragma: no cover
+        KotorModel = type(result_model)  # type: ignore[assignment]
+
+    try:
+        rebuilt = KotorModel(
+            name=str(getattr(mesh_model, "name", "") or getattr(result_model, "name", "") or "character"),
+            supermodel=str(supermodel or "NULL"),
+            root_node=skel_root,
+        )
+    except Exception:
+        rebuilt = result_model
+        rebuilt.root_node = skel_root
+        rebuilt.supermodel = str(supermodel or "NULL")
+        return rebuilt, not _model_walk_contains_root(result_model, skel_root)
+
+    import copy
+
+    for attr in (
+        "classification",
+        "game_version",
+        "model_type",
+        "subclassification",
+        "unknown_byte",
+        "disable_fog",
+        "anim_scale",
+        "bb_min",
+        "bb_max",
+        "radius",
+        "mdl_path",
+        "mdx_path",
+        "super_root_node_name",
+        "geometry_node_count",
+        "preserve_native_supernode_numbers",
+    ):
+        if hasattr(result_model, attr):
+            try:
+                setattr(rebuilt, attr, copy.deepcopy(getattr(result_model, attr)))
+            except Exception:
+                pass
+
+    metadata = getattr(result_model, "metadata", None)
+    if isinstance(metadata, dict):
+        try:
+            rebuilt.metadata = copy.deepcopy(metadata)
+        except Exception:
+            rebuilt.metadata = dict(metadata)
+
+    for key, value in (getattr(result_model, "__dict__", {}) or {}).items():
+        if not key.startswith("_gr_"):
+            continue
+        try:
+            setattr(rebuilt, key, copy.deepcopy(value))
+        except Exception:
+            try:
+                setattr(rebuilt, key, value)
+            except Exception:
+                pass
+    return rebuilt, True
+
+
+def _model_walk_contains_root(model: Any, root: Any) -> bool:
+    if model is None or root is None:
+        return False
+    if getattr(model, "root_node", None) is not root:
+        return False
+    return any(node is root for node in _model_nodes_for_diag(model))
+
+
+def _diag_bounds_for_nodes(nodes: list[Any]) -> dict:
+    mins = [float("inf"), float("inf"), float("inf")]
+    maxs = [float("-inf"), float("-inf"), float("-inf")]
+    found = False
+    for node in nodes:
+        for vertex in list(getattr(node, "vertices", []) or []):
+            try:
+                x, y, z = float(vertex[0]), float(vertex[1]), float(vertex[2])
+            except Exception:
+                continue
+            mins[0] = min(mins[0], x)
+            mins[1] = min(mins[1], y)
+            mins[2] = min(mins[2], z)
+            maxs[0] = max(maxs[0], x)
+            maxs[1] = max(maxs[1], y)
+            maxs[2] = max(maxs[2], z)
+            found = True
+    if not found:
+        return {}
+    return {
+        "min": [round(v, 6) for v in mins],
+        "max": [round(v, 6) for v in maxs],
+        "extent": [round(maxs[i] - mins[i], 6) for i in range(3)],
+    }
+
+
+def _diag_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_diag_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_diag_safe(item) for item in value[:32]]
+    if isinstance(value, dict):
+        return {str(key): _diag_safe(item) for key, item in value.items()}
+    return str(value)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -425,6 +724,22 @@ def validate_facial_bones(head_model) -> List[str]:
     return warnings
 
 
+def _import_animation_engine():  # pragma: no cover - import shim
+    try:
+        from src.core.animation import animation_engine as _animation
+    except ImportError:
+        from core.animation import animation_engine as _animation  # type: ignore
+    return _animation
+
+
+def _import_facial_performance():  # pragma: no cover - import shim
+    try:
+        from src.core.animation import facial_performance as _facial
+    except ImportError:
+        from core.animation import facial_performance as _facial  # type: ignore
+    return _facial
+
+
 class LIPPlayback:
     """LIP sync playback engine for character builder facial preview.
 
@@ -447,6 +762,9 @@ class LIPPlayback:
     def __init__(self):
         self._lip_data = None      # LIPFile instance
         self._talk_anim = None     # Animation named 'talk' from head model
+        self._animation_engine = None
+        self._head_model = None
+        self._shape_times = tuple(index / 30.0 for index in range(16))
         self._elapsed = 0.0        # current playback time
         self._playing = False
 
@@ -486,15 +804,142 @@ class LIPPlayback:
         """
         if head_model is None:
             return False
-        anims = getattr(head_model, 'animations', [])
-        for anim in anims:
-            name = getattr(anim, 'name', '').lower()
-            if name == 'talk' or name.endswith('_talk'):
-                self._talk_anim = anim
-                log.debug(f"LIPPlayback: found talk animation '{anim.name}'")
-                return True
-        log.debug("LIPPlayback: no 'talk' animation found in head model")
-        return False
+        try:
+            animation = _import_animation_engine()
+            engine = animation.AnimationEngine(head_model)
+            if not engine.play("talk", loop=False, blend=False):
+                log.debug(
+                    "LIPPlayback: no local or inherited 'talk' animation "
+                    "found for %s",
+                    getattr(head_model, "name", "head"),
+                )
+                return False
+        except Exception:
+            log.debug(
+                "LIPPlayback: failed to resolve 'talk' animation",
+                exc_info=True,
+            )
+            return False
+        self._animation_engine = engine
+        self._talk_anim = engine.current_animation
+        self._head_model = head_model
+        self._shape_times = self._controller_shape_times(self._talk_anim)
+        log.debug(
+            "LIPPlayback: found talk animation '%s' through AnimationEngine",
+            getattr(self._talk_anim, "name", "talk"),
+        )
+        return True
+
+    @staticmethod
+    def _controller_shape_times(talk_animation) -> Tuple[float, ...]:
+        """Return the 16 controller slots used as KOTOR viseme poses."""
+
+        nodes = getattr(talk_animation, "nodes", ()) or ()
+        if isinstance(nodes, dict):
+            nodes = nodes.values()
+        for node in nodes:
+            for controller in getattr(node, "controllers", ()) or ():
+                try:
+                    times = tuple(float(value) for value in controller.get("times", ()))
+                    values = tuple(controller.get("values", ()))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if len(times) >= 16 and len(values) >= 16:
+                    return times[:16]
+        length = max(
+            0.0,
+            float(getattr(talk_animation, "length", 0.0) or 0.0),
+        )
+        if length > 0.0:
+            return tuple(length * index / 15.0 for index in range(16))
+        return tuple(index / 30.0 for index in range(16))
+
+    def _evaluate_shape(self, shape_index: int):
+        if self._animation_engine is None:
+            return None
+        index = max(0, min(15, int(shape_index)))
+        pose = self._animation_engine.evaluate(self._shape_times[index])
+        try:
+            setattr(pose, "_gr_animation_source_model_id", id(self._head_model))
+            setattr(
+                pose,
+                "_gr_animation_source_model_name",
+                str(getattr(self._head_model, "name", "") or ""),
+            )
+            setattr(pose, "_gr_animation_name", "talk")
+        except Exception:
+            pass
+        return pose
+
+    def animation_pose_for_shapes(
+        self,
+        left_shape: int,
+        right_shape: int,
+        factor: float,
+        *,
+        time_seconds: Optional[float] = None,
+    ):
+        """Evaluate and directly blend two arbitrary talk-animation slots."""
+
+        if self._animation_engine is None or self._talk_anim is None:
+            return None
+        left_index = max(0, min(15, int(left_shape)))
+        right_index = max(0, min(15, int(right_shape)))
+        left_pose = self._evaluate_shape(left_index)
+        if left_pose is None:
+            return None
+        alpha = max(0.0, min(1.0, float(factor)))
+        if left_index == right_index or alpha <= 0.0:
+            return left_pose
+        right_pose = self._evaluate_shape(right_index)
+        if right_pose is None:
+            return left_pose
+        facial = _import_facial_performance()
+        animation = _import_animation_engine()
+        output_time = (
+            float(time_seconds)
+            if time_seconds is not None
+            else (
+                self._shape_times[left_index]
+                + (
+                    self._shape_times[right_index]
+                    - self._shape_times[left_index]
+                )
+                * alpha
+            )
+        )
+        return facial.blend_animation_poses(
+            left_pose,
+            right_pose,
+            alpha,
+            animation_module=animation,
+            time_seconds=output_time,
+        )
+
+    def animation_pose_for_viseme(self, viseme_index: int):
+        """Return one exact KOTOR talk pose for Head Builder preview."""
+
+        index = max(0, min(15, int(viseme_index)))
+        return self.animation_pose_for_shapes(
+            index,
+            index,
+            0.0,
+            time_seconds=self._shape_times[index],
+        )
+
+    def animation_pose_at_time(self, time_seconds: float):
+        """Evaluate the loaded LIP timeline as one native AnimPose."""
+
+        if self._lip_data is None:
+            return None
+        facial = _import_facial_performance()
+        blend = facial.sample_lip_blend(self._lip_data, time_seconds)
+        return self.animation_pose_for_shapes(
+            blend.left_shape,
+            blend.right_shape,
+            blend.factor,
+            time_seconds=float(time_seconds),
+        )
 
     def update(self, dt: float) -> Optional[dict]:
         """Advance playback by dt seconds and return current bone poses.
@@ -511,47 +956,26 @@ class LIPPlayback:
 
         self._elapsed += dt
 
-        # Check if we've passed the end of the LIP data
-        sound_length = getattr(self._lip_data, 'sound_length', 0.0)
-        if sound_length > 0 and self._elapsed > sound_length:
+        # Check if we've passed the end of the LIP data.
+        duration = self.duration
+        if duration > 0 and self._elapsed > duration:
             self._playing = False
             self._elapsed = 0.0
             return None
 
-        # Get interpolated shape values at current time
-        # KotOR.js LIPObject.ts line 195: get the current and next keyframes
-        shape_data = self._lip_data.get_shape_at_time(self._elapsed)
-        if shape_data is None:
+        pose = self.animation_pose_at_time(self._elapsed)
+        if pose is None:
             return {}
-
-        # shape_data contains (shape_index, interpolation_factor)
-        # or just the shape index depending on lip_reader implementation
-        current_shape = shape_data if isinstance(shape_data, int) else int(shape_data)
-
-        # Build bone pose from talk animation controller data
-        # KotOR.js algorithm: for each animation node, use shape index
-        # to select Position/Orientation keyframe values
-        if self._talk_anim is None:
-            return {}
-
-        poses = {}
-        nodes = getattr(self._talk_anim, 'nodes', {})
-        for bone_name, node_data in nodes.items():
-            pose = {}
-            # Position controller: indexed by shape index
-            pos_vals = getattr(node_data, 'position_values', None)
-            if pos_vals and current_shape < len(pos_vals):
-                pose['position'] = tuple(pos_vals[current_shape][:3])
-
-            # Rotation controller: indexed by shape index
-            rot_vals = getattr(node_data, 'rotation_values', None)
-            if rot_vals and current_shape < len(rot_vals):
-                pose['rotation'] = tuple(rot_vals[current_shape][:4])
-
-            if pose:
-                poses[bone_name.lower()] = pose
-
-        return poses
+        facial = _import_facial_performance()
+        records = facial.pose_to_mapping(pose)
+        return {
+            bone_name: {
+                key: value
+                for key, value in record.items()
+                if key in {"position", "rotation", "scale", "alpha", "selfillum"}
+            }
+            for bone_name, record in records.items()
+        }
 
     def play(self):
         """Start playback from the beginning."""
@@ -581,9 +1005,7 @@ class LIPPlayback:
 
     @property
     def duration(self) -> float:
-        if self._lip_data is None:
-            return 0.0
-        return getattr(self._lip_data, 'sound_length', 0.0)
+        return _import_facial_performance().lip_duration(self._lip_data)
 
 
 def rebuild_templates(out_dir: Optional[str] = None) -> List[str]:
@@ -964,6 +1386,16 @@ def apply_template_rig(
 
         import copy
         skel_root = copy.deepcopy(tmpl_root)
+        creature_skeleton_fit_report = _apply_creature_skeleton_fit_targets(
+            skel_root,
+            mesh_model,
+        )
+        if bool(creature_skeleton_fit_report.get("applied", False)):
+            warnings.append(
+                "Adjusted native creature skeleton pivots to the imported "
+                "mesh using regional correspondence targets "
+                f"({int(creature_skeleton_fit_report.get('moved_bones', 0))} bone(s))."
+            )
 
         replaced_native_render_nodes: List[dict] = []
         removed_template_meshes = _strip_render_geometry_from_skeleton(
@@ -999,10 +1431,97 @@ def apply_template_rig(
                 f"Removed {removed_template_meshes} reference mesh node(s) from the base skeleton."
             )
 
-        result_model.root_node = skel_root
+        result_model, root_shell_rebuilt = _ensure_template_rig_root_model(
+            result_model,
+            mesh_model=mesh_model,
+            template_model=template_model,
+            skel_root=skel_root,
+            supermodel=sm or "NULL",
+        )
+        if root_shell_rebuilt:
+            warnings.append(
+                "Rebuilt the rig result model shell so the native skeleton "
+                "DAG is the active node hierarchy."
+            )
+        # The native KOTOR skeleton is the DAG authority, so the rig result
+        # carries ITS identity — not the imported payload's model name or
+        # classification (an FBX import can arrive tagged as e.g. TILE).
+        result_model.name = str(
+            getattr(skel_root, "name", "")
+            or getattr(template_model, "name", "")
+            or getattr(result_model, "name", "")
+            or "character"
+        )
+        try:
+            result_model.model_type = int(
+                getattr(template_model, "model_type", result_model.model_type)
+            )
+        except Exception:
+            pass
+        template_classification = str(
+            getattr(template_model, "classification", "") or ""
+        )
+        if template_classification:
+            result_model.classification = template_classification
+        # anim_scale is part of the ANIMATION contract, not the mesh payload:
+        # supermodel-inherited position tracks are multiplied by the
+        # requesting model's anim_scale (KotorBlender p1 = restloc +
+        # animscale*val; SuperModelResolver seeds its cumulative product with
+        # it).  c_rancorS ships 0.336 — leaving the FBX default 1.0 played
+        # every inherited clip's translations ~3x too large (cdie dropped the
+        # model through the floor) and is also written to the MDL header at
+        # export (T2535).
+        try:
+            template_anim_scale = float(
+                getattr(template_model, "anim_scale", 0.0) or 0.0
+            )
+        except Exception:
+            template_anim_scale = 0.0
+        if template_anim_scale > 0.0:
+            result_model.anim_scale = template_anim_scale
         result_model.animations = list(template_model.animations)
+        controller_restore_report = _restore_native_static_controllers(
+            result_model, template_model
+        )
+        if (
+            controller_restore_report.get("restored_count")
+            or controller_restore_report.get("refreshed_metadata_count")
+        ):
+            log_character_builder_event(
+                "apply_template_rig.native_static_controllers_restored",
+                **controller_restore_report,
+            )
         if native_skeleton_snapshot is not None:
             setattr(result_model, "_gr_native_skeleton_snapshot", native_skeleton_snapshot)
+
+        log_character_builder_event(
+            "apply_template_rig.root_verified",
+            root=str(getattr(getattr(result_model, "root_node", None), "name", "") or ""),
+            node_count=len(_model_nodes_for_diag(result_model)),
+            first_nodes=_node_names_for_character_builder(result_model),
+            rebuilt_shell=bool(root_shell_rebuilt),
+            payload_names=[
+                str(getattr(mesh_node, "name", "") or "")
+                for mesh_node in mesh_payloads
+            ],
+        )
+
+        weight_donor_model, weight_donor_source, weight_donor_summary = (
+            _resolve_template_weight_donor(template_model, game)
+        )
+        log_character_builder_event(
+            "apply_template_rig.pre_bind",
+            game=game,
+            template=summarize_model_for_character_builder(template_model),
+            weight_donor_source=weight_donor_source,
+            weight_donor=weight_donor_summary,
+            imported_payload=summarize_model_for_character_builder(mesh_model),
+            cleaned_payload=summarize_model_for_character_builder(result_model),
+            payload_names=[
+                str(getattr(mesh_node, "name", "") or "")
+                for mesh_node in mesh_payloads
+            ],
+        )
 
         try:
             try:
@@ -1012,7 +1531,7 @@ def apply_template_rig(
             bind_report = bind_imported_meshes_to_skeleton(
                 result_model,
                 mesh_nodes=mesh_payloads,
-                donor_model=template_model,
+                donor_model=weight_donor_model,
             )
             if not bind_report.ok:
                 return {"ok": False, "model": None,
@@ -1020,11 +1539,89 @@ def apply_template_rig(
                         "warnings": warnings + list(bind_report.warnings or []),
                         "scale": applied_scale}
             warnings.extend(bind_report.warnings or [])
+            # T2532 (restored) / T2526: vanilla skin vertices are authored in
+            # the animation t=0 pose space, so preview skinning routes through
+            # set_bind_pose_from_anim().  Meshes fitted by the creature
+            # auto-fit pipeline keep their vertices in REST-pose space, and
+            # base-bind skinning deforms every animation with position tracks
+            # (Rancor audit: max edge stretch 39.2 -> 8.4, p95 3.9 -> 1.3
+            # when the flag is off).  Gate on the creature-fit signal; the
+            # original T2532 anim_scale!=1.0 heuristic misclassified both
+            # n_mandalorian (1.06, humanoid) and c_drexlf (1.0, creature).
+            # GHOSTRIGGER_FORCE_ANIM_BASE_BIND=1 forces the flag back on.
+            use_anim_base_bind = not bool(
+                creature_skeleton_fit_report.get("applied", False)
+            )
+            if os.environ.get("GHOSTRIGGER_FORCE_ANIM_BASE_BIND") == "1":
+                use_anim_base_bind = True
             for mesh_node in mesh_payloads:
                 setattr(mesh_node, "_gr_bound_to_kotor_skeleton", True)
                 setattr(mesh_node, "_gr_kotor_skeleton_root", str(getattr(skel_root, "name", "") or ""))
                 setattr(mesh_node, "_gr_kotor_bone_map_source", "character_builder_template_rig")
-                setattr(mesh_node, "_gr_use_animation_base_bind_for_preview", True)
+                setattr(
+                    mesh_node,
+                    "_gr_use_animation_base_bind_for_preview",
+                    use_anim_base_bind,
+                )
+            # T2557: kit-bashed payloads are shell soups (the K1 Sith
+            # Ithorian is 311 disconnected plates) and Euclidean donor
+            # transfer mixes anatomically distant bones inside single rigid
+            # shells.  Regularize weights over the payload graph (face edges
+            # + inter-shell bridges) before anything downstream consumes
+            # them; coherent single-shell payloads anchor everywhere and
+            # pass through unchanged.
+            try:
+                try:
+                    from .headless_body_workflow import (
+                        regularize_imported_skin_weights,
+                    )
+                except ImportError:  # pragma: no cover
+                    from headless_body_workflow import (  # type: ignore
+                        regularize_imported_skin_weights,
+                    )
+                donor_surface_points: list = []
+                try:
+                    from .headless_body_workflow import (
+                        _node_world_vertices_for_split as _world_verts,
+                    )
+                    import numpy as _np
+                    for donor_skin in (
+                        weight_donor_model.all_nodes()
+                        if weight_donor_model is not None else []
+                    ):
+                        if not bool(getattr(donor_skin, "is_skin", False)):
+                            continue
+                        if not getattr(donor_skin, "vertices", None):
+                            continue
+                        try:
+                            world = _world_verts(donor_skin, _np)
+                        except Exception:
+                            world = _np.asarray(
+                                [tuple(float(c) for c in v[:3])
+                                 for v in donor_skin.vertices]
+                            )
+                        donor_surface_points.extend(world.tolist())
+                except Exception:
+                    donor_surface_points = []
+                for mesh_node in mesh_payloads:
+                    regularization = regularize_imported_skin_weights(
+                        mesh_node,
+                        donor_surface_points=donor_surface_points or None,
+                    )
+                    if regularization and regularization.get("applied"):
+                        log_character_builder_event(
+                            "apply_template_rig.skin_weight_regularization",
+                            node=str(getattr(mesh_node, "name", "") or ""),
+                            **regularization,
+                        )
+                    elif regularization:
+                        warnings.append(
+                            "Skin-weight regularization skipped for "
+                            f"'{getattr(mesh_node, 'name', '?')}': "
+                            f"{regularization.get('reason', 'unknown')}"
+                        )
+            except Exception:
+                log.exception("skin-weight regularization failed")
             metadata = getattr(result_model, "metadata", None)
             if not isinstance(metadata, dict):
                 metadata = {}
@@ -1079,6 +1676,8 @@ def apply_template_rig(
             donor_weight_transfer = bool(getattr(bind_report, "donor_weight_transfer", False))
             source_skin_remap = bool(getattr(bind_report, "source_skin_remap", False))
             source_hand_refinement = bool(getattr(bind_report, "source_hand_refinement", False))
+            creature_wing_refinement = bool(getattr(bind_report, "creature_wing_refinement", False))
+            collapsed_bind_repairs = int(getattr(bind_report, "collapsed_bind_repairs", 0) or 0)
             metadata["character_builder_bind"] = {
                 "status": "bound_to_native_kotor_skeleton",
                 "skeleton_root": str(getattr(skel_root, "name", "") or ""),
@@ -1088,8 +1687,11 @@ def apply_template_rig(
                     "game": native_base_game,
                     "supermodel": sm or "NULL",
                     "dag_authority": "native_kotor_base",
+                    "creature_skeleton_fit": creature_skeleton_fit_report,
                     "dag_fingerprint": native_dag_fingerprint,
                     "dag_fingerprint_algorithm": native_dag_fingerprint_algorithm,
+                    "weight_donor_source": weight_donor_source,
+                    "weight_donor": weight_donor_summary,
                     "replaced_render_payload_nodes": replaced_native_render_nodes,
                     "replaced_render_payload_count": len(replaced_native_render_nodes),
                 },
@@ -1118,8 +1720,15 @@ def apply_template_rig(
                     "donor_weight_transfer": donor_weight_transfer,
                     "source_skin_remap": source_skin_remap,
                     "source_hand_refinement": source_hand_refinement,
+                    "creature_wing_refinement": creature_wing_refinement,
+                    "collapsed_bind_repairs": collapsed_bind_repairs,
                     "mesh_reports": list(getattr(bind_report, "mesh_reports", None) or []),
                     "note": (
+                        "Native-template donor weights were transferred by nearest "
+                        "surface vertex, then creature wing membrane weights were "
+                        "refined onto animated native wing helper nodes. Preview "
+                        "inherited animations before claiming launch-quality deformation."
+                        if creature_wing_refinement and donor_weight_transfer else
                         "Imported source skin weights were remapped onto the "
                         "selected native KOTOR skeleton by semantic bone role. "
                         "Native hand/finger refinement was applied. "
@@ -1167,12 +1776,33 @@ def apply_template_rig(
 
         log.info(
             "apply_template_rig: success  game=%s  scale=%.3f  "
-            "skel_bones=%d  skinned=%d  weighted=%d  anims=%d",
+            "skel_bones=%d  skinned=%d  weighted=%d  bone_slots=%d  "
+            "bind=%s  donor=%s  donor_source=%s  repairs=%d  anims=%d",
             game, applied_scale,
             template_model.node_count(),
             bind_report.skinned_meshes,
             bind_report.weighted_vertices,
+            bind_report.bone_count,
+            getattr(bind_report, "weighting_method", ""),
+            bool(getattr(bind_report, "donor_weight_transfer", False)),
+            weight_donor_source,
+            int(getattr(bind_report, "collapsed_bind_repairs", 0) or 0),
             len(result_model.animations),
+        )
+        log_character_builder_event(
+            "apply_template_rig.result",
+            ok=True,
+            game=game,
+            skel_bones=template_model.node_count(),
+            skinned=bind_report.skinned_meshes,
+            weighted_vertices=bind_report.weighted_vertices,
+            bone_slots=bind_report.bone_count,
+            weighting_method=getattr(bind_report, "weighting_method", ""),
+            donor_weight_transfer=bool(getattr(bind_report, "donor_weight_transfer", False)),
+            creature_wing_refinement=bool(getattr(bind_report, "creature_wing_refinement", False)),
+            weight_donor_source=weight_donor_source,
+            collapsed_bind_repairs=int(getattr(bind_report, "collapsed_bind_repairs", 0) or 0),
+            mesh_reports=list(getattr(bind_report, "mesh_reports", None) or []),
         )
         return {
             "ok": True,
@@ -1237,6 +1867,249 @@ def _normalize_vec(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
     return (x / mag, y / mag, z / mag)
 
 
+def _quat_conjugate(q) -> Tuple[float, float, float, float]:
+    try:
+        return (-float(q[0]), -float(q[1]), -float(q[2]), float(q[3]))
+    except Exception:
+        return (0.0, 0.0, 0.0, 1.0)
+
+
+def _node_world_position_for_fit(node: Any) -> Tuple[float, float, float]:
+    try:
+        pos = node.bone_world_position()
+        return (float(pos[0]), float(pos[1]), float(pos[2]))
+    except Exception:
+        pass
+    try:
+        pos = node.world_transform()[0]
+        return (float(pos[0]), float(pos[1]), float(pos[2]))
+    except Exception:
+        pass
+    try:
+        pos = getattr(node, "position", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+        return (float(pos[0]), float(pos[1]), float(pos[2]))
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
+def _node_world_rotation_for_fit(node: Any) -> Tuple[float, float, float, float]:
+    try:
+        rot = node.world_transform()[1]
+        return (float(rot[0]), float(rot[1]), float(rot[2]), float(rot[3]))
+    except Exception:
+        pass
+    try:
+        rot = getattr(node, "rotation", (0.0, 0.0, 0.0, 1.0)) or (0.0, 0.0, 0.0, 1.0)
+        return (float(rot[0]), float(rot[1]), float(rot[2]), float(rot[3]))
+    except Exception:
+        return (0.0, 0.0, 0.0, 1.0)
+
+
+def _iter_skeleton_tree(root: Any) -> List[Any]:
+    if root is None:
+        return []
+    out: List[Any] = []
+    stack = [root]
+    seen: Set[int] = set()
+    while stack:
+        node = stack.pop()
+        if node is None:
+            continue
+        node_id = id(node)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        out.append(node)
+        children = list(getattr(node, "children", []) or [])
+        stack.extend(reversed(children))
+    return out
+
+
+def _creature_skeleton_fit_targets_from_mesh(mesh_model: Any) -> Optional[dict]:
+    metadata = getattr(mesh_model, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    normalization = metadata.get("kotor_normalization")
+    if not isinstance(normalization, dict):
+        return None
+    correspondence = normalization.get("correspondence_fit")
+    if not isinstance(correspondence, dict):
+        fit_report = normalization.get("fit_report")
+        if isinstance(fit_report, dict):
+            correspondence = fit_report.get("correspondence_fit")
+    if not isinstance(correspondence, dict):
+        return None
+    skeleton_fit = correspondence.get("creature_skeleton_fit")
+    if not isinstance(skeleton_fit, dict):
+        return None
+    if not bool(skeleton_fit.get("apply_recommended", False)):
+        return None
+    targets = skeleton_fit.get("bone_targets")
+    if not isinstance(targets, dict) or not targets:
+        return None
+    return skeleton_fit
+
+
+def _apply_creature_skeleton_fit_targets(
+    skel_root: Any,
+    mesh_model: Any,
+) -> dict:
+    """Move cloned native pivots to regional correspondence bone targets."""
+
+    skeleton_fit = _creature_skeleton_fit_targets_from_mesh(mesh_model)
+    if skeleton_fit is None:
+        return {
+            "applied": False,
+            "reason": "no_recommended_creature_skeleton_fit",
+            "moved_bones": 0,
+        }
+    raw_targets = dict(skeleton_fit.get("bone_targets") or {})
+    target_by_name = {
+        str(name or "").strip().lower(): value
+        for name, value in raw_targets.items()
+        if str(name or "").strip()
+    }
+    # T2560: snapshot every bone's DONOR (pre-fit) world position so the loop
+    # can measure how much a correspondence target would shrink each bone's
+    # segment to its parent.  Wide-sleeved/robed imports (K1 Sith Ithorian)
+    # make the per-region correspondence estimate the arm/leg joints near the
+    # body centre, collapsing whole limb chains (donor hand->forearm segment
+    # 0.335 -> target 0.071).  A collapsed segment is anatomically impossible
+    # and shreds the limb under animation, so those targets are rejected and
+    # the bone keeps its donor-local offset — rigidly following its fitted
+    # parent and preserving the donor limb geometry exactly.
+    donor_world_by_id: Dict[int, tuple] = {}
+    for node in _iter_skeleton_tree(skel_root):
+        donor_world_by_id[id(node)] = _node_world_position_for_fit(node)
+
+    def _seg_vec(a: Any, b: Any) -> tuple:
+        return (float(b[0]) - float(a[0]), float(b[1]) - float(a[1]), float(b[2]) - float(a[2]))
+
+    def _seg_len(a: Any, b: Any) -> float:
+        v = _seg_vec(a, b)
+        return (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+
+    def _seg_cos(u: tuple, v: tuple) -> float:
+        nu = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]) ** 0.5
+        nv = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+        if nu <= 1.0e-6 or nv <= 1.0e-6:
+            return 1.0
+        return (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (nu * nv)
+
+    _SEGMENT_COLLAPSE_MIN_RATIO = 0.6
+    _SEGMENT_STRETCH_MAX_RATIO = 1.7
+    _SEGMENT_DIRECTION_MIN_COS = 0.7   # ~45 degrees
+
+    moved: List[dict] = []
+    skipped: List[dict] = []
+    for node in _iter_skeleton_tree(skel_root):
+        if node is skel_root:
+            continue
+        name = str(getattr(node, "name", "") or "").strip()
+        if not name:
+            continue
+        target = target_by_name.get(name.lower())
+        if target is None:
+            continue
+        try:
+            target_world = (
+                float(target[0]),
+                float(target[1]),
+                float(target[2]),
+            )
+        except Exception:
+            skipped.append({"name": name, "reason": "invalid_target"})
+            continue
+        parent = getattr(node, "parent", None)
+        parent_pos = (
+            _node_world_position_for_fit(parent)
+            if parent is not None else
+            (0.0, 0.0, 0.0)
+        )
+        parent_rot = (
+            _node_world_rotation_for_fit(parent)
+            if parent is not None else
+            (0.0, 0.0, 0.0, 1.0)
+        )
+        # Segment-collapse guard: reject targets that crush the parent->bone
+        # segment.  Parent is processed first (tree order), so parent_pos is
+        # its final fitted world; skipping leaves node's donor-local offset in
+        # place, which rigidly follows that fitted parent and keeps the donor
+        # segment vector.
+        if parent is not None:
+            donor_parent_w = donor_world_by_id.get(id(parent), parent_pos)
+            donor_node_w = donor_world_by_id.get(id(node), target_world)
+            donor_seg = _seg_len(donor_parent_w, donor_node_w)
+            proposed_seg = _seg_len(parent_pos, target_world)
+            if donor_seg > 1.0e-4:
+                ratio = proposed_seg / donor_seg
+                # Compare direction in the DONOR frame: rotate the proposed
+                # segment back by how much the parent itself was reoriented,
+                # so a legitimately rotated limb is not flagged.  Here the fit
+                # barely rotates limb roots, so comparing raw donor vs proposed
+                # segment direction catches the "arm placed sideways at
+                # shoulder height" failure while allowing honest relocation.
+                direction_cos = _seg_cos(
+                    _seg_vec(donor_parent_w, donor_node_w),
+                    _seg_vec(parent_pos, target_world),
+                )
+                if (
+                    ratio < _SEGMENT_COLLAPSE_MIN_RATIO
+                    or ratio > _SEGMENT_STRETCH_MAX_RATIO
+                    or direction_cos < _SEGMENT_DIRECTION_MIN_COS
+                ):
+                    skipped.append({
+                        "name": name,
+                        "reason": "limb_segment_guard",
+                        "donor_segment": round(donor_seg, 4),
+                        "proposed_segment": round(proposed_seg, 4),
+                        "length_ratio": round(ratio, 3),
+                        "direction_cos": round(direction_cos, 3),
+                    })
+                    continue
+        old_world = _node_world_position_for_fit(node)
+        rel_world = (
+            target_world[0] - parent_pos[0],
+            target_world[1] - parent_pos[1],
+            target_world[2] - parent_pos[2],
+        )
+        local = _quat_rotate_vec(_quat_conjugate(parent_rot), rel_world)
+        try:
+            node.position = (
+                float(local[0]),
+                float(local[1]),
+                float(local[2]),
+            )
+        except Exception:
+            skipped.append({"name": name, "reason": "position_write_failed"})
+            continue
+        new_world = _node_world_position_for_fit(node)
+        moved.append({
+            "name": name,
+            "old_world": [float(value) for value in old_world],
+            "target_world": [float(value) for value in target_world],
+            "new_world": [float(value) for value in new_world],
+            "delta": float(
+                (
+                    (target_world[0] - old_world[0]) ** 2
+                    + (target_world[1] - old_world[1]) ** 2
+                    + (target_world[2] - old_world[2]) ** 2
+                ) ** 0.5
+            ),
+        })
+    return {
+        "applied": bool(moved),
+        "method": str(skeleton_fit.get("method") or "per_region_correspondence_bone_targets"),
+        "coordinate_space": str(skeleton_fit.get("coordinate_space") or "kotor_world_after_fit"),
+        "moved_bones": len(moved),
+        "requested_targets": len(target_by_name),
+        "max_displacement": float(skeleton_fit.get("max_displacement", 0.0) or 0.0),
+        "mean_displacement": float(skeleton_fit.get("mean_displacement", 0.0) or 0.0),
+        "moved": moved,
+        "skipped": skipped,
+    }
+
+
 def _is_mesh_payload_node(node: Any) -> bool:
     if node is None:
         return False
@@ -1266,13 +2139,38 @@ def _strip_render_geometry_from_skeleton(
     kept = []
     for child in list(getattr(node, "children", []) or []):
         if _is_mesh_payload_node(child):
-            if _is_template_skeleton_helper(child):
+            if _is_native_nonrendered_helper_trimesh(child):
+                # Bone-geometry trimeshes (pelvis_g, Ran_FootL, ...) are
+                # non-rendered but their GEOMETRY is part of the vanilla MDL
+                # structure the writer must reproduce — keep it intact.
+                _normalize_preserved_helper_trimesh(child)
+            elif _is_template_skeleton_helper(child):
                 _clear_template_render_payload(child)
-            else:
+            elif (
+                bool(getattr(child, "is_skin", False))
+                or not (
+                    getattr(child, "vertices", None)
+                    and getattr(child, "faces", None)
+                )
+            ):
+                # Only the REPLACED body skins and geometry-less placeholder
+                # meshes may leave the DAG entirely.
                 removed += 1
                 if replaced_nodes is not None:
                     replaced_nodes.append(_native_render_replacement_record(child))
                 continue
+            else:
+                # Rendered non-skin DETAIL trimesh (Rancor_eyeL/R): native
+                # creature geometry.  Keep the node + geometry + MESH flag
+                # (animation target, tree structure must match vanilla) but
+                # hide it: the imported payload is the complete visible body
+                # (the custom head has its own eyes), and the vanilla eyeballs
+                # float at vanilla head positions outside the custom head
+                # (T2552 live screenshot).  render=False nodes are the
+                # proven-safe configuration (all bone hulls ship that way);
+                # the earlier keep_render=True (T2542) was a crash-hunt
+                # experiment obsoleted by T2549's real writer fix.
+                _normalize_preserved_helper_trimesh(child)
         removed += _strip_render_geometry_from_skeleton(
             child,
             replaced_nodes=replaced_nodes,
@@ -1323,6 +2221,49 @@ def _is_template_skeleton_helper(node: Any) -> bool:
     return bool(getattr(node, "children", None))
 
 
+def _is_native_nonrendered_helper_trimesh(node: Any) -> bool:
+    """True for non-rendered native trimeshes whose geometry must survive.
+
+    Vanilla KOTOR rigs store bone geometry as render=False trimeshes; the
+    T2513 audit showed every such node carries vertices.  They may carry a
+    texture reference even though they never render (the Rancor's leaf bones
+    all reference c_rancor01, T2536), so texture is NOT a disqualifier.
+    Clearing them to empty dummies diverges the exported DAG from the
+    vanilla structure, so they are preserved as-is instead.
+    """
+    if bool(getattr(node, "is_skin", False)):
+        return False
+    if bool(getattr(node, "render", True)):
+        return False
+    return bool(getattr(node, "vertices", None)) and bool(
+        getattr(node, "faces", None)
+    )
+
+
+def _normalize_preserved_helper_trimesh(node: Any, *, keep_render: bool = False) -> None:
+    """Keep a preserved trimesh writer-ready: HEADER|MESH.
+
+    ``keep_render`` preserves the node's existing render bit (native detail
+    meshes such as Rancor eyes render in vanilla, T2541); the default forces
+    render off for invisible bone-geometry hulls (pelvis_g, Ran_FootL).
+    """
+    try:
+        from core.geometry.model_data import NodeFlags  # type: ignore
+    except ImportError:                         # pragma: no cover
+        from src.core.geometry.model_data import NodeFlags  # type: ignore
+
+    try:
+        node.flags = (
+            int(getattr(node, "flags", 0))
+            | int(NodeFlags.HEADER)
+            | int(NodeFlags.MESH)
+        )
+    except Exception:
+        pass
+    if not keep_render:
+        node.render = False
+
+
 def _clear_template_render_payload(node: Any) -> None:
     """Turn a reference mesh/helper into an empty transform node."""
     try:
@@ -1352,6 +2293,72 @@ def _clear_template_render_payload(node: Any) -> None:
     except Exception:
         pass
     node.render = False
+
+
+def _restore_native_static_controllers(result_model: Any, donor_model: Any) -> dict:
+    """Restore native controller blocks lost during the template-rig rebuild.
+
+    KOTOR's binary MDL stores static position/orientation controller rows —
+    plus writer-facing ``binary_*`` metadata — on native nodes.  A rebuild can
+    drop them.  For every result node with a same-named donor node:
+
+    - a node with NO controllers receives a deep copy of the donor's blocks
+      (counted in ``restored_count``, one per node);
+    - a node that kept controllers gets missing ``binary_*`` metadata keys
+      copied per matching controller type (counted per controller in
+      ``refreshed_metadata_count``); existing keys are never overwritten.
+    """
+    import copy
+
+    donor_by_name: dict[str, Any] = {}
+    for donor_node in _model_nodes_for_diag(donor_model):
+        name = str(getattr(donor_node, "name", "") or "").strip().lower()
+        if name and name not in donor_by_name:
+            donor_by_name[name] = donor_node
+
+    restored_count = 0
+    refreshed_metadata_count = 0
+    for node in _model_nodes_for_diag(result_model):
+        name = str(getattr(node, "name", "") or "").strip().lower()
+        donor_node = donor_by_name.get(name)
+        if donor_node is None:
+            continue
+        donor_controllers = [
+            ctrl
+            for ctrl in list(getattr(donor_node, "controllers", []) or [])
+            if isinstance(ctrl, dict)
+        ]
+        if not donor_controllers:
+            continue
+        current = list(getattr(node, "controllers", []) or [])
+        if not current:
+            try:
+                node.controllers = copy.deepcopy(donor_controllers)
+            except Exception:
+                continue
+            restored_count += 1
+            continue
+        donor_by_type: dict[Any, dict] = {}
+        for ctrl in donor_controllers:
+            donor_by_type.setdefault(ctrl.get("type"), ctrl)
+        for ctrl in current:
+            if not isinstance(ctrl, dict):
+                continue
+            donor_ctrl = donor_by_type.get(ctrl.get("type"))
+            if donor_ctrl is None:
+                continue
+            missing = {
+                key: copy.deepcopy(value)
+                for key, value in donor_ctrl.items()
+                if str(key).startswith("binary_") and key not in ctrl
+            }
+            if missing:
+                ctrl.update(missing)
+                refreshed_metadata_count += 1
+    return {
+        "restored_count": restored_count,
+        "refreshed_metadata_count": refreshed_metadata_count,
+    }
 
 
 def _clean_mesh_payload_node(node: Any) -> Any:
@@ -1415,13 +2422,14 @@ def _clean_mesh_payload_node(node: Any) -> Any:
     cleaned.bone_map_floats = []
     cleaned.qbone_list = []
     cleaned.tbone_list = []
+    cleaned.vertex_space = 1
     setattr(cleaned, "_external_imported", True)
+    setattr(cleaned, "_imported", True)
+    setattr(cleaned, "_gr_vertices_in_kotor_world", True)
     if source_bone_map and source_skin_data:
         setattr(cleaned, "_gr_source_bone_map", source_bone_map)
         setattr(cleaned, "_gr_source_skin_data", source_skin_data)
         setattr(cleaned, "_gr_source_skin_weight_role", "imported_fbx_payload")
-    if vertices_are_world:
-        setattr(cleaned, "_gr_vertices_in_kotor_world", True)
     try:
         cleaned.compute_bounds()
     except Exception:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,9 +19,10 @@ from src.core.lighting.lightmap_export_bridge import (
 from src.core.lighting.lightmap_lighting_solver import LightmapLightingSolver
 from src.core.lighting.lightmap_padding import LightmapPadding
 from src.core.lighting.lightmap_rasterizer import LightmapRasterizer
+from src.core.lighting.lightmap_shadow_solver import LightmapShadowSolver
 from src.core.lighting.lightmap_uv_validator import LightmapUVValidator
 from src.core.lighting.uv_atlas_generator import UVAtlasGenerator
-from src.core.geometry.model_data import KotorModel, ModelNode, NodeFlags
+from src.core.geometry.model_data import BoneWeight, KotorModel, ModelNode, NodeFlags, VertexSkinData
 
 
 def _model_with_lightmapped_triangle() -> tuple[KotorModel, ModelNode]:
@@ -120,7 +122,126 @@ def test_xatlas_generator_preserves_uv1_and_creates_uv2_faces() -> None:
     assert mesh.uvs == original_uv1
     assert getattr(mesh, "uvs_lm")
     assert getattr(mesh, "face_uvs_lm")
+    assert result.vertex_mapping == getattr(mesh, "_gr_generated_lightmap_vertex_mapping")
+    assert result.atlas_faces == getattr(mesh, "_gr_generated_lightmap_faces")
+    assert [
+        tuple(result.vertex_mapping[index] for index in atlas_face)
+        for atlas_face in result.atlas_faces
+    ] == mesh.faces
     assert all(0.0 <= uv[0] <= 1.0 and 0.0 <= uv[1] <= 1.0 for uv in mesh.uvs_lm)
+
+
+def test_lightmap_vertex_stream_remap_preserves_all_mesh_streams_across_uv_seam() -> None:
+    mesh = ModelNode(
+        name="seamed_floor",
+        flags=int(NodeFlags.HEADER | NodeFlags.SKIN | NodeFlags.MESH),
+        vertices=[
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ],
+        normals=[(0.0, 0.0, 1.0)] * 4,
+        tangents=[(1.0, 0.0, 0.0)] * 4,
+        uvs=[
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (0.25, 0.25),
+        ],
+        uvs_lm=[
+            (0.05, 0.05),
+            (0.45, 0.05),
+            (0.45, 0.45),
+            (0.55, 0.55),
+            (0.95, 0.95),
+            (0.55, 0.95),
+        ],
+        uvs_2=[(0.1, 0.1), (0.2, 0.1), (0.2, 0.2), (0.1, 0.2)],
+        faces=[(0, 1, 2), (0, 2, 3)],
+        face_mats=[2, 4],
+        face_uvs=[(0, 1, 2), (4, 2, 3)],
+        skin_data=[
+            VertexSkinData([BoneWeight(index, 1.0)])
+            for index in range(4)
+        ],
+    )
+    mesh.face_uvs_lm = [(0, 1, 2), (3, 4, 5)]
+    mesh._gr_generated_lightmap_uv_channel = 1
+    mesh._gr_generated_lightmap_vertex_mapping = [0, 1, 2, 0, 2, 3]
+    mesh._gr_generated_lightmap_faces = [(0, 1, 2), (3, 4, 5)]
+    mesh._gr_generated_lightmap_source_vertex_count = 4
+
+    result = UVAtlasGenerator().remap_vertex_stream_for_lightmap(mesh, target_channel=1)
+
+    assert result.success
+    assert result.changed
+    assert result.source_vertex_count == 4
+    assert result.vertex_count == 6
+    assert result.duplicated_vertex_count == 2
+    assert mesh.faces == [(0, 1, 2), (3, 4, 5)]
+    assert mesh.vertices == [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    ]
+    assert len(mesh.normals) == len(mesh.tangents) == len(mesh.vertices)
+    assert mesh.uvs == [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.25, 0.25),
+        (1.0, 1.0),
+        (0.0, 1.0),
+    ]
+    assert mesh.uvs_lm == [
+        (0.05, 0.05),
+        (0.45, 0.05),
+        (0.45, 0.45),
+        (0.55, 0.55),
+        (0.95, 0.95),
+        (0.55, 0.95),
+    ]
+    assert mesh.uvs_2 == [
+        (0.1, 0.1),
+        (0.2, 0.1),
+        (0.2, 0.2),
+        (0.1, 0.1),
+        (0.2, 0.2),
+        (0.1, 0.2),
+    ]
+    assert mesh.face_uvs == []
+    assert mesh.face_uvs_lm == []
+    assert mesh.face_uvs_2 == []
+    assert mesh.face_mats == [2, 4]
+    assert [skin.influences[0].bone_index for skin in mesh.skin_data] == [0, 1, 2, 0, 2, 3]
+    assert mesh.skin_data[0] is not mesh.skin_data[3]
+    assert mesh.skin_data[0].influences[0] is not mesh.skin_data[3].influences[0]
+    assert mesh._gr_lightmap_vertex_source_mapping == [0, 1, 2, 0, 2, 3]
+
+
+def test_lightmap_vertex_stream_remap_is_noop_for_existing_per_vertex_uv2() -> None:
+    _model, mesh = _model_with_lightmapped_triangle()
+    original_vertices = mesh.vertices
+    original_faces = mesh.faces
+    original_uv1 = mesh.uvs
+    original_uv2 = mesh.uvs_lm
+    original_normals = mesh.normals
+
+    result = UVAtlasGenerator().remap_vertex_stream_for_lightmap(mesh, target_channel=1)
+
+    assert result.success
+    assert not result.changed
+    assert result.source_vertex_count == result.vertex_count == 3
+    assert mesh.vertices is original_vertices
+    assert mesh.faces is original_faces
+    assert mesh.uvs is original_uv1
+    assert mesh.uvs_lm is original_uv2
+    assert mesh.normals is original_normals
 
 
 def test_baker_does_not_fallback_to_diffuse_uvs_unless_selected() -> None:
@@ -295,6 +416,110 @@ def test_lighting_solver_vectorized_buffer_matches_scalar_path() -> None:
     scalar = solver._solve_buffer_scalar(buffer, lights, settings)
 
     assert np.allclose(vector, scalar, atol=1.0e-5)
+
+
+def test_shadow_solver_rejects_only_the_source_triangle_and_keeps_folded_self_shadow() -> None:
+    mesh = SimpleNamespace(
+        vertices=[
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0),
+        ],
+        faces=[(0, 1, 2), (3, 4, 5)],
+        position=(0.0, 0.0, 0.0),
+        vertex_space=1,
+    )
+    settings = LightmapBakeSettings(use_shadows=True, normal_bias=0.002)
+    light = SimpleNamespace(
+        type="point",
+        position=(0.2, 0.2, 2.0),
+        casts_shadows=True,
+    )
+    solver = LightmapShadowSolver()
+    solver.build_acceleration_structure([mesh])
+    # Keep this contract deterministic even when a developer has Open3D.
+    solver._o3d_scene = None
+
+    shadowed = solver.calculate_shadow_factor(
+        {
+            "position": (0.2, 0.2, 0.0),
+            "normal": (0.0, 0.0, 1.0),
+            "mesh_id": id(mesh) & 0x7FFFFFFF,
+            "triangle_id": 0,
+        },
+        light,
+        settings,
+    )
+
+    assert shadowed == 0.0
+
+    source_only = SimpleNamespace(
+        vertices=mesh.vertices[:3],
+        faces=[(0, 1, 2)],
+        position=(0.0, 0.0, 0.0),
+        vertex_space=1,
+    )
+    solver.build_acceleration_structure([source_only])
+    solver._o3d_scene = None
+    acne_safe = solver.calculate_shadow_factor(
+        {
+            "position": (0.2, 0.2, 0.0),
+            # Deliberately point the bias behind the polygon. The exact source
+            # triangle must still be rejected without ignoring its whole mesh.
+            "normal": (0.0, 0.0, -1.0),
+            "mesh_id": id(source_only) & 0x7FFFFFFF,
+            "triangle_id": 0,
+        },
+        light,
+        settings,
+    )
+
+    assert acne_safe == 1.0
+
+
+def test_uv_overlap_validation_preserves_small_mesh_results_and_scales_to_room_atlases() -> None:
+    validator = LightmapUVValidator()
+    small = SimpleNamespace(
+        name="overlap_fixture",
+        uvs_lm=[
+            (0.0, 0.0),
+            (0.5, 0.0),
+            (0.0, 0.5),
+            (0.1, 0.1),
+            (0.6, 0.1),
+            (0.1, 0.6),
+            (0.5, 0.0),
+            (1.0, 0.0),
+            (0.5, 0.5),
+        ],
+        faces=[(0, 1, 2), (3, 4, 5), (6, 7, 8)],
+    )
+    assert validator.detect_overlaps(small, 1) == [(0, 1), (1, 2)]
+
+    grid_size = 64
+    uvs = [
+        (x / grid_size, y / grid_size)
+        for y in range(grid_size + 1)
+        for x in range(grid_size + 1)
+    ]
+    faces = []
+    stride = grid_size + 1
+    for y in range(grid_size):
+        for x in range(grid_size):
+            lower_left = y * stride + x
+            faces.append((lower_left, lower_left + 1, lower_left + stride + 1))
+            faces.append((lower_left, lower_left + stride + 1, lower_left + stride))
+    atlas = SimpleNamespace(name="room_atlas", uvs_lm=uvs, faces=faces)
+
+    started = time.perf_counter()
+    overlaps = validator.detect_overlaps(atlas, 1)
+    elapsed = time.perf_counter() - started
+
+    assert overlaps == []
+    assert elapsed < 2.0, f"8,192-triangle UV broadphase took {elapsed:.3f}s"
 
 
 def test_lightmap_export_bridge_discovers_generated_assignments(tmp_path: Path) -> None:

@@ -10,6 +10,8 @@
         <panel id="library" region="left" visible="true" minWidth="220" preferredWidth="260"/>
         <panel id="modules" region="left" visible="true" minWidth="220" preferredWidth="260"/>
         <panel id="properties" region="right" visible="true" minWidth="230" preferredWidth="280"/>
+        <panel id="guiEditorCatalog" region="left" visible="true" minWidth="220" preferredWidth="260"/>
+        <panel id="guiEditorInspector" region="right" visible="true" minWidth="230" preferredWidth="280"/>
         <panel id="animationLibrary" region="right" visible="true" minWidth="230" preferredWidth="280"/>
         <panel id="meshTools" region="farRight" visible="true" minWidth="220" preferredWidth="280"/>
         <panel id="spriteMaterials" region="right" visible="false" minWidth="300" preferredWidth="380"/>
@@ -25,6 +27,12 @@
         <panelSpacing value="2"/>
         <toolbarSpacing value="2"/>
         <splitterHandleWidth value="5"/>
+        <menuBarHeight value="22"/>
+        <menuMinimumWidth value="160"/>
+        <menuHorizontalPadding value="10"/>
+        <menuShortcutGap value="18"/>
+        <menuIndicatorWidth value="20"/>
+        <menuSubmenuArrowWidth value="16"/>
         <inputHeight value="22"/>
         <comboHeight value="22"/>
         <spinboxHeight value="22"/>

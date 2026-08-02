@@ -197,6 +197,17 @@ def test_t1605_exports_install_safe_mod_source_resources_and_manifest(tmp_path, 
     assert manifest["install"]["module_path"] == result.module_path
     assert manifest["validation"]["blocking_issues"] == []
     assert manifest["source"]["resources"]
+    transaction = manifest["transaction"]
+    assert transaction["staging_model"] == "save_pipeline_temp_root_then_export_job_promote"
+    assert transaction["export_job"]["job_id"] == "map_studio.custom_module_package.custom01"
+    assert transaction["export_job"]["kind"] == "map_studio.custom_module_package"
+    assert transaction["export_job"]["status"] == "succeeded"
+    assert transaction["export_job"]["manifest_path"] == result.manifest_path
+    assert not pathlib.Path(transaction["staging_root"]).exists()
+    promoted_kinds = {row["artifact_kind"] for row in transaction["promoted_outputs"]}
+    assert {"module_package", "save_manifest", "pack_manifest", "loose_resource"} <= promoted_kinds
+    assert all(pathlib.Path(row["final_path"]).exists() for row in transaction["promoted_outputs"])
+    assert all(".ghostrigger_export_" not in row["final_path"] for row in transaction["promoted_outputs"])
 
 
 def test_t1605_strict_preflight_blocks_missing_game_ready_core_files(tmp_path, monkeypatch):
@@ -259,3 +270,30 @@ def test_t1605_can_stage_source_from_resource_path(tmp_path, monkeypatch):
     assert result.ok is True
     assert (tmp_path / "out" / "source" / "resources" / "custom_a.mdl").read_bytes() == b"MDL-FROM-DISK"
     assert any(row.resref == "custom_a" and row.restype == "mdl" for row in result.staged_resources)
+
+
+def test_particle_placeables_stage_global_2da_in_override_not_inside_mod(tmp_path, monkeypatch):
+    _patch_imports(monkeypatch)
+    request = packager.CustomModulePackRequest(
+        module_root="custom01",
+        game="K1",
+        output_dir=str(tmp_path),
+    )
+    resources = [
+        packager.PackagedModuleResource("fx_crate", "utp", b"UTP"),
+        packager.PackagedModuleResource("fx_crate", "mdl", b"MDL"),
+        packager.PackagedModuleResource("fx_crate", "mdx", b"MDX"),
+        packager.PackagedModuleResource("placeables", "2da", b"2DA V2.0\n"),
+    ]
+
+    result = packager.package_custom_module(_hydrated(), request, resources=resources)
+
+    assert result.ok is True
+    override = tmp_path / "install" / "Override" / "placeables.2da"
+    assert override.read_bytes() == b"2DA V2.0\n"
+    assert [pathlib.Path(row.path).name for row in result.staged_override_resources] == ["placeables.2da"]
+    _sig, archived = _read_erf(pathlib.Path(result.module_path))
+    assert ("placeables", sp.RESTYPE_IDS["2da"]) not in archived
+    assert archived[("fx_crate", sp.RESTYPE_IDS["utp"])] == b"UTP"
+    manifest = json.loads(pathlib.Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["install"]["override_resources"][0]["resref"] == "placeables"

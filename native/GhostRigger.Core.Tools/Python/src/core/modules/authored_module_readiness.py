@@ -13,16 +13,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from .authored_module_metadata import authored_area_script_hooks, authored_module_script_hooks
+from .authored_module_metadata import authored_area_script_hooks, authored_lighting_is_fullbright, authored_lighting_profile, authored_module_script_hooks
 from .authored_module_objects import normalise_resource_resref, validate_authored_gameplay_placement_against_walkmesh
 from .authored_module_placements import authored_gameplay_placement_rows
 from .authored_module_pathing import AuthoredPathAnchor, compile_authored_pathing_for_module
 from .authored_module_project import AuthoredModuleProject, compile_authored_room_spec, normalise_resref, validate_authored_module_project
 from .authored_module_walkmesh import combine_authored_module_walkmesh
+from .authored_imported_mesh import (
+    ImportedMeshRoomPrimitive,
+    authored_room_uses_unresolved_stock_geometry,
+    imported_mesh_room_is_backdrop,
+    imported_mesh_room_is_visual_only,
+)
 from .authored_room_floorplan import FloorPlanRoomPrimitive, polygon_signed_area, validate_floor_plan_room_primitive
 from .map_studio_export_objects import map_studio_export_object_boundaries
-from .authored_walkmesh_audit import audit_authored_wok
+from .map_studio_curve_guides import authored_curve_guides
+from .authored_walkmesh_audit import DOOR_TRANSITION_SURFACE_ID, audit_authored_wok
 from .authored_walkmesh_surfaces import walkmesh_surface_name
+from .authored_sky_traffic import read_authored_project_sky_traffic, validate_authored_sky_traffic_collection
 
 
 RuntimeResourceKey = tuple[str, str]
@@ -87,6 +95,10 @@ class AuthoredRoomReadiness:
     invalid_wok_face_count: int = 0
     degenerate_wok_face_count: int = 0
     non_manifold_wok_edge_count: int = 0
+    open_wok_edge_count: int = 0
+    steep_walkable_face_count: int = 0
+    max_walkable_slope_degrees: float = 0.0
+    max_allowed_walkable_slope_degrees: float = 45.0
     warnings: tuple[str, ...] = ()
     blocking_messages: tuple[str, ...] = ()
 
@@ -118,13 +130,14 @@ class AuthoredGameplayTemplateReference:
 
 @dataclass(frozen=True)
 class AuthoredModuleTransitionReference:
-    """One authored transition/area-link candidate from door, trigger, or waypoint data."""
+    """One authored transition/area-link candidate from door or trigger data."""
 
     kind: str
     tag: str
     template_resref: str = ""
     linked_to: str = ""
     linked_to_module: str = ""
+    linked_to_flags: int = 0
     status: str = "unlinked"
     complete: bool = False
     message: str = ""
@@ -140,6 +153,20 @@ class AuthoredModuleScriptReference:
     restype: str = "ncs"
     status: str = "external_or_override"
     packaged: bool = False
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class AuthoredModuleDialogReference:
+    """One authored dialog/conversation resource referenced by module metadata."""
+
+    source: str
+    field_name: str
+    dialog_resref: str
+    restype: str = "dlg"
+    status: str = "external_or_override"
+    packaged: bool = False
+    required: bool = True
     message: str = ""
 
 
@@ -183,6 +210,7 @@ class AuthoredModuleLightingReadiness:
 
     ready: bool
     status: str
+    lighting_profile: str = "standard"
     light_count: int = 0
     room_count: int = 0
     rooms_with_lights: tuple[str, ...] = ()
@@ -307,6 +335,19 @@ def _resource_key(resource: Any) -> RuntimeResourceKey | None:
 def _present_keys(resources: Iterable[Any]) -> tuple[RuntimeResourceKey, ...]:
     keys = {_key for resource in list(resources or ()) if (_key := _resource_key(resource)) and _key != ("", "")}
     return tuple(sorted(keys))
+
+
+def _curve_guide_capability_warnings(project: AuthoredModuleProject) -> tuple[str, ...]:
+    guides = authored_curve_guides(project)
+    if not guides:
+        return ()
+    plural = "s" if len(guides) != 1 else ""
+    names = ", ".join(guide.name for guide in guides[:3])
+    suffix = "" if len(guides) <= 3 else f", +{len(guides) - 3} more"
+    return (
+        f"{len(guides)} Map Studio construction curve guide{plural} ({names}{suffix}) "
+        "are previewable KMAP authoring guides only; they do not yet export as KOTOR runtime geometry, PTH, or walkmesh edges.",
+    )
 
 
 def _resource_label(key: RuntimeResourceKey) -> str:
@@ -486,31 +527,45 @@ def _transition_reference_entry(
     tag: Any,
     linked_to: Any,
     linked_to_module: Any = "",
+    linked_to_flags: Any = 0,
 ) -> AuthoredModuleTransitionReference | None:
     destination = str(linked_to or "").strip()
     destination_module = normalise_resref(linked_to_module)
+    try:
+        target_type = int(linked_to_flags or 0)
+    except (TypeError, ValueError):
+        target_type = -1
     if not destination and not destination_module:
         return None
     label = str(tag or template_resref or kind).strip()
     template = normalise_resource_resref(template_resref)
-    if destination and destination_module:
+    target_label = {1: "door", 2: "waypoint"}.get(target_type, "untyped target")
+    if destination and target_type not in {1, 2}:
+        status = "missing_link_type" if target_type == 0 else "invalid_link_type"
+        complete = False
+        message = (
+            f"{kind.title()} {label} links to {destination}, but LinkedToFlags must identify a destination door (1) "
+            "or waypoint (2)."
+        )
+    elif destination and destination_module:
         status = "module_transition"
         complete = True
-        message = f"{kind.title()} {label} links to {destination} in module {destination_module}."
+        message = f"{kind.title()} {label} links to {target_label} {destination} in module {destination_module}."
     elif destination:
         status = "local_transition"
         complete = True
-        message = f"{kind.title()} {label} links to local destination {destination}."
+        message = f"{kind.title()} {label} links to local {target_label} {destination}."
     else:
         status = "missing_destination"
         complete = False
-        message = f"{kind.title()} {label} names module {destination_module} but no destination tag/waypoint."
+        message = f"{kind.title()} {label} names module {destination_module} but no destination door/waypoint tag."
     return AuthoredModuleTransitionReference(
         kind=kind,
         tag=label,
         template_resref=template,
         linked_to=destination,
         linked_to_module=destination_module,
+        linked_to_flags=target_type,
         status=status,
         complete=complete,
         message=message,
@@ -523,7 +578,6 @@ def _transition_references(project: AuthoredModuleProject) -> tuple[AuthoredModu
     for kind, items in (
         ("door", tuple(placements.doors or ())),
         ("trigger", tuple(placements.triggers or ())),
-        ("waypoint", tuple(placements.waypoints or ())),
     ):
         for item in items:
             ref = _transition_reference_entry(
@@ -532,6 +586,7 @@ def _transition_references(project: AuthoredModuleProject) -> tuple[AuthoredModu
                 tag=getattr(item, "tag", ""),
                 linked_to=getattr(item, "linked_to", ""),
                 linked_to_module=getattr(item, "linked_to_module", ""),
+                linked_to_flags=getattr(item, "linked_to_flags", 0),
             )
             if ref is not None:
                 refs.append(ref)
@@ -581,6 +636,69 @@ def _script_references(
         if ref is not None:
             refs.append(ref)
     return tuple(sorted(refs, key=lambda item: (item.scope, item.field_name, item.script_resref)))
+
+
+def _dialog_reference_entry(
+    *,
+    source: str,
+    field_name: str,
+    dialog_resref: Any,
+    present: set[RuntimeResourceKey],
+) -> AuthoredModuleDialogReference | None:
+    dialog = normalise_resource_resref(dialog_resref)
+    if not dialog:
+        return None
+    key = (dialog, "dlg")
+    packaged = key in present
+    status = "packaged" if packaged else "external_or_override"
+    message = (
+        f"Dialog reference {dialog}.dlg is included in this module package."
+        if packaged
+        else f"Dialog reference {dialog}.dlg must resolve from the base game, Override, or another installed mod."
+    )
+    return AuthoredModuleDialogReference(
+        source=source,
+        field_name=str(field_name or source),
+        dialog_resref=dialog,
+        status=status,
+        packaged=packaged,
+        message=message,
+    )
+
+
+def _dialog_references(
+    project: AuthoredModuleProject,
+    *,
+    present: set[RuntimeResourceKey],
+) -> tuple[AuthoredModuleDialogReference, ...]:
+    metadata = dict(getattr(getattr(project, "metadata", None), "metadata", {}) or {})
+    refs: list[AuthoredModuleDialogReference] = []
+
+    def append_ref(source: str, label: str, value: Any) -> None:
+        ref = _dialog_reference_entry(source=source, field_name=label, dialog_resref=value, present=present)
+        if ref is not None:
+            refs.append(ref)
+
+    for source in ("dialog_refs", "dialog_references", "dialogue_refs", "conversation_refs", "conversations", "dialogs"):
+        value = metadata.get(source)
+        if not value:
+            continue
+        if isinstance(value, dict):
+            for label, resref in value.items():
+                append_ref(source, str(label), resref)
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                if isinstance(item, dict):
+                    append_ref(
+                        source,
+                        str(item.get("field") or item.get("label") or item.get("name") or index),
+                        item.get("resref") or item.get("dialog") or item.get("dlg"),
+                    )
+                else:
+                    append_ref(source, str(index), item)
+        else:
+            append_ref(source, source, value)
+    return tuple(sorted(refs, key=lambda item: (item.source, item.field_name, item.dialog_resref)))
 
 
 def _path_anchors_from_walkability(project: AuthoredModuleProject, walkability: Any) -> tuple[AuthoredPathAnchor, ...]:
@@ -951,7 +1069,6 @@ def _doorway_transition_readiness(
     transition_marker_count = (
         len(tuple(getattr(placements, "doors", ()) or ()))
         + len(tuple(getattr(placements, "triggers", ()) or ()))
-        + len(tuple(getattr(placements, "waypoints", ()) or ()))
     )
     transition_reference_count = len(tuple(transition_references or ()))
     linked_transition_count = sum(1 for ref in transition_references if bool(getattr(ref, "complete", False)))
@@ -968,22 +1085,22 @@ def _doorway_transition_readiness(
         )
     if transition_marker_count <= 0:
         warnings.append(
-            f"{opening_count} floor-plan opening(s) exist without authored door, trigger, or waypoint markers. "
+            f"{opening_count} floor-plan opening(s) exist without authored door or trigger markers. "
             "Add a KOTOR door/transition marker and review DOOR WOK surface intent before game proof."
         )
         return AuthoredDoorwayTransitionReadiness(
             ready=False,
-            status="Needs door/trigger/waypoint marker",
+            status="Needs door/trigger marker",
             opening_count=opening_count,
             transition_marker_count=transition_marker_count,
             transition_reference_count=transition_reference_count,
             linked_transition_count=linked_transition_count,
             warnings=tuple(warnings),
-            fix_hint="Use Placement > Door, Trigger, or Waypoint near the opening, then set transition destinations if it leaves the area.",
+            fix_hint="Use Placement > Door or Trigger near the opening, then set transition destinations if it leaves the area.",
         )
     if transition_reference_count <= 0:
         warnings.append(
-            f"{opening_count} floor-plan opening(s) and {transition_marker_count} door/trigger/waypoint marker(s) exist, "
+            f"{opening_count} floor-plan opening(s) and {transition_marker_count} door/trigger marker(s) exist, "
             "but no transition destination is configured yet."
         )
         return AuthoredDoorwayTransitionReadiness(
@@ -994,7 +1111,7 @@ def _doorway_transition_readiness(
             transition_reference_count=transition_reference_count,
             linked_transition_count=linked_transition_count,
             warnings=tuple(warnings),
-            fix_hint="If the opening is an area exit, set the linked tag/waypoint and module resref on the door, trigger, or waypoint.",
+            fix_hint="If the opening is an area exit, set the destination tag, target type, and module resref on the door or trigger.",
         )
     if linked_transition_count < transition_reference_count:
         warnings.append(
@@ -1008,7 +1125,7 @@ def _doorway_transition_readiness(
             transition_reference_count=transition_reference_count,
             linked_transition_count=linked_transition_count,
             warnings=tuple(warnings),
-            fix_hint="Complete linked_to and linked_to_module for each authored transition before game proof.",
+            fix_hint="Complete LinkedTo, LinkedToFlags target type, and LinkedToModule for each authored transition before game proof.",
         )
     return AuthoredDoorwayTransitionReadiness(
         ready=True,
@@ -1019,6 +1136,93 @@ def _doorway_transition_readiness(
         linked_transition_count=linked_transition_count,
         fix_hint="Doorway openings have authored transition markers. Verify DOOR WOK surfaces and door alignment in game.",
     )
+
+
+def _transition_surface_reference_rows(project: AuthoredModuleProject) -> tuple[dict[str, Any], ...]:
+    """Return linked door/trigger rows that require WOK DOOR surface evidence."""
+
+    rows: list[dict[str, Any]] = []
+    placements = project.placements
+    for kind, items in (
+        ("door", tuple(getattr(placements, "doors", ()) or ())),
+        ("trigger", tuple(getattr(placements, "triggers", ()) or ())),
+    ):
+        for index, item in enumerate(items):
+            linked_to = str(getattr(item, "linked_to", "") or "").strip()
+            if not linked_to:
+                continue
+            rows.append(
+                {
+                    "kind": kind,
+                    "index": index,
+                    "tag": str(getattr(item, "tag", "") or ""),
+                    "template_resref": normalise_resource_resref(getattr(item, "template_resref", "")),
+                    "linked_to": linked_to,
+                    "linked_to_module": normalise_resource_resref(getattr(item, "linked_to_module", "")),
+                    "linked_to_flags": int(getattr(item, "linked_to_flags", 0) or 0),
+                    "transition_destination": int(getattr(item, "transition_destination", 0) or 0),
+                    "requires_wok_transition_surface": True,
+                }
+            )
+    return tuple(rows)
+
+
+def _transition_surface_gate(project: AuthoredModuleProject) -> dict[str, Any]:
+    """Summarize whether linked transitions have authored WOK DOOR surfaces."""
+
+    references = _transition_surface_reference_rows(project)
+    transition_surface_face_count = 0
+    warnings: list[str] = []
+    blocking: list[str] = []
+    room_rows: list[dict[str, Any]] = []
+    for room in tuple(project.rooms or ()):
+        room_resref = normalise_resref(getattr(room, "room_resref", ""))
+        try:
+            geometry = compile_authored_room_spec(room)
+        except Exception as exc:
+            blocking.append(f"Room {room_resref or '(unnamed)'} WOK transition surfaces could not be checked: {exc}")
+            continue
+        face_count = sum(
+            1
+            for face in tuple(getattr(geometry.wok, "faces", ()) or ())
+            if int(getattr(face, "surface", -1)) == DOOR_TRANSITION_SURFACE_ID
+        )
+        transition_surface_face_count += int(face_count)
+        room_rows.append(
+            {
+                "room_resref": normalise_resref(getattr(geometry, "room_resref", "") or room_resref),
+                "transition_surface_face_count": int(face_count),
+            }
+        )
+
+    if references and transition_surface_face_count <= 0:
+        # Vanilla WOKs (plcaa among them) ship linked transitions with no
+        # surface-18 faces and run fine in game; warn instead of blocking so
+        # stock round-trips export.
+        warnings.append(
+            f"Authored module has {len(references)} linked door/trigger transition(s) but no WOK DOOR/transition surface "
+            f"face(s). Paint at least one doorway walkmesh face as surface {DOOR_TRANSITION_SURFACE_ID} if the "
+            "transition should trigger from the floor."
+        )
+    if not references and transition_surface_face_count > 0:
+        warnings.append(
+            f"Generated WOK includes {transition_surface_face_count} DOOR/transition surface face(s) but no linked door/trigger transition intent."
+        )
+    return {
+        "ready": not blocking,
+        "status": "Ready" if not blocking else "Blocked",
+        "required_transition_count": len(references),
+        "transition_surface_face_count": int(transition_surface_face_count),
+        "transition_surface_id": DOOR_TRANSITION_SURFACE_ID,
+        "references": [dict(row) for row in references],
+        "rooms": room_rows,
+        "warnings": warnings,
+        "blocking_messages": blocking,
+        "fix_hint": (
+            f"Paint doorway walkmesh faces as WOK surface {DOOR_TRANSITION_SURFACE_ID} (DOOR) "
+            "or remove linked door/trigger transition fields before export."
+        ),
+    }
 
 
 def _lighting_count(project: AuthoredModuleProject) -> int:
@@ -1051,6 +1255,25 @@ def _lightmap_metadata(project: AuthoredModuleProject) -> dict[str, Any]:
         return dict(source)
     if isinstance(source, str) and source.strip():
         return {"status": source.strip()}
+    project_extra = dict(getattr(project, "extra", {}) or {})
+    applied = project_extra.get("applied_lightmaps")
+    if isinstance(applied, dict) and applied:
+        records = tuple(dict(value) for value in applied.values() if isinstance(value, dict))
+        rooms = tuple(
+            dict.fromkeys(
+                normalise_resref(record.get("room_resref"))
+                for record in records
+                if normalise_resref(record.get("room_resref"))
+            )
+        )
+        return {
+            "status": "baked_candidate",
+            "manifest_path": "kmap:extra.applied_lightmaps",
+            "rooms": rooms,
+            "applied_surface_count": len(records),
+            "game_tested": bool(records) and all(bool(record.get("engine_game_proof")) for record in records),
+            "resource_types": tuple(dict.fromkeys(str(record.get("resource_type") or "tpc") for record in records)),
+        }
     return {}
 
 
@@ -1068,6 +1291,8 @@ def _lighting_readiness(project: AuthoredModuleProject, rooms: tuple[AuthoredRoo
     room_resrefs = tuple(room.room_resref for room in rooms if room.room_resref)
     light_count = _lighting_count(project)
     rooms_with_lights, rooms_without_lights = _lighting_room_coverage(project, rooms)
+    lighting_profile = authored_lighting_profile(project.metadata) or "standard"
+    fullbright = authored_lighting_is_fullbright(project.metadata)
     lightmap = _lightmap_metadata(project)
     raw_status = str(lightmap.get("status") or "not_started").strip().lower().replace("-", "_").replace(" ", "_")
     manifest_path = str(lightmap.get("manifest_path") or lightmap.get("path") or lightmap.get("proof_manifest_path") or "")
@@ -1084,6 +1309,7 @@ def _lighting_readiness(project: AuthoredModuleProject, rooms: tuple[AuthoredRoo
         return AuthoredModuleLightingReadiness(
             ready=False,
             status="Needs authored rooms",
+            lighting_profile=lighting_profile,
             light_count=light_count,
             lightmap_status="not_started",
             fix_hint="Create authored rooms before planning room lights or lightmaps.",
@@ -1104,6 +1330,7 @@ def _lighting_readiness(project: AuthoredModuleProject, rooms: tuple[AuthoredRoo
         return AuthoredModuleLightingReadiness(
             ready=True,
             status="Game-tested lighting",
+            lighting_profile=lighting_profile,
             light_count=light_count,
             room_count=len(room_resrefs),
             rooms_with_lights=rooms_with_lights,
@@ -1116,10 +1343,14 @@ def _lighting_readiness(project: AuthoredModuleProject, rooms: tuple[AuthoredRoo
             fix_hint="Keep the lighting proof manifest and in-game screenshot/video with the staged package.",
         )
 
-    if raw_status in {"baked", "export_candidate", "ready"} and manifest_path:
+    if raw_status in {"baked", "baked_candidate", "export_candidate", "ready"} and manifest_path:
+        warnings.append(
+            "Applied lightmap TPCs have vanilla-compared binary structure, but their final room appearance is not game proof."
+        )
         return AuthoredModuleLightingReadiness(
             ready=True,
-            status="Lightmap export candidate",
+            status="Applied lightmap candidate",
+            lighting_profile=lighting_profile,
             light_count=light_count,
             room_count=len(room_resrefs),
             rooms_with_lights=rooms_with_lights,
@@ -1131,6 +1362,22 @@ def _lighting_readiness(project: AuthoredModuleProject, rooms: tuple[AuthoredRoo
             fix_hint="Install the module and verify lighting/lightmap appearance in-game before calling it game-tested.",
         )
 
+    if fullbright:
+        return AuthoredModuleLightingReadiness(
+            ready=True,
+            status="Fullbright export candidate",
+            lighting_profile=lighting_profile,
+            light_count=light_count,
+            room_count=len(room_resrefs),
+            rooms_with_lights=rooms_with_lights,
+            rooms_without_lights=rooms_without_lights,
+            lightmap_status="fullbright_export_candidate",
+            lightmap_manifest_path=manifest_path,
+            lightmap_room_count=len(lightmap_rooms),
+            warnings=tuple(warnings),
+            fix_hint="Install the module and verify fullbright actor/room visibility in-game before calling it game-tested.",
+        )
+
     if light_count:
         warnings.append(
             "Authored room lights are viewport/editor intent only until a baked lightmap manifest or in-game lighting proof is recorded."
@@ -1138,6 +1385,7 @@ def _lighting_readiness(project: AuthoredModuleProject, rooms: tuple[AuthoredRoo
         return AuthoredModuleLightingReadiness(
             ready=False,
             status="Viewport lit only",
+            lighting_profile=lighting_profile,
             light_count=light_count,
             room_count=len(room_resrefs),
             rooms_with_lights=rooms_with_lights,
@@ -1153,6 +1401,7 @@ def _lighting_readiness(project: AuthoredModuleProject, rooms: tuple[AuthoredRoo
     return AuthoredModuleLightingReadiness(
         ready=False,
         status="Lighting not planned",
+        lighting_profile=lighting_profile,
         light_count=0,
         room_count=len(room_resrefs),
         rooms_with_lights=(),
@@ -1422,12 +1671,12 @@ def _toolchain_statuses(
         transition_ready = incomplete_transitions == 0
         transition_status = "Ready" if transition_ready else "Needs destination"
         transition_value = f"{complete_transitions}/{transition_count} authored transition(s) linked"
-        transition_fix = "Set a destination tag/waypoint and module resref for each authored transition."
+        transition_fix = "Set a destination tag, door/waypoint target type, and module resref for each authored transition."
     else:
         transition_ready = True
         transition_status = "Optional"
         transition_value = "No authored transitions yet"
-        transition_fix = "Add a door, trigger, or waypoint transition when this module needs exits."
+        transition_fix = "Add a door or trigger transition source when this module needs exits; place waypoints as destinations."
     script_ref_count = len(script_references)
     packaged_scripts = sum(1 for ref in script_references if ref.packaged)
     external_scripts = script_ref_count - packaged_scripts
@@ -1474,7 +1723,7 @@ def _toolchain_statuses(
             doorway_transition.status,
             (
                 f"{doorway_transition.opening_count} opening(s); "
-                f"{doorway_transition.transition_marker_count} door/trigger/waypoint marker(s); "
+                f"{doorway_transition.transition_marker_count} door/trigger source marker(s); "
                 f"{doorway_transition.linked_transition_count}/{doorway_transition.transition_reference_count} linked transition(s)"
             ),
             doorway_transition.fix_hint,
@@ -1515,7 +1764,8 @@ def _toolchain_statuses(
             lighting.status,
             (
                 f"{lighting.light_count} authored light(s), {len(lighting.rooms_with_lights)}/{lighting.room_count} room(s) lit; "
-                f"lightmap: {lighting.lightmap_status}; manifest: {lighting.lightmap_manifest_path or '(none)'}"
+                f"profile: {lighting.lighting_profile}; lightmap: {lighting.lightmap_status}; "
+                f"manifest: {lighting.lightmap_manifest_path or '(none)'}"
             ),
             lighting.fix_hint,
         ),
@@ -1569,6 +1819,28 @@ def _room_readiness(project: AuthoredModuleProject) -> tuple[AuthoredRoomReadine
     for room in project.rooms:
         room_resref = room.normalised_resref()
         primitive_type = type(room.primitive).__name__
+        if authored_room_uses_unresolved_stock_geometry(room):
+            issue = str(dict(getattr(room, "metadata", {}) or {}).get("stock_geometry_issue") or "stock room model is unavailable")
+            rooms.append(
+                AuthoredRoomReadiness(
+                    room_resref=room_resref,
+                    primitive_type=primitive_type,
+                    can_preview_geometry=False,
+                    blocking_messages=(
+                        f"Room {room_resref or '(unnamed)'} has unresolved stock geometry ({issue}). "
+                        "PIE excludes its placeholder, but export requires the missing room resources or deliberate removal.",
+                    ),
+                )
+            )
+            continue
+        if isinstance(room.primitive, ImportedMeshRoomPrimitive):
+            backdrop_only = imported_mesh_room_is_backdrop(room.primitive)
+            visual_only = imported_mesh_room_is_visual_only(room.primitive)
+        else:
+            room_metadata = dict(getattr(room, "metadata", {}) or {})
+            backdrop_only = bool(room_metadata.get("backdrop_only", False))
+            visual_only = bool(room_metadata.get("visual_only", False))
+        visual_only = bool(visual_only or backdrop_only)
         try:
             geometry = compile_authored_room_spec(room)
         except Exception as exc:
@@ -1588,9 +1860,10 @@ def _room_readiness(project: AuthoredModuleProject) -> tuple[AuthoredRoomReadine
         blockers: list[str] = []
         if not getattr(geometry.room_mesh, "faces", ()):
             blockers.append(f"Room {room_resref} has no renderable room mesh faces.")
-        if walkable_faces <= 0:
+        if walkable_faces <= 0 and not visual_only:
             blockers.append(f"Room {room_resref} has no walkable WOK faces.")
-        blockers.extend(walkmesh_audit.blocking_messages)
+        if not visual_only:
+            blockers.extend(walkmesh_audit.blocking_messages)
         rooms.append(
             AuthoredRoomReadiness(
                 room_resref=normalise_resref(geometry.room_resref or room_resref),
@@ -1606,6 +1879,10 @@ def _room_readiness(project: AuthoredModuleProject) -> tuple[AuthoredRoomReadine
                 invalid_wok_face_count=walkmesh_audit.invalid_face_count,
                 degenerate_wok_face_count=walkmesh_audit.degenerate_face_count,
                 non_manifold_wok_edge_count=walkmesh_audit.non_manifold_edge_count,
+                open_wok_edge_count=walkmesh_audit.open_edge_count,
+                steep_walkable_face_count=walkmesh_audit.steep_walkable_face_count,
+                max_walkable_slope_degrees=walkmesh_audit.max_walkable_slope_degrees,
+                max_allowed_walkable_slope_degrees=walkmesh_audit.max_allowed_walkable_slope_degrees,
                 warnings=tuple(walkmesh_audit.warnings),
                 blocking_messages=tuple(blockers),
             )
@@ -1644,12 +1921,24 @@ def build_authored_module_readiness(
     lighting_count = _lighting_count(project)
     rooms_with_lights, rooms_without_lights = _lighting_room_coverage(project, rooms)
     lighting = _lighting_readiness(project, rooms)
+    sky_traffic = read_authored_project_sky_traffic(project)
+    sky_traffic_validation = validate_authored_sky_traffic_collection(
+        sky_traffic,
+        room_resrefs={room.normalised_resref() for room in project.rooms},
+    )
+    enabled_sky_traffic = tuple(track for track in sky_traffic if bool(getattr(track, "enabled", True)))
+    sky_traffic_export_blocking = tuple(sky_traffic_validation.blocking_issues)
+    if enabled_sky_traffic:
+        sky_traffic_export_blocking += (
+            "Sky traffic previews in Map Studio, but its room-MDL animloop controller compiler is not yet vanilla/in-game verified.",
+        )
     present = _present_keys(packaged_resources)
     expected = _expected_keys(project.module_root, rooms)
     present_set = set(present)
     template_references = _gameplay_template_references(project, present=present_set)
     transition_references = _transition_references(project)
     script_references = _script_references(project, present=present_set)
+    dialog_references = _dialog_references(project, present=present_set)
     pathing = _pathing_readiness(project)
     visibility = _visibility_readiness(project)
     component_edit = _component_edit_readiness(project)
@@ -1659,16 +1948,25 @@ def build_authored_module_readiness(
         geometry_validation=geometry_validation,
         transition_references=transition_references,
     )
+    transition_surface_gate = _transition_surface_gate(project)
     export_object_boundaries = map_studio_export_object_boundaries(project)
     external_template_count = sum(1 for ref in template_references if not ref.packaged)
     incomplete_transition_count = sum(1 for ref in transition_references if not ref.complete)
     external_script_count = sum(1 for ref in script_references if not ref.packaged)
+    external_dialog_count = sum(1 for ref in dialog_references if not ref.packaged)
     missing = tuple(key for key in expected if key not in present_set)
     room_blocking = tuple(message for room in rooms for message in room.blocking_messages)
     preview_blocking = tuple(validation.blocking_issues) + room_blocking + geometry_validation.blocking_messages
     pathing_blocking = tuple(pathing.blocking_messages or ())
     visibility_blocking = tuple(visibility.blocking_messages or ())
-    blocking = preview_blocking + pathing_blocking + visibility_blocking
+    transition_surface_blocking = tuple(str(message) for message in transition_surface_gate.get("blocking_messages", ()) or ())
+    blocking = (
+        preview_blocking
+        + pathing_blocking
+        + visibility_blocking
+        + transition_surface_blocking
+        + sky_traffic_export_blocking
+    )
     template_warnings: tuple[str, ...] = ()
     if external_template_count:
         template_warnings = (
@@ -1678,13 +1976,20 @@ def build_authored_module_readiness(
     transition_warnings: tuple[str, ...] = ()
     if incomplete_transition_count:
         transition_warnings = (
-            f"{incomplete_transition_count} authored transition(s) name a module but are missing a destination tag/waypoint.",
+            f"{incomplete_transition_count} authored transition(s) are missing a destination tag or door/waypoint target type.",
         )
     script_warnings: tuple[str, ...] = ()
     if external_script_count:
         script_warnings = (
             f"{external_script_count} authored script hook(s) rely on base-game, Override, or another installed mod .ncs instead of being packaged.",
         )
+    dialog_warnings: tuple[str, ...] = ()
+    if external_dialog_count:
+        dialog_warnings = (
+            f"{external_dialog_count} authored dialog reference(s) rely on base-game, Override, or another installed mod .dlg instead of being packaged.",
+        )
+    curve_guides = authored_curve_guides(project)
+    curve_guide_warnings = _curve_guide_capability_warnings(project)
     component_warnings = component_edit.validation_messages if not component_edit.ready else ()
     room_warnings = tuple(warning for room in rooms for warning in room.warnings)
     warnings = (
@@ -1695,14 +2000,27 @@ def build_authored_module_readiness(
         + tuple(visibility.warnings or ())
         + tuple(lighting.warnings or ())
         + doorway_transition.warnings
+        + tuple(str(warning) for warning in transition_surface_gate.get("warnings", ()) or ())
         + template_warnings
         + transition_warnings
         + script_warnings
+        + dialog_warnings
+        + curve_guide_warnings
         + component_warnings
+        + tuple(sky_traffic_validation.warnings)
     )
     can_preview = not preview_blocking and bool(rooms) and all(room.can_preview_geometry for room in rooms)
     component_export_blocking = not component_edit.ready
-    can_export_candidate = can_preview and not missing and pathing.ready and not visibility_blocking and not component_export_blocking
+    transition_surface_ready = bool(transition_surface_gate.get("ready", False))
+    can_export_candidate = (
+        can_preview
+        and not missing
+        and pathing.ready
+        and not visibility_blocking
+        and transition_surface_ready
+        and not component_export_blocking
+        and not sky_traffic_export_blocking
+    )
     proof_game_tested = can_export_candidate and _recorded_game_proof_complete(proof)
     ready_for_game_test = can_export_candidate and not proof_game_tested
     proof_manifest_path = str(proof.get("proof_manifest_path") or "")
@@ -1725,6 +2043,43 @@ def build_authored_module_readiness(
     elevated_launch_script_path = str(proof.get("elevated_launch_script_path") or "")
     proof_recording_script_path = str(proof.get("proof_recording_script_path") or "")
     modder_test_plan = dict(proof.get("modder_test_plan") or {}) if isinstance(proof.get("modder_test_plan"), dict) else {}
+    export_job = dict(proof.get("export_job") or {}) if isinstance(proof.get("export_job"), dict) else {}
+    export_proof_invalidation = (
+        dict(proof.get("export_proof_invalidation") or {})
+        if isinstance(proof.get("export_proof_invalidation"), dict)
+        else {}
+    )
+    export_job_status = str(export_job.get("status") or "")
+    export_job_package = dict(export_job.get("package") or {}) if isinstance(export_job.get("package"), dict) else {}
+    export_job_readback = dict(export_job.get("readback") or {}) if isinstance(export_job.get("readback"), dict) else {}
+    export_job_proof = dict(export_job.get("proof_handoff") or {}) if isinstance(export_job.get("proof_handoff"), dict) else {}
+    package_resource_inventory: dict[str, Any] = {}
+    for source in (proof, modder_test_plan, export_job_package):
+        inventory = source.get("package_resource_inventory") or source.get("resource_inventory")
+        if isinstance(inventory, dict):
+            package_resource_inventory = dict(inventory)
+            break
+    if not proof_manifest_path:
+        proof_manifest_path = str(export_job_proof.get("proof_manifest_path") or "")
+    pack_manifest_path = str(proof.get("pack_manifest_path") or export_job_package.get("pack_manifest_path") or "")
+    package_manifest_evidence_missing: list[str] = []
+    if can_export_candidate:
+        if not pack_manifest_path:
+            package_manifest_evidence_missing.append("pack_manifest_path")
+        if not proof_manifest_path:
+            package_manifest_evidence_missing.append("proof_manifest_path")
+        if not package_resource_inventory:
+            package_manifest_evidence_missing.append("package_resource_inventory")
+        elif not bool(package_resource_inventory.get("readback_ok")):
+            package_manifest_evidence_missing.append("package_resource_inventory.readback_ok")
+    package_manifest_evidence = {
+        "ready": can_export_candidate and not package_manifest_evidence_missing,
+        "pack_manifest_path": pack_manifest_path,
+        "proof_manifest_path": proof_manifest_path,
+        "package_resource_inventory_present": bool(package_resource_inventory),
+        "package_readback_ok": bool(package_resource_inventory.get("readback_ok")) if package_resource_inventory else False,
+        "missing": list(package_manifest_evidence_missing),
+    }
     if proof_game_tested:
         proof_status = "game_smoke_tested"
         launch_status = "proof_recorded"
@@ -1761,12 +2116,21 @@ def build_authored_module_readiness(
     elif can_preview:
         stage = "previewable"
         preview_status = "Ready"
-        if not pathing.ready:
+        if sky_traffic_export_blocking:
+            export_status = "Sky traffic compiler blocked"
+            next_action = (
+                "Keep editing the model/path preview, but disable/remove sky traffic before packaging until the "
+                "room-MDL animloop controller compiler passes vanilla comparison and a manual KOTOR warp."
+            )
+        elif not pathing.ready:
             export_status = "Pathing blocked"
             next_action = pathing.fix_hint or "Move the module entry point and gameplay anchors onto generated walkable WOK before export."
         elif visibility_blocking:
             export_status = "VIS visibility blocked"
             next_action = visibility.fix_hint or "Fix broken VIS room links before staging the module."
+        elif not transition_surface_ready:
+            export_status = "Transition WOK surface blocked"
+            next_action = str(transition_surface_gate.get("fix_hint") or "Paint linked doorway WOK faces as DOOR before export.")
         elif component_export_blocking:
             export_status = "Stale runtime resources"
             next_action = (
@@ -1836,13 +2200,26 @@ def build_authored_module_readiness(
             "room_count": len(rooms),
             "export_object_count": len(export_object_boundaries),
             "export_object_boundaries": [boundary.to_metadata() for boundary in export_object_boundaries],
+            "construction_curve_guide_count": len(curve_guides),
+            "construction_curve_guide_names": [guide.name for guide in curve_guides],
+            "construction_curve_guide_runtime_state": "guide_only_not_runtime_geometry" if curve_guides else "none",
             "uv_handoff_object_count": sum(1 for boundary in export_object_boundaries if boundary.uv_handoff_recommended),
             "walkable_face_count": sum(room.walkable_face_count for room in rooms),
+            "transition_surface_gate": dict(transition_surface_gate),
+            "transition_surface_face_count": int(transition_surface_gate.get("transition_surface_face_count", 0) or 0),
+            "transition_surface_required_count": int(transition_surface_gate.get("required_transition_count", 0) or 0),
             "walkable_component_count": sum(room.walkable_component_count for room in rooms),
             "disconnected_walkmesh_room_count": sum(1 for room in rooms if room.walkable_component_count > 1),
             "invalid_wok_face_count": sum(room.invalid_wok_face_count for room in rooms),
             "degenerate_wok_face_count": sum(room.degenerate_wok_face_count for room in rooms),
             "non_manifold_wok_edge_count": sum(room.non_manifold_wok_edge_count for room in rooms),
+            "open_wok_edge_count": sum(room.open_wok_edge_count for room in rooms),
+            "steep_walkable_face_count": sum(room.steep_walkable_face_count for room in rooms),
+            "max_walkable_slope_degrees": max((float(room.max_walkable_slope_degrees) for room in rooms), default=0.0),
+            "max_allowed_walkable_slope_degrees": max(
+                (float(room.max_allowed_walkable_slope_degrees) for room in rooms),
+                default=45.0,
+            ),
             "pathing": {
                 "ready": pathing.ready,
                 "status": pathing.status,
@@ -1945,6 +2322,7 @@ def build_authored_module_readiness(
                     "template_resref": ref.template_resref,
                     "linked_to": ref.linked_to,
                     "linked_to_module": ref.linked_to_module,
+                    "linked_to_flags": ref.linked_to_flags,
                     "status": ref.status,
                     "complete": ref.complete,
                     "message": ref.message,
@@ -1966,14 +2344,32 @@ def build_authored_module_readiness(
                 }
                 for ref in script_references
             ],
+            "dialog_reference_count": len(dialog_references),
+            "dialog_packaged_count": sum(1 for ref in dialog_references if ref.packaged),
+            "dialog_external_count": external_dialog_count,
+            "dialog_references": [
+                {
+                    "source": ref.source,
+                    "field_name": ref.field_name,
+                    "dialog_resref": ref.dialog_resref,
+                    "restype": ref.restype,
+                    "status": ref.status,
+                    "packaged": ref.packaged,
+                    "required": ref.required,
+                    "message": ref.message,
+                }
+                for ref in dialog_references
+            ],
             "lighting_count": lighting_count,
             "lighting_room_count": len(rooms_with_lights),
             "rooms_with_authored_lights": list(rooms_with_lights),
             "rooms_without_authored_lights": list(rooms_without_lights),
+            "lighting_profile": lighting.lighting_profile,
             "lightmap_planning_status": lighting.lightmap_status,
             "lighting": {
                 "ready": lighting.ready,
                 "status": lighting.status,
+                "lighting_profile": lighting.lighting_profile,
                 "light_count": lighting.light_count,
                 "room_count": lighting.room_count,
                 "rooms_with_lights": list(lighting.rooms_with_lights),
@@ -1985,8 +2381,18 @@ def build_authored_module_readiness(
                 "warnings": list(lighting.warnings),
                 "fix_hint": lighting.fix_hint,
             },
+            "sky_traffic": {
+                "count": len(sky_traffic),
+                "enabled_count": len(enabled_sky_traffic),
+                "compiler_target": "room_mdl_animation",
+                "preview_ready": bool(sky_traffic_validation.ok),
+                "export_ready": not sky_traffic_export_blocking,
+                "warnings": list(sky_traffic_validation.warnings),
+                "blocking_messages": list(sky_traffic_export_blocking),
+            },
             "room_lights": [
                 {
+                    "light_id": light.light_id,
                     "name": light.name,
                     "room_resref": light.room_resref,
                     "position": [float(light.position[0]), float(light.position[1]), float(light.position[2])],
@@ -1994,6 +2400,13 @@ def build_authored_module_readiness(
                     "radius": float(light.radius),
                     "intensity": float(light.intensity),
                     "light_type": light.light_type,
+                    "enabled": bool(light.enabled),
+                    "casts_shadows": bool(light.casts_shadows),
+                    "affects_diffuse": bool(light.affects_diffuse),
+                    "affects_lightmap": bool(light.affects_lightmap),
+                    "direction": [float(value) for value in light.direction],
+                    "cone_angle_degrees": float(light.cone_angle_degrees),
+                    "bake_group": light.bake_group,
                 }
                 for light in tuple(getattr(project, "lights", ()) or ())
             ],
@@ -2001,6 +2414,7 @@ def build_authored_module_readiness(
             "proof_game_tested": proof_game_tested,
             "proof_manifest_path": proof_manifest_path,
             "checklist_path": checklist_path,
+            "pack_manifest_path": pack_manifest_path,
             "installed_module_path": installed_module_path,
             "backup_module_path": backup_module_path,
             "resolved_modules_dir": resolved_modules_dir,
@@ -2010,6 +2424,14 @@ def build_authored_module_readiness(
             "elevated_launch_script_path": elevated_launch_script_path,
             "proof_recording_script_path": proof_recording_script_path,
             "modder_test_plan": modder_test_plan,
+            "package_resource_inventory": package_resource_inventory,
+            "package_manifest_evidence": package_manifest_evidence,
+            "export_job": export_job,
+            "export_proof_invalidation": export_proof_invalidation,
+            "export_job_status": export_job_status,
+            "export_job_package_ok": bool(export_job_package.get("ok")),
+            "export_job_readback_ok": bool(export_job_readback.get("ok")),
+            "export_job_proof_state": str(export_job_proof.get("state") or ""),
             "launch_status": launch_status,
             "warp_command": warp_command,
             "in_game_proof_evidence_path": evidence_path,

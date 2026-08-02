@@ -104,6 +104,19 @@ _PRESETS: tuple[AuthoredRoomPrimitivePreset, ...] = (
         metadata={"shape": "octagon", "supports_non_rectangular_floorplan": True},
     ),
     AuthoredRoomPrimitivePreset(
+        preset_id="composition_starter_room",
+        label="Composition Starter Room",
+        description="Export-safe primitive-composition room with one connected walkable floor and editable wall primitives.",
+        points=((-6.0, -5.0), (6.0, -5.0), (6.0, 5.0), (-6.0, 5.0)),
+        entry_position=(0.0, -3.5, 0.0),
+        placeable_position=(2.5, 1.75, 0.0),
+        metadata={
+            "shape": "primitive_composition_starter",
+            "room_geometry_mode": "authored_room_composition",
+            "supports_blockout_primitives": True,
+        },
+    ),
+    AuthoredRoomPrimitivePreset(
         preset_id="elevation_test_room",
         label="Elevation Test Room",
         description="Primitive-composition room with walls, ramp, stairs, and arch geometry for testing elevated walkmesh export.",
@@ -162,7 +175,7 @@ def _preset_room_lights(*, preset: AuthoredRoomPrimitivePreset, root: str, room_
             position=(0.0, -1.5, max(2.25, float(preset.wall_height) * 0.75)),
             color=(1.0, 0.92, 0.76),
             radius=max(8.0, max(abs(float(x)) for point in preset.points for x in point)),
-            intensity=1.0,
+            intensity=0.65,
             light_type="point",
             metadata={
                 "source": "map_studio:room_primitive_preset",
@@ -171,6 +184,24 @@ def _preset_room_lights(*, preset: AuthoredRoomPrimitivePreset, root: str, room_
             },
         ),
     )
+
+
+def _preset_lighting_metadata(preset: AuthoredRoomPrimitivePreset) -> dict[str, Any]:
+    """Return game-visible lighting policy for generated room presets."""
+
+    return {
+        "lighting": {
+            "profile": "standard",
+            "source": "map_studio:room_primitive_preset_balanced",
+            "preset_id": preset.preset_id,
+            "purpose": "readable_textured_room_preview",
+            "sun_ambient": [48, 48, 48],
+            "sun_diffuse": [150, 150, 150],
+            "dynamic_ambient": [72, 72, 72],
+            "shadow_opacity": 80,
+            "sun_shadows": 0,
+        }
+    }
 
 
 def _composition_project_from_preset(
@@ -190,46 +221,40 @@ def _composition_project_from_preset(
         },
     )
     floor_surface = preset.floor_surface_id
-    composition = AuthoredRoomComposition(
-        room_resref=room_resref,
-        floor=FloorPrimitive(
-            name=f"{room_resref}_floor",
+    primitives: tuple[Any, ...] = (
+        WallPrimitive(
+            name=f"{room_resref}_wall_n",
             width=12.0,
-            depth=10.0,
-            surface_id=floor_surface,
+            height=preset.wall_height,
+            center=(0.0, 5.0, preset.wall_height * 0.5),
             material=material,
         ),
-        primitives=(
-            WallPrimitive(
-                name=f"{room_resref}_wall_n",
-                width=12.0,
-                height=preset.wall_height,
-                center=(0.0, 5.0, preset.wall_height * 0.5),
-                material=material,
-            ),
-            WallPrimitive(
-                name=f"{room_resref}_wall_s",
-                width=12.0,
-                height=preset.wall_height,
-                center=(0.0, -5.0, preset.wall_height * 0.5),
-                material=material,
-            ),
-            WallPrimitive(
-                name=f"{room_resref}_wall_e",
-                axis="y",
-                width=10.0,
-                height=preset.wall_height,
-                center=(6.0, 0.0, preset.wall_height * 0.5),
-                material=material,
-            ),
-            WallPrimitive(
-                name=f"{room_resref}_wall_w",
-                axis="y",
-                width=10.0,
-                height=preset.wall_height,
-                center=(-6.0, 0.0, preset.wall_height * 0.5),
-                material=material,
-            ),
+        WallPrimitive(
+            name=f"{room_resref}_wall_s",
+            width=12.0,
+            height=preset.wall_height,
+            center=(0.0, -5.0, preset.wall_height * 0.5),
+            material=material,
+        ),
+        WallPrimitive(
+            name=f"{room_resref}_wall_e",
+            axis="y",
+            width=10.0,
+            height=preset.wall_height,
+            center=(6.0, 0.0, preset.wall_height * 0.5),
+            material=material,
+        ),
+        WallPrimitive(
+            name=f"{room_resref}_wall_w",
+            axis="y",
+            width=10.0,
+            height=preset.wall_height,
+            center=(-6.0, 0.0, preset.wall_height * 0.5),
+            material=material,
+        ),
+    )
+    if preset.metadata.get("supports_elevation_geometry"):
+        primitives = primitives + (
             PlacedRoomPrimitive(
                 primitive=RampPrimitive(
                     name=f"{room_resref}_ramp",
@@ -262,12 +287,22 @@ def _composition_project_from_preset(
                 center=(0.0, -4.9, 1.5),
                 material=material,
             ),
+        )
+    composition = AuthoredRoomComposition(
+        room_resref=room_resref,
+        floor=FloorPrimitive(
+            name=f"{room_resref}_floor",
+            width=12.0,
+            depth=10.0,
+            surface_id=floor_surface,
+            material=material,
         ),
+        primitives=primitives,
         metadata={
             "source": "map_studio:room_primitive_preset",
             "preset_id": preset.preset_id,
             "room_geometry_mode": "authored_room_composition",
-            "supports_elevation_geometry": True,
+            **dict(preset.metadata),
         },
     )
     placements = AuthoredGameplayPlacement(
@@ -308,6 +343,7 @@ def _composition_project_from_preset(
             "source": "map_studio:room_primitive_preset",
             "room_geometry_mode": "authored_room_composition",
             "preset_id": preset.preset_id,
+            **_preset_lighting_metadata(preset),
         },
     )
 
@@ -387,6 +423,7 @@ def _terrain_project_from_preset(
             "source": "map_studio:room_primitive_preset",
             "room_geometry_mode": "terrain_heightfield",
             "preset_id": preset.preset_id,
+            **_preset_lighting_metadata(preset),
         },
     )
 
@@ -484,6 +521,7 @@ def create_authored_module_from_room_preset(
             "source": "map_studio:room_primitive_preset",
             "room_geometry_mode": "floor_plan_extrusion",
             "preset_id": preset.preset_id,
+            **_preset_lighting_metadata(preset),
         },
     )
 

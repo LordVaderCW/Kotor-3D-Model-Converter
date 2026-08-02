@@ -214,6 +214,33 @@ def test_t2639_floor_plan_project_is_previewable_but_not_export_candidate_withou
     assert "grdev01_room01.mdl" in runtime_status["missing"]
 
 
+def test_t2606_curve_guides_are_reported_as_authoring_only_in_readiness() -> None:
+    _install_native_payload_paths()
+
+    from src.core.modules.authored_module_readiness import build_authored_module_readiness
+    from src.core.modules.map_studio_curve_guides import add_authored_curve_guide
+
+    project = add_authored_curve_guide(
+        _floor_plan_project(),
+        name="main_path",
+        purpose="pth_planning",
+        room_resref="grdev01_room01",
+        coordinate_space="kmap_world",
+        points=((0.0, 0.0, 0.0), (1.0, 0.5, 0.0), (2.0, 0.5, 0.0)),
+    )
+
+    readiness = build_authored_module_readiness(project)
+
+    assert readiness.metadata["construction_curve_guide_count"] == 1
+    assert readiness.metadata["construction_curve_guide_names"] == ["main_path"]
+    assert readiness.metadata["construction_curve_guide_runtime_state"] == "guide_only_not_runtime_geometry"
+    assert any(
+        "previewable KMAP authoring guides only" in warning
+        and "do not yet export as KOTOR runtime geometry" in warning
+        for warning in readiness.warnings
+    )
+
+
 def test_t2639_runtime_resources_promote_project_to_export_candidate() -> None:
     _install_native_payload_paths()
 
@@ -398,6 +425,44 @@ def test_t2692_readiness_reports_full_map_studio_toolchain_scope() -> None:
     assert export_candidate.metadata["toolchain"][0]["name"] == "Geometry authoring"
 
 
+def test_t2911_readiness_metadata_reports_steep_walkable_wok_slope(monkeypatch) -> None:
+    _install_native_payload_paths()
+
+    import src.core.modules.authored_module_readiness as readiness_module
+    from src.core.modules.authored_module_readiness import build_authored_module_readiness
+    from src.core.modules.module_format import WOKData, WOKFace
+
+    steep_wok = WOKData(
+        name="grsteep_room01",
+        verts=[
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 2.0),
+        ],
+        faces=[
+            WOKFace(0, 1, 2, surface=4),
+        ],
+    )
+
+    def compile_steep_room(room):
+        return SimpleNamespace(
+            room_resref=room.normalised_resref(),
+            room_mesh=SimpleNamespace(name="grsteep_room01", texture="CM_Baremetal", faces=(0,)),
+            helper_meshes=(),
+            wok=steep_wok,
+        )
+
+    monkeypatch.setattr(readiness_module, "compile_authored_room_spec", compile_steep_room)
+
+    readiness = build_authored_module_readiness(_floor_plan_project())
+
+    assert readiness.metadata["steep_walkable_face_count"] == 1
+    assert readiness.metadata["max_walkable_slope_degrees"] > readiness.metadata["max_allowed_walkable_slope_degrees"]
+    # Steep faces are advisory now (vanilla 001ebo ships one).
+    assert not any("steeper than" in message for message in readiness.blocking_messages)
+    assert any("steeper than" in message for message in readiness.warnings)
+
+
 def test_t2606_readiness_reports_multi_room_vis_visibility_gaps() -> None:
     _install_native_payload_paths()
 
@@ -574,6 +639,40 @@ def test_t2600_readiness_reports_authored_room_light_coverage() -> None:
     assert readiness.metadata["room_lights"][0]["name"] == "key_light"
 
 
+def test_t3105_readiness_reports_fullbright_export_candidate() -> None:
+    _install_native_payload_paths()
+
+    from src.core.modules.authored_module_readiness import build_authored_module_readiness
+
+    project = _floor_plan_project()
+    project = replace(
+        project,
+        metadata=replace(
+            project.metadata,
+            metadata={
+                **dict(project.metadata.metadata),
+                "lighting": {
+                    "profile": "fullbright",
+                    "source": "map_studio:test_fullbright",
+                },
+            },
+        ),
+    )
+
+    readiness = build_authored_module_readiness(project)
+    lighting = {step.name: step for step in readiness.toolchain}["Lighting"]
+
+    assert lighting.ready is True
+    assert lighting.status == "Fullbright export candidate"
+    assert "profile: fullbright" in lighting.value_label
+    assert readiness.metadata["lighting_profile"] == "fullbright"
+    assert readiness.metadata["lightmap_planning_status"] == "fullbright_export_candidate"
+    assert readiness.metadata["lighting"]["lighting_profile"] == "fullbright"
+    assert readiness.metadata["lighting"]["lightmap_status"] == "fullbright_export_candidate"
+    assert readiness.metadata["lighting"]["game_tested_lighting"] is False
+    assert readiness.metadata["lighting"]["warnings"] == []
+
+
 def test_t2600_readiness_distinguishes_lightmap_export_candidate_and_game_tested_lighting() -> None:
     _install_native_payload_paths()
 
@@ -699,6 +798,40 @@ def test_t2684_readiness_reports_staged_and_installed_game_proof_state() -> None
     assert installed.metadata["elevated_launch_script_path"].endswith("grdev01_launch_kotor_as_admin.cmd")
     assert installed.metadata["proof_recording_script_path"].endswith("grdev01_record_game_proof.cmd")
     assert "Run the launch helper dry-run" in installed.next_action
+
+
+def test_t3104_readiness_metadata_keeps_package_resource_inventory() -> None:
+    _install_native_payload_paths()
+
+    from src.core.modules.authored_module_readiness import build_authored_module_readiness
+
+    inventory = {
+        "schema": "ghostrigger.map_studio.package_resource_inventory.v1",
+        "module_root": "grdev01",
+        "readback_ok": True,
+        "required_runtime_resources": [
+            {"resref": resref, "restype": restype}
+            for resref, restype in _runtime_keys()
+        ],
+        "missing_required_runtime_resources": [],
+        "resource_groups": {
+            "verified_archive_resource_count": 9,
+            "loose_staged_resource_count": 9,
+        },
+        "install": {"installed": False, "dry_run": True},
+    }
+    readiness = build_authored_module_readiness(
+        _floor_plan_project(),
+        packaged_resources=_runtime_keys(),
+        proof_metadata={
+            "proof_manifest_path": "C:/tmp/grdev01_authored_module_game_manifest.json",
+            "package_resource_inventory": inventory,
+        },
+    )
+
+    assert readiness.metadata["package_resource_inventory"] == inventory
+    assert readiness.metadata["package_resource_inventory"]["module_root"] == "grdev01"
+    assert readiness.metadata["package_resource_inventory"]["readback_ok"] is True
 
 
 def test_t2601_readiness_builds_k2_launch_helper() -> None:

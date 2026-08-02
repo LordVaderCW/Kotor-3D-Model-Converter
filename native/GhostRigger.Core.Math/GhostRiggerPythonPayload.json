@@ -2,7 +2,7 @@
     "schema": "ghostrigger_python_payload.v1",
     "phase": "P1.5 embedded python payload",
     "project": "GhostRigger.Core.Math",
-    "file_count": 46,
+    "file_count": 63,
     "originals_remain_in_src": true,
     "files": [
         {
@@ -93,13 +93,13 @@
             "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_INIT",
             "source_path": "src/core/geometry/__init__.py",
             "packaged_path": "Python/src/core/geometry/__init__.py",
-            "sha256": "3c05fda5aa3b8c10b185fbcc0744f8a229d9f6c2d98613e95d5f50f4a9ce25f1"
+            "sha256": "4236a209ae791c378ed28516abc73c49a113ac07f1c9f46370871162fbfa1fae"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_COMPONENT_EDITING",
             "source_path": "src/core/geometry/component_editing.py",
             "packaged_path": "Python/src/core/geometry/component_editing.py",
-            "sha256": "ff9c0e614000b83e1547d1af7f774c16eb36ae1e64ecbe68cd41b6f80e256ec1"
+            "sha256": "025039dac06b9a05383dcd1cc85a20a5c986532c432ac4774b215cbc9e7aa52f"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_LIGHTSABER",
@@ -114,10 +114,28 @@
             "sha256": "080f3ed3b05762c4b7e98f53da08591675e947be6d50afbb007e80cc025dbf0f"
         },
         {
+            "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_MESH_TOPOLOGY",
+            "source_path": "src/core/geometry/mesh_topology.py",
+            "packaged_path": "Python/src/core/geometry/mesh_topology.py",
+            "sha256": "241cd8975f6fa3e973227fe5979529abf725a2c05ebed7bd2ce4402743d16d4d"
+        },
+        {
             "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_MODEL_DATA",
             "source_path": "src/core/geometry/model_data.py",
             "packaged_path": "Python/src/core/geometry/model_data.py",
-            "sha256": "aa12bc22123f64c8627d4a8d987b0bf2e6ff7311023baf7fc3397d547bafc57e"
+            "sha256": "6cb0af36c09188165d2376daab5b073122443a340e31a5b1c94781f2756b3f0c"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_POLYGON_MESH_OPERATIONS",
+            "source_path": "src/core/geometry/polygon_mesh_operations.py",
+            "packaged_path": "Python/src/core/geometry/polygon_mesh_operations.py",
+            "sha256": "2ddb82fafa2801bb528805ec42528b7712c66e86f48eb02a3d60d476e9db410c"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_SOLID_BOOLEAN",
+            "source_path": "src/core/geometry/solid_boolean.py",
+            "packaged_path": "Python/src/core/geometry/solid_boolean.py",
+            "sha256": "e1dd698d695eced8fb837d0c22fcc4e3915eb086c6e31955cc823b55d8f0c5f8"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_CORE_GEOMETRY_VERTEX_SPACE",
@@ -192,10 +210,40 @@
             "sha256": "875c6f53db68dc536a08114a5fceb14693b90e2940482c18e5394904326eb3a8"
         },
         {
+            "resource_name": "PYTHON_PAYLOAD_MATH_HD_INTEGRATION_TEST",
+            "source_path": "src/math/_hd_integration_test.py",
+            "packaged_path": "Python/src/math/_hd_integration_test.py",
+            "sha256": "bdcde5c4dba2bc37c8c9eb040925aa9ccf404f0a6531bda133a281bbba798106"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_HD_SMOKE_TEST",
+            "source_path": "src/math/_hd_smoke_test.py",
+            "packaged_path": "Python/src/math/_hd_smoke_test.py",
+            "sha256": "8d76d956ac0f34c681469de456c15e000a36457395f4409f67af786912f9e173"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_ANATOMICAL_PARTITION",
+            "source_path": "src/math/anatomical_partition.py",
+            "packaged_path": "Python/src/math/anatomical_partition.py",
+            "sha256": "65219b517d2d2478c3dfe459a4ed04ae17852a9ae603df3f8b2f558b860504cb"
+        },
+        {
             "resource_name": "PYTHON_PAYLOAD_MATH_CAMERA_MATH",
             "source_path": "src/math/camera_math.py",
             "packaged_path": "Python/src/math/camera_math.py",
             "sha256": "ca0dd8f763af5cafbcf96ba194d523ad3671951c140bf387f7d958dad8ce6f71"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_CONTAINMENT_FIT",
+            "source_path": "src/math/containment_fit.py",
+            "packaged_path": "Python/src/math/containment_fit.py",
+            "sha256": "461d47e0fe90e1dbcce95ee394dcdc9adbeeb7d22e5624c8c15ec623621563e0"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_CORRESPONDENCE_FIT",
+            "source_path": "src/math/correspondence_fit.py",
+            "packaged_path": "Python/src/math/correspondence_fit.py",
+            "sha256": "85b17cb8b6c7770e57518deec32b9ce3c4a86320c0cd0ba5a3f78dd1e72a5426"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_MATH_FRAME_MATH",
@@ -207,7 +255,49 @@
             "resource_name": "PYTHON_PAYLOAD_MATH_GPU_MATH",
             "source_path": "src/math/gpu_math.py",
             "packaged_path": "Python/src/math/gpu_math.py",
-            "sha256": "9ec4f83e22baa11eb08264f1bb7e3aad4286d304a0968ca83f5ffd062db40ec8"
+            "sha256": "99a867d656dd9a6c8071bbf64f220ab8e8344953658aaedc7309782c5d1f3a78"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_HEAD_ALIGNMENT",
+            "source_path": "src/math/head_alignment.py",
+            "packaged_path": "Python/src/math/head_alignment.py",
+            "sha256": "e7e1ccaf37622a094875d11bde65ff7f8363f189b38b4b7d57e7eb18bbbc4881"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_HEAD_COMPONENT_TRANSFORM",
+            "source_path": "src/math/head_component_transform.py",
+            "packaged_path": "Python/src/math/head_component_transform.py",
+            "sha256": "349f5c5662449386ca8bfb8a2dd44aca889d2fcdd569b2a9f360de3446e99cde"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_HEAD_SKIN_TRANSFER",
+            "source_path": "src/math/head_skin_transfer.py",
+            "packaged_path": "Python/src/math/head_skin_transfer.py",
+            "sha256": "001879343518f38df193c48676680920b24d93bebd8537e4ba4c0176c269cbf0"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_HEAD_UV",
+            "source_path": "src/math/head_uv.py",
+            "packaged_path": "Python/src/math/head_uv.py",
+            "sha256": "46cd0628b4cd556eb28dba378c7d1e2174a6771dd273bf7246c701242b4f4b31"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_HEAT_DIFFUSION_SKINNING",
+            "source_path": "src/math/heat_diffusion_skinning.py",
+            "packaged_path": "Python/src/math/heat_diffusion_skinning.py",
+            "sha256": "2a1c4bdd18e2949d14f93f87bc80c79be3dfe43a2dae672f062e43f7fbd3ddcb"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_LANDMARK_ALIGNMENT",
+            "source_path": "src/math/landmark_alignment.py",
+            "packaged_path": "Python/src/math/landmark_alignment.py",
+            "sha256": "1c1f80080ae7dfd12c600c1a1b6c58bf22e9ef6bfd0f7635066d8fcb82a0aa4a"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_LIMB_IK",
+            "source_path": "src/math/limb_ik.py",
+            "packaged_path": "Python/src/math/limb_ik.py",
+            "sha256": "3d351051c134474ea17165080eb037272a6c08e4a41fb3e975d5d9f0afc813d4"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_MATH_MODULE_LAYOUT_MATH",
@@ -219,13 +309,25 @@
             "resource_name": "PYTHON_PAYLOAD_MATH_TRANSFORM_MATH",
             "source_path": "src/math/transform_math.py",
             "packaged_path": "Python/src/math/transform_math.py",
-            "sha256": "b22c5dfafadc08011e83cb8539805ef365a1f895c8e2e2cf8f70fc3d43b76e6e"
+            "sha256": "8955b589e685a5ef5510a9981b43feadbdf0ad56f7971d7af2e5ba3f13102190"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_MATH_VIEWCUBE_MATH",
             "source_path": "src/math/viewcube_math.py",
             "packaged_path": "Python/src/math/viewcube_math.py",
             "sha256": "64b19ca3f3ef2a72c4daaa33cb877147dcf1b0883fda8530ae7a978eb5e46ad3"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_WALKMESH_RUNTIME",
+            "source_path": "src/math/walkmesh_runtime.py",
+            "packaged_path": "Python/src/math/walkmesh_runtime.py",
+            "sha256": "cc41c6d4e54d4ddfb0d2bf3be2bee307bea532768bf1fab83b56f03dad0cc803"
+        },
+        {
+            "resource_name": "PYTHON_PAYLOAD_MATH_WINDING_NUMBER",
+            "source_path": "src/math/winding_number.py",
+            "packaged_path": "Python/src/math/winding_number.py",
+            "sha256": "6978a48f6531f2b562108f7709fa635a9da73f6462eac13710df4eccdc34a615"
         },
         {
             "resource_name": "PYTHON_PAYLOAD_MEASUREMENT_INIT",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,60 @@ def _request(tmp_path: Path, target_mdl: Path, *, replace_existing: bool = True)
     )
 
 
+def test_full_writer_preserves_sparse_native_supernode_numbers() -> None:
+    """Character rebuilds must not collapse node-header +2 to DFS order."""
+
+    root = ModelNode(name="root", number=0)
+    headhook = ModelNode(name="headhook", number=27, parent=root)
+    root.children = [headhook]
+    anim_root = ModelNode(name="root", number=0)
+    anim_headhook = ModelNode(name="headhook", number=27, parent=anim_root)
+    anim_root.children = [anim_headhook]
+    model = KotorModel(
+        name="sparse_supernode_probe",
+        root_node=root,
+        animations=[
+            Animation(
+                name="pause1",
+                length=1.0,
+                anim_root="root",
+                nodes=[anim_root, anim_headhook],
+            )
+        ],
+        game_version=GameVersion.K2,
+    )
+    model.preserve_native_supernode_numbers = True
+
+    mdl_bytes, _mdx_bytes = MDLBinaryWriter().write(model)
+    base = 12
+    geometry_root_rel = struct.unpack_from("<I", mdl_bytes, base + 40)[0]
+    geometry_root_abs = base + geometry_root_rel
+    geometry_children_rel = struct.unpack_from(
+        "<I", mdl_bytes, geometry_root_abs + 44
+    )[0]
+    geometry_child_rel = struct.unpack_from(
+        "<I", mdl_bytes, base + geometry_children_rel
+    )[0]
+    geometry_child_abs = base + geometry_child_rel
+
+    animation_table_rel = struct.unpack_from("<I", mdl_bytes, base + 88)[0]
+    animation_rel = struct.unpack_from("<I", mdl_bytes, base + animation_table_rel)[0]
+    animation_abs = base + animation_rel
+    animation_root_rel = struct.unpack_from("<I", mdl_bytes, animation_abs + 40)[0]
+    animation_root_abs = base + animation_root_rel
+    animation_children_rel = struct.unpack_from(
+        "<I", mdl_bytes, animation_root_abs + 44
+    )[0]
+    animation_child_rel = struct.unpack_from(
+        "<I", mdl_bytes, base + animation_children_rel
+    )[0]
+    animation_child_abs = base + animation_child_rel
+
+    assert struct.unpack_from("<H", mdl_bytes, geometry_child_abs + 2)[0] == 27
+    assert struct.unpack_from("<H", mdl_bytes, animation_child_abs + 2)[0] == 27
+    assert headhook.clone_shallow().number == 27
+
+
 def _inject_with_animation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -201,7 +256,7 @@ def test_orientation_controller_survives_writer_boundary(monkeypatch, tmp_path: 
     _assert_quat_close(pose_end.local_transforms_by_node["root"].rotation, _quat_axis("Y", 90.0))
 
 
-def test_position_controller_survives_writer_boundary_as_absolute_local(monkeypatch, tmp_path: Path) -> None:
+def test_position_controller_survives_writer_boundary_as_rest_local_delta(monkeypatch, tmp_path: Path) -> None:
     animation = Animation(
         name="UE_Position",
         length=1.0,
@@ -214,7 +269,12 @@ def test_position_controller_survives_writer_boundary_as_absolute_local(monkeypa
 
     assert result.success is True, result.errors
     pose = evaluate_aurora_animation_pose(model, readback, 0.5)
-    assert pose.local_transforms_by_node["child"].position == pytest.approx((2.0, 3.0, 4.0))
+    readback_child = next(node for node in readback.nodes if node.name == "child")
+    position_controller = next(controller for controller in readback_child.controllers if controller["name"] == "position")
+    assert position_controller["values"] == [[2.0, 3.0, 4.0]]
+    # Child bind position is (1, 0, 0), so Odyssey evaluates the raw key as a
+    # delta and produces (3, 3, 4) in parent-local space.
+    assert pose.local_transforms_by_node["child"].position == pytest.approx((3.0, 3.0, 4.0))
 
 
 def test_parent_child_fk_evaluates_after_readback(monkeypatch, tmp_path: Path) -> None:
@@ -427,6 +487,40 @@ def test_animation_only_injection_uses_vanilla_depth_first_node_order() -> None:
     assert candidate.declared_node_count == 61
     assert candidate.visited_node_count == 61
     assert candidate.node_names == [node.name for node in target_model.all_nodes()]
+
+    # Aurora's retail runtime pairs animation nodes to geometry nodes through
+    # the u16 at node-header +2.  That value is a geometry node number, not the
+    # adjacent name-table index at +4.  PMBAM deliberately has many non-DFS
+    # identities, so this fixture catches writers that duplicate +4 into +2:
+    # GhostRigger's name-based preview accepts those files, but KOTOR does not
+    # deform the corresponding skinned body nodes.
+    base = 12
+    source_numbers = writer._read_geometry_node_numbers(target_mdl.read_bytes())
+    assert any(name_index != node_number for name_index, node_number in source_numbers.items())
+
+    animation_rel = writer._read_animation_offsets(mdl_bytes)[-1]
+    animation_root_rel = struct.unpack_from("<I", mdl_bytes, base + animation_rel + 0x28)[0]
+    pending = [animation_root_rel]
+    visited: set[int] = set()
+    while pending:
+        node_rel = pending.pop(0)
+        if node_rel in visited:
+            continue
+        visited.add(node_rel)
+        node_abs = base + node_rel
+        node_number, name_index = struct.unpack_from("<HH", mdl_bytes, node_abs + 0x02)
+        assert node_number == source_numbers[name_index]
+
+        child_array_rel, child_count = struct.unpack_from("<II", mdl_bytes, node_abs + 0x2C)
+        for child_index in range(child_count):
+            child_rel = struct.unpack_from(
+                "<I",
+                mdl_bytes,
+                base + child_array_rel + child_index * 4,
+            )[0]
+            pending.append(child_rel)
+
+    assert len(visited) == candidate.visited_node_count
 
 
 def test_raw_animation_footprint_validator_rejects_non_depth_first_child_layout() -> None:

@@ -12,7 +12,7 @@ import threading
 from typing import Callable, Optional, TextIO
 
 try:
-    from PySide6 import QtGui, QtWidgets
+    from PySide6 import QtCore, QtGui, QtWidgets
 except ImportError as exc:  # pragma: no cover - import gate for Qt runtime
     raise RuntimeError("PySide6 is required for the Qt shell") from exc
 
@@ -50,8 +50,15 @@ class _SplashStream:
         with self._lock:
             written = None
             if self._wrapped is not None:
-                written = self._wrapped.write(value)
-                self._wrapped.flush()
+                try:
+                    written = self._wrapped.write(value)
+                    self._wrapped.flush()
+                except (OSError, ValueError):
+                    # A native GUI launch may inherit a console stream whose
+                    # OS handle closes before Qt finishes its splash cleanup.
+                    # The splash and file logger remain valid, so a stale
+                    # console must not abort application startup.
+                    written = None
             self._buffer += value
             while "\n" in self._buffer:
                 line, self._buffer = self._buffer.split("\n", 1)
@@ -66,7 +73,10 @@ class _SplashStream:
                 self._emit_line(f"{self._label}  {self._buffer.strip()}")
             self._buffer = ""
             if self._wrapped is not None:
-                self._wrapped.flush()
+                try:
+                    self._wrapped.flush()
+                except (OSError, ValueError):
+                    pass
 
     def isatty(self) -> bool:
         if self._wrapped is None:
@@ -136,6 +146,17 @@ def _prelaunch_foreground_seconds_from_env() -> float:
     return max(0.5, min(float(hold_ms) / 1000.0, 12.0))
 
 
+def _start_without_activation_from_env() -> bool:
+    """Return whether this process is a focus-safe validation instance."""
+
+    return str(os.environ.get("GHOSTRIGGER_START_WITHOUT_ACTIVATING", "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def run_qt_application(
     app_root: Optional[str],
     startup_input: Optional[dict],
@@ -147,7 +168,9 @@ def run_qt_application(
     build_prelaunch_library_input: Callable[[Path, Optional[dict], object], dict],
 ) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("GhostRigger")
+    start_without_activation = _start_without_activation_from_env()
+    app.setApplicationName("GhostStudio")
+    app.setApplicationDisplayName("GhostStudio")
     app.setStyle("Fusion")
     for family in ("Consolas", "Lucida Console", "Courier New"):
         if family in QtGui.QFontDatabase.families():
@@ -157,6 +180,8 @@ def run_qt_application(
     settings_data = read_settings(root / "settings.json")
     startup_theme_manager = ThemeManager(root, settings_data)
     splash = splash_cls(root, theme_manager=startup_theme_manager)
+    if start_without_activation:
+        splash.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
     splash.show()
     log_queue: SimpleQueue[str] = SimpleQueue()
 
@@ -169,7 +194,8 @@ def run_qt_application(
         finished = title.strip().lower() in {"workspace ready", "main window ready"}
         splash.set_status(title, detail, finished=finished)
         splash.show()
-        splash.raise_()
+        if not start_without_activation:
+            splash.raise_()
         app.processEvents()
 
     status_queue: SimpleQueue[tuple[str, str]] = SimpleQueue()
@@ -282,6 +308,8 @@ def run_qt_application(
     win = window_cls(root, startup_input=prepared_input)
     drain_splash_log()
     app.processEvents()
+    if start_without_activation:
+        win.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
     win.show()
     app.processEvents()
     splash.close()

@@ -25,8 +25,44 @@ from src.core.geometry.model_data import (
 from src.core.retargeting.fbx_exporter import FBXExportFailure, find_blender_executable
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _repo_root_for_blender_script() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "scripts" / "blender_extract_fbx_mesh.py").exists():
+            return parent
+    return Path(__file__).resolve().parents[2]
+
+
+REPO_ROOT = _repo_root_for_blender_script()
 BLENDER_MESH_SCRIPT = REPO_ROOT / "scripts" / "blender_extract_fbx_mesh.py"
+
+
+def _hidden_process_options() -> dict[str, Any]:
+    """Keep headless Blender invisible in the Windows desktop application."""
+
+    if os.name != "nt":
+        return {}
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startup,
+    }
+
+
+def _stable_blender_for_fbx_import(explicit: str | Path | None = None) -> Path:
+    """Resolve Blender for FBX preview import, preferring the stable 4.2 importer."""
+
+    if explicit:
+        return find_blender_executable(explicit)
+    env = os.environ.get("GHOSTRIGGER_BLENDER_PATH")
+    if env:
+        return find_blender_executable(env)
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    preferred = Path(program_files) / "Blender Foundation" / "Blender 4.2" / "blender.exe"
+    if preferred.exists():
+        return preferred
+    return find_blender_executable(None)
 
 
 class BlenderFbxMeshImportError(RuntimeError):
@@ -42,6 +78,7 @@ def import_fbx_mesh_with_blender(
     classification: str = "character",
     blender_executable: str | Path | None = None,
     timeout: int = 300,
+    axis_conversion: str = "blender_xyz_to_kotor_xz_minus_y",
 ) -> KotorModel:
     """Import FBX renderable mesh geometry through Blender's FBX importer."""
 
@@ -52,13 +89,14 @@ def import_fbx_mesh_with_blender(
         raise BlenderFbxMeshImportError(f"Blender mesh extraction script not found: {BLENDER_MESH_SCRIPT}")
 
     try:
-        blender = find_blender_executable(blender_executable)
+        blender = _stable_blender_for_fbx_import(blender_executable)
     except FBXExportFailure as exc:
         raise BlenderFbxMeshImportError(str(exc)) from exc
 
     output_json = _output_json_path(source)
     cmd = [
         str(blender),
+        "--factory-startup",
         "--background",
         "--python",
         str(BLENDER_MESH_SCRIPT),
@@ -68,7 +106,14 @@ def import_fbx_mesh_with_blender(
         "--json",
         str(output_json),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        **_hidden_process_options(),
+    )
     log_path = output_json.with_suffix(".blender.log")
     log_path.write_text(
         f"COMMAND:\n{' '.join(cmd)}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}\n",
@@ -91,6 +136,7 @@ def import_fbx_mesh_with_blender(
         game_version=game_version,
         supermodel=supermodel,
         classification=classification,
+        axis_conversion=axis_conversion,
     )
     metadata = getattr(model, "metadata", None)
     if not isinstance(metadata, dict):
@@ -110,6 +156,7 @@ def model_from_blender_fbx_mesh_payload(
     game_version: GameVersion,
     supermodel: str = "NULL",
     classification: str = "character",
+    axis_conversion: str = "blender_xyz_to_kotor_xz_minus_y",
 ) -> KotorModel:
     """Convert Blender mesh JSON into a viewport-friendly ``KotorModel``."""
 
@@ -139,20 +186,29 @@ def model_from_blender_fbx_mesh_payload(
     setattr(model, "_gr_fbx_mesh_count", len(meshes))
     setattr(model, "_gr_fbx_armatures", list(payload.get("armatures") or []))
     setattr(model, "_gr_fbx_armature_bone_count", armature_bone_count)
+    # Custom Rigged Character conversion needs the authored hierarchy and rest
+    # matrices as build authority. This remains runtime-only evidence; project
+    # files store paths/hashes and decisions rather than duplicating FBX data.
+    setattr(model, "_gr_fbx_armature_objects", armature_objects)
     setattr(model, "_gr_fbx_actions", list(payload.get("actions") or []))
+    selected_axis_conversion = _select_axis_conversion(payload, axis_conversion)
+    setattr(model, "_gr_fbx_axis_conversion", selected_axis_conversion)
     metadata = getattr(model, "metadata", None)
     if not isinstance(metadata, dict):
         metadata = {}
         setattr(model, "metadata", metadata)
-    metadata.setdefault(
-        "external_import",
-        {"disable_kotor_uv_seam_fix": True},
-    )
+    external = dict(metadata.get("external_import") or {})
+    external.setdefault("disable_kotor_uv_seam_fix", True)
+    external["source_axis_system"] = "blender_fbx_import_z_up"
+    external["target_axis_system"] = "kotor_z_up"
+    external["axis_conversion"] = selected_axis_conversion
+    metadata["external_import"] = external
 
     _attach_imported_armature_guides(
         root,
         armature_objects,
         armature_bones,
+        axis_conversion=selected_axis_conversion,
     )
 
     for index, mesh in enumerate(meshes):
@@ -162,13 +218,20 @@ def model_from_blender_fbx_mesh_payload(
             flags=int(NodeFlags.HEADER | (NodeFlags.SKIN if is_skin else NodeFlags.MESH)),
             parent=root,
         )
-        node.vertices = [_triple(vertex) for vertex in mesh.get("vertices") or []]
-        node.normals = [_triple(normal) for normal in mesh.get("normals") or []]
+        node.vertices = [_convert_axis(vertex, selected_axis_conversion) for vertex in mesh.get("vertices") or []]
+        node.normals = [_convert_axis(normal, selected_axis_conversion) for normal in mesh.get("normals") or []]
         node.uvs = [_pair(uv) for uv in mesh.get("uvs") or []]
         node.faces = [_face(face) for face in mesh.get("faces") or []]
+        setattr(
+            node,
+            "_gr_source_vertex_indices",
+            [int(value) for value in mesh.get("source_vertex_indices") or []],
+        )
         materials = list(mesh.get("materials") or [])
         material = materials[0] if materials else {}
         node.texture = str(material.get("texture") or material.get("name") or "")[:32]
+        setattr(node, "_gr_source_texture", str(material.get("texture_path") or ""))
+        setattr(node, "_gr_source_material", dict(material))
         diffuse = material.get("diffuse")
         if isinstance(diffuse, (list, tuple)) and len(diffuse) >= 3:
             node.diffuse = (float(diffuse[0]), float(diffuse[1]), float(diffuse[2]))
@@ -197,6 +260,8 @@ def _attach_imported_armature_guides(
     root: ModelNode,
     armature_objects: list[Any],
     flat_bones: list[Any],
+    *,
+    axis_conversion: str = "blender_xyz_to_kotor_xz_minus_y",
 ) -> None:
     """Attach imported FBX rest-pose bones as non-rendering fit guides.
 
@@ -259,15 +324,15 @@ def _attach_imported_armature_guides(
                 node._imported = True
                 node._gr_imported_armature_joint = True
                 node._gr_imported_armature_name = armature_name
-                world = _optional_triple(bone.get("world_position"))
+                world = _optional_convert_axis(bone.get("world_position"), axis_conversion)
                 if world is None:
-                    world = _optional_triple(bone.get("head_world_position"))
+                    world = _optional_convert_axis(bone.get("head_world_position"), axis_conversion)
                 if world is not None:
                     node.external_world_position = world
-                head = _optional_triple(bone.get("head_world_position"))
+                head = _optional_convert_axis(bone.get("head_world_position"), axis_conversion)
                 if head is not None:
                     node._gr_imported_bone_head_world = head
-                tail = _optional_triple(bone.get("tail_world_position"))
+                tail = _optional_convert_axis(bone.get("tail_world_position"), axis_conversion)
                 if tail is not None:
                     node._gr_imported_bone_tail_world = tail
                 node._gr_imported_bone_use_deform = bool(bone.get("use_deform", True))
@@ -290,7 +355,7 @@ def _attach_imported_armature_guides(
                     node._imported = True
                     node._gr_imported_armature_joint = True
                     node._gr_imported_armature_name = armature_name
-                    world = _optional_triple(bone.get("world_position"))
+                    world = _optional_convert_axis(bone.get("world_position"), axis_conversion)
                     if world is not None:
                         node.external_world_position = world
                     armature_node.children.append(node)
@@ -309,6 +374,61 @@ def _optional_triple(values: Any) -> tuple[float, float, float] | None:
         return (float(raw[0]), float(raw[1]), float(raw[2]))
     except Exception:
         return None
+
+
+def _blender_to_kotor(values: Any) -> tuple[float, float, float]:
+    x, y, z = _triple(values)
+    return (x, z, -y)
+
+
+def _convert_axis(values: Any, mode: str) -> tuple[float, float, float]:
+    if str(mode) == "identity_z_up":
+        return _triple(values)
+    return _blender_to_kotor(values)
+
+
+def _optional_blender_to_kotor(values: Any) -> tuple[float, float, float] | None:
+    point = _optional_triple(values)
+    if point is None:
+        return None
+    x, y, z = point
+    return (x, z, -y)
+
+
+def _optional_convert_axis(values: Any, mode: str) -> tuple[float, float, float] | None:
+    point = _optional_triple(values)
+    if point is None:
+        return None
+    return _convert_axis(point, mode)
+
+
+def _select_axis_conversion(payload: dict[str, Any], requested: str) -> str:
+    mode = str(requested or "").strip().lower()
+    if mode != "auto":
+        return "identity_z_up" if mode == "identity_z_up" else "blender_xyz_to_kotor_xz_minus_y"
+    points = [
+        tuple(float(value) for value in vertex[:3])
+        for mesh in payload.get("meshes") or ()
+        for vertex in mesh.get("vertices") or ()
+        if len(vertex) >= 3
+    ]
+    if not points:
+        return "blender_xyz_to_kotor_xz_minus_y"
+
+    def score(converted: list[tuple[float, float, float]]) -> float:
+        minimum = min(value[2] for value in converted)
+        maximum = max(value[2] for value in converted)
+        height = max(maximum - minimum, 1.0e-6)
+        # Authored character scenes normally put their support plane close to
+        # zero. Strong below-floor penetration is a better automatic signal
+        # than bone naming or an FBX exporter label.
+        penetration = max(0.0, -minimum) / height
+        floating = max(0.0, minimum) / height
+        return penetration * 4.0 + floating
+
+    identity = [_convert_axis(value, "identity_z_up") for value in points]
+    converted = [_convert_axis(value, "blender_xyz_to_kotor_xz_minus_y") for value in points]
+    return "identity_z_up" if score(identity) + 1.0e-6 < score(converted) else "blender_xyz_to_kotor_xz_minus_y"
 
 
 def _output_json_path(source: Path) -> Path:
